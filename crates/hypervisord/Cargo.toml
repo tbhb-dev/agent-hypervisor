@@ -1,0 +1,15 @@
+[package]
+name = "hypervisord"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Host daemon shell for the agent hypervisor"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hypervisor-core.workspace = true
+
+[lints]
+workspace = true

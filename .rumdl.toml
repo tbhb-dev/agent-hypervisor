@@ -1,0 +1,10 @@
+# rumdl configuration. Paragraphs are one line each (guard-markdown enforces it), so MD013 is off.
+[global]
+disable = ["MD013"]
+exclude = [".worktrees/", "target/", ".vale/"]
+
+[per-file-ignores]
+# Claude's root instructions begin with the cross-harness import.
+"CLAUDE.md" = ["MD041"]
+# Path-scoped rules files open with frontmatter and a prompt paragraph.
+".claude/rules/*.md" = ["MD041"]

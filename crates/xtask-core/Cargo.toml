@@ -1,0 +1,17 @@
+[package]
+name = "xtask-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Pure decisions behind the repository checks: the functional core boundary and commit trailers"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

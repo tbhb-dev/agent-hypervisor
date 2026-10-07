@@ -1,0 +1,88 @@
+# Functional core: no I/O. Clippy reads the clippy.toml beside a crate's Cargo.toml, so this file
+# applies to this crate only. Every `-core` crate carries an identical copy; `check:boundary` fails
+# when one is missing. Pass values in from the shell instead of calling any of these.
+disallowed-methods = [
+  # Files
+  { path = "std::fs::read", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::read_to_string", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::read_dir", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::read_link", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::write", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::copy", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::rename", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::create_dir", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::create_dir_all", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::remove_file", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::remove_dir", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::remove_dir_all", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::metadata", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::symlink_metadata", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::canonicalize", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::exists", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::hard_link", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::set_permissions", reason = "file I/O belongs in a shell crate" },
+  { path = "std::path::Path::exists", reason = "file I/O belongs in a shell crate" },
+  { path = "std::path::Path::metadata", reason = "file I/O belongs in a shell crate" },
+  { path = "std::path::Path::read_dir", reason = "file I/O belongs in a shell crate" },
+  { path = "std::path::Path::canonicalize", reason = "file I/O belongs in a shell crate" },
+  # Network
+  { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "network I/O belongs in a shell crate" },
+  { path = "std::net::TcpStream::connect", reason = "network I/O belongs in a shell crate" },
+  { path = "std::net::TcpListener::bind", reason = "network I/O belongs in a shell crate" },
+  { path = "std::net::UdpSocket::bind", reason = "network I/O belongs in a shell crate" },
+  # Processes
+  { path = "std::process::exit", reason = "process control belongs in a shell crate" },
+  { path = "std::process::abort", reason = "process control belongs in a shell crate" },
+  { path = "std::process::id", reason = "process state belongs in a shell crate" },
+  # Environment
+  { path = "std::env::var", reason = "read the environment in the shell and pass the value in" },
+  { path = "std::env::var_os", reason = "read the environment in the shell and pass the value in" },
+  { path = "std::env::vars", reason = "read the environment in the shell and pass the value in" },
+  { path = "std::env::vars_os", reason = "read the environment in the shell and pass the value in" },
+  { path = "std::env::args", reason = "read arguments in the shell and pass the value in" },
+  { path = "std::env::args_os", reason = "read arguments in the shell and pass the value in" },
+  { path = "std::env::set_var", reason = "the environment belongs to the shell" },
+  { path = "std::env::remove_var", reason = "the environment belongs to the shell" },
+  { path = "std::env::current_dir", reason = "read the working directory in the shell and pass it in" },
+  { path = "std::env::set_current_dir", reason = "the working directory belongs to the shell" },
+  { path = "std::env::current_exe", reason = "read it in the shell and pass it in" },
+  { path = "std::env::home_dir", reason = "read it in the shell and pass it in" },
+  { path = "std::env::temp_dir", reason = "read it in the shell and pass it in" },
+  # Clocks
+  { path = "std::time::SystemTime::now", reason = "read the clock in the shell and pass the time in" },
+  { path = "std::time::Instant::now", reason = "read the clock in the shell and pass the time in" },
+  # Threads
+  { path = "std::thread::spawn", reason = "threads belong in a shell crate" },
+  { path = "std::thread::scope", reason = "threads belong in a shell crate" },
+  { path = "std::thread::sleep", reason = "blocking belongs in a shell crate" },
+  { path = "std::thread::Builder::spawn", reason = "threads belong in a shell crate" },
+  # Standard input and output
+  { path = "std::io::stdin", reason = "standard input belongs in a shell crate" },
+  { path = "std::io::stdout", reason = "standard output belongs in a shell crate" },
+  { path = "std::io::stderr", reason = "standard error belongs in a shell crate" },
+]
+disallowed-types = [
+  { path = "std::fs::File", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::OpenOptions", reason = "file I/O belongs in a shell crate" },
+  { path = "std::fs::ReadDir", reason = "file I/O belongs in a shell crate" },
+  { path = "std::net::TcpStream", reason = "network I/O belongs in a shell crate" },
+  { path = "std::net::TcpListener", reason = "network I/O belongs in a shell crate" },
+  { path = "std::net::UdpSocket", reason = "network I/O belongs in a shell crate" },
+  { path = "std::os::unix::net::UnixStream", reason = "socket I/O belongs in a shell crate" },
+  { path = "std::os::unix::net::UnixListener", reason = "socket I/O belongs in a shell crate" },
+  { path = "std::os::unix::net::UnixDatagram", reason = "socket I/O belongs in a shell crate" },
+  { path = "std::process::Command", reason = "processes belong in a shell crate" },
+  { path = "std::process::Child", reason = "processes belong in a shell crate" },
+  { path = "std::thread::Builder", reason = "threads belong in a shell crate" },
+  { path = "std::thread::JoinHandle", reason = "threads belong in a shell crate" },
+  { path = "std::io::Stdin", reason = "standard input belongs in a shell crate" },
+  { path = "std::io::Stdout", reason = "standard output belongs in a shell crate" },
+  { path = "std::io::Stderr", reason = "standard error belongs in a shell crate" },
+]
+disallowed-macros = [
+  { path = "std::print", reason = "standard output belongs in a shell crate" },
+  { path = "std::println", reason = "standard output belongs in a shell crate" },
+  { path = "std::eprint", reason = "standard error belongs in a shell crate" },
+  { path = "std::eprintln", reason = "standard error belongs in a shell crate" },
+  { path = "std::dbg", reason = "standard error belongs in a shell crate" },
+]

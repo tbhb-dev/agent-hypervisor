@@ -14,7 +14,7 @@ use hypervisor_core::session::{
 };
 use hypervisor_ghostty::GhosttyEmulator;
 use hypervisor_pty::{PtyError, Spawn, UnixPty, UnixSpawner};
-use hypervisor_session::{Command, SessionHandle, spawn};
+use hypervisor_session::{Command, LogContext, SessionHandle, spawn};
 
 #[path = "../../../tests/support/process_group.rs"]
 mod process_group;
@@ -79,6 +79,10 @@ fn start(script: &str, config: HolderConfig) -> Fixture {
         FixtureSpawner(Arc::clone(&group)),
         spec,
         config,
+        LogContext {
+            workload_id: "actor-test-workload".into(),
+            session_id: "actor-test-session".into(),
+        },
         GhosttyEmulator::new,
     );
     let guard = group.lock().unwrap().take();

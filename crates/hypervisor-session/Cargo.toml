@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 hypervisor-core.workspace = true
 hypervisor-pty.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 hypervisor-ghostty.workspace = true

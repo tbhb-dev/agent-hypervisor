@@ -1,8 +1,14 @@
 # State reporting
 
-Status: stub. Drafted in Phase 1 and stable after Phase 7 of the RFC-36 run plan.
+Status: draft. Drafted in Phase 1 and stable after Phase 7 of the RFC-36 run plan.
 
-This spec records the run 11 hook prototype with its screen fallback and session events. Run 12 drafts the conformance contract.
+This spec records the run 11 hook prototype with its screen fallback and session events and the Phase 1 conformance contract.
+
+## Phase 1 conformance contract
+
+A hook listener selects its session by socket path and normalizes only state-bearing fields. It passes source sequence and actor receive time to the holder, which ignores a non-increasing sequence. Each state change emits one `StateChanged` event. On child exit, that event precedes the lifecycle `Exited` event. A late subscriber receives future events only. Screen detection is disabled until explicitly enabled, and a visible blocker can correct a stale hook state. The first server-side cases exercise hooks and ordered events through the public session handle. The recorded hook and screen fixture tests cover detailed harness mappings, while live harness behavior remains untested ([#43](https://github.com/tbhb-dev/agent-hypervisor/issues/43)).
+
+The RFC-36 source at `tbhb-dev/agent-orchestration-poc.internal` commit `63ab6a891a2d167dfdf1faf6ec497b38996e93fa`, `wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/source.md`, lines 117 to 120 and 340 to 347, names working, blocked, and idle hook events and a fallback trait. The merged run 11 code receives harness-specific hook names and derives those states. It does not accept a generic `working`/`blocked`/`idle` wire event. The draft follows the normalized hook schema in the code. The source names created, attached, detached, state-changed, and exited events. The merged stream adds running, resized, and reaped events and uses an in-memory per-session `u64` sequence with no durable cursor.
 
 ## Evidence and limits
 
@@ -12,7 +18,7 @@ Findings below are in `tbhb-dev/agent-orchestration-poc.internal` at commit `485
 - [RFC-36 run 5 hook table](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/485c37e54cd69d186a4b5eb0909f5bdee822fe1b/wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/findings/r5-agy-capture.md#L93-L106) records agy 1.2.12 against a fake model.
 - [RFC-40 run 18](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/485c37e54cd69d186a4b5eb0909f5bdee822fe1b/wiki/proposals/2026-10-07T2052Z-RFC-40-miscellany-spikes/findings/r18-herdr.md#L74-L82) records herdr's screen fallback and its stale working history.
 
-Run 11 replays the 15 recorded `hooks.jsonl` metadata shapes with their `event`, `fields`, `enums`, and timestamps, plus expected states and relative event times from the findings tables. The fixtures preserve hook metadata after prompt and tool input were removed. A live harness test remains open.
+Run 11 replays the 15 recorded `hooks.jsonl` metadata shapes with their `event`, `fields`, `enums`, and timestamps, plus expected states and relative event times from the findings tables. The fixtures preserve hook metadata after prompt and tool input were removed. A live harness test remains open ([#43](https://github.com/tbhb-dev/agent-hypervisor/issues/43)).
 
 ## Hook schema
 

@@ -235,6 +235,7 @@ dependencies = [
  "hypervisor-ghostty",
  "hypervisor-pty",
  "rustix",
+ "serde_json",
 ]
 
 [[package]]
@@ -242,8 +243,11 @@ name = "hypervisord"
 version = "0.1.0"
 dependencies = [
  "hypervisor-core",
+ "hypervisor-ghostty",
+ "hypervisor-pty",
  "hypervisor-session",
  "libc",
+ "rustix",
  "serde_json",
  "sha2",
 ]

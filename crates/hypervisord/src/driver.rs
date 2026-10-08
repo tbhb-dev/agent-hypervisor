@@ -141,6 +141,7 @@ impl HostDriver {
         }
         spec.workspace_dir = fs::canonicalize(&spec.workspace_dir)?;
         spec.cache_dir = fs::canonicalize(&spec.cache_dir)?;
+        workload::validate_host(&spec).map_err(invalid)?;
         let path = self.metadata(&spec.id);
         let mut file = OpenOptions::new()
             .write(true)

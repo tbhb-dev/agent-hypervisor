@@ -1,0 +1,19 @@
+[package]
+name = "hypervisor-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The session actor: one thread per session owning its PTY and emulator"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hypervisor-core.workspace = true
+hypervisor-pty.workspace = true
+
+[dev-dependencies]
+hypervisor-ghostty.workspace = true
+
+[lints]
+workspace = true

@@ -179,6 +179,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hypervisor-session"
+version = "0.1.0"
+dependencies = [
+ "hypervisor-core",
+ "hypervisor-ghostty",
+ "hypervisor-pty",
+]
+
+[[package]]
 name = "hypervisord"
 version = "0.1.0"
 dependencies = [

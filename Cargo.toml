@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+repository = "https://github.com/tbhb-dev/agent-hypervisor"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+hypervisor-core = { path = "crates/hypervisor-core" }
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+serde_json = "1.0.151"
+xtask-core = { path = "crates/xtask-core" }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[workspace.lints.rust]
+# Core crates also carry `#![forbid(unsafe_code)]`; a shell crate that needs unsafe allows it locally with a reason.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+# The functional core boundary: a `-core` crate's normal dependencies must be other `-core` crates
+# or a crate named here. `mise run check:boundary` reads this list through `cargo metadata`.
+[workspace.metadata.boundary]
+allow = []

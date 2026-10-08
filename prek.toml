@@ -1,0 +1,112 @@
+# Configuration file for `prek`, a git hook framework written in Rust.
+# See https://prek.j178.dev for more information.
+#:schema https://www.schemastore.org/prek.json
+#
+# Every local hook runs its tool through mise, so the pinned version in mise.toml is the one
+# that gates the commit. `prek install` writes both shims (see default_install_hook_types).
+
+default_install_hook_types = ["pre-commit", "commit-msg"]
+exclude = '^(\.worktrees/|target/)'
+
+[[repos]]
+repo = "builtin"
+hooks = [
+  { id = "trailing-whitespace" },
+  { id = "end-of-file-fixer" },
+  { id = "check-added-large-files" },
+]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "gitleaks"
+name = "gitleaks (staged secrets)"
+language = "system"
+entry = "mise exec -- gitleaks git --pre-commit --redact --staged --verbose --no-banner"
+pass_filenames = false
+always_run = true
+
+[[repos.hooks]]
+id = "cargo-fmt"
+name = "cargo fmt --check"
+language = "system"
+entry = "mise exec -- cargo fmt --all --check"
+types = ["rust"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "clippy"
+name = "cargo clippy"
+language = "system"
+entry = "mise exec -- cargo clippy --workspace --all-targets --locked -- -D warnings"
+files = '(\.rs|Cargo\.toml|Cargo\.lock|clippy\.toml)$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "boundary"
+name = "functional core boundary"
+language = "system"
+entry = "mise run check:boundary"
+files = '(Cargo\.toml|Cargo\.lock|clippy\.toml)$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "tombi-lint"
+name = "tombi lint"
+language = "system"
+entry = "mise exec -- tombi lint"
+types = ["toml"]
+# Cargo writes Cargo.lock; tombi's formatting does not apply to it.
+exclude = '^Cargo\.lock$'
+
+[[repos.hooks]]
+id = "tombi-format"
+name = "tombi format --check"
+language = "system"
+entry = "mise exec -- tombi format --check"
+types = ["toml"]
+# Cargo writes Cargo.lock; tombi's formatting does not apply to it.
+exclude = '^Cargo\.lock$'
+
+[[repos.hooks]]
+id = "ryl"
+name = "ryl check"
+language = "system"
+entry = "mise exec -- ryl check"
+types = ["yaml"]
+
+[[repos.hooks]]
+id = "rumdl"
+name = "rumdl check"
+language = "system"
+entry = "mise exec -- rumdl check"
+types = ["markdown"]
+
+[[repos.hooks]]
+id = "guard-markdown"
+name = "guard-markdown"
+language = "system"
+entry = "mise exec -- guard-markdown"
+types = ["markdown"]
+
+[[repos.hooks]]
+id = "vale"
+name = "vale (prose)"
+language = "system"
+entry = "mise exec -- vale"
+types = ["markdown"]
+
+[[repos.hooks]]
+id = "commit-trailers"
+name = "commit attribution and Refs trailers"
+language = "system"
+entry = "mise exec -- cargo run --quiet --locked -p xtask -- commit-msg"
+stages = ["commit-msg"]
+
+[[repos.hooks]]
+id = "vale-commit-msg"
+name = "vale (commit message)"
+language = "system"
+entry = "mise exec -- vale --ext=.md"
+stages = ["commit-msg"]

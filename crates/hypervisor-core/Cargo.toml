@@ -1,0 +1,17 @@
+[package]
+name = "hypervisor-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Pure core of the agent hypervisor: decisions and data transformations, no I/O"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,54 @@
+---
+# Runs the same `mise run check` aggregate workers run locally. The job is
+# named `check` because the `main` ruleset will require it by name;
+# keep the name.
+# Linux only: the repository is private, so the job spends Actions minutes.
+name: check
+
+"on":
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # mise's Rust backend drives rustup. Keeping the rustup and cargo homes under
+  # the mise data directory puts them inside what jdx/mise-action caches, so a
+  # cache hit restores a complete toolchain (jdx/mise-action#215).
+  MISE_RUSTUP_HOME: /home/runner/.local/share/mise/rustup
+  MISE_CARGO_HOME: /home/runner/.local/share/mise/cargo
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    # A cold run takes about 80 s; the default timeout is 360 minutes.
+    timeout-minutes: 15
+    steps:
+      # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # check:secrets scans the whole history with gitleaks.
+          fetch-depth: 0
+      # v4.3.0
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c
+        with:
+          version: 2026.8.6
+          install: true
+          cache: true
+      # v2.9.2. Caches the registry and target/, keyed on Cargo.lock
+      # and the toolchain.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        env:
+          CARGO_HOME: /home/runner/.local/share/mise/cargo
+        with:
+          # PRs restore main's cache without saving their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: mise run check

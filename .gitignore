@@ -1,0 +1,18 @@
+# Rust build output
+target/
+
+# Agent worktrees live inside the clone
+.worktrees/
+
+# Vale styles, downloaded by `mise run vale:sync`
+.vale/styles/
+
+# Tool caches
+.rumdl_cache/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

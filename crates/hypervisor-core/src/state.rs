@@ -227,7 +227,7 @@ impl StateMachine {
 
     /// An enabled screen rule can correct a stale, non-authoritative hook state.
     pub fn screen(&mut self, state: AgentState) -> Option<AgentState> {
-        if self.state == AgentState::Exited || state == AgentState::Exited {
+        if self.state == AgentState::Exited || !matches!(state, AgentState::Blocked { .. }) {
             return None;
         }
         self.pending_agy_tool = None;
@@ -328,6 +328,32 @@ mod tests {
                 reason: BlockReason::Approval
             })
         );
+    }
+
+    #[test]
+    fn idle_footer_does_not_clear_hook_approval() {
+        let mut s = StateMachine::default();
+        s.report(report(Harness::Claude, HookKind::PermissionRequest, 1, 0));
+        assert_eq!(s.screen(AgentState::Idle), None);
+        assert_eq!(
+            s.state(),
+            AgentState::Blocked {
+                reason: BlockReason::Approval
+            }
+        );
+    }
+
+    #[test]
+    fn working_footer_does_not_revive_hook_idle() {
+        let mut s = StateMachine::default();
+        s.report(report(
+            Harness::Claude,
+            HookKind::Stop { fully_idle: true },
+            1,
+            0,
+        ));
+        assert_eq!(s.screen(AgentState::Working), None);
+        assert_eq!(s.state(), AgentState::Idle);
     }
 
     #[test]

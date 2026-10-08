@@ -12,11 +12,11 @@ Findings below are in `tbhb-dev/agent-orchestration-poc.internal` at commit `485
 - [RFC-36 run 5 hook table](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/485c37e54cd69d186a4b5eb0909f5bdee822fe1b/wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/findings/r5-agy-capture.md#L93-L106) records agy 1.2.12 against a fake model.
 - [RFC-40 run 18](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/485c37e54cd69d186a4b5eb0909f5bdee822fe1b/wiki/proposals/2026-10-07T2052Z-RFC-40-miscellany-spikes/findings/r18-herdr.md#L74-L82) records herdr's screen fallback and its stale working history.
 
-Run 11 replays fixtures containing only event names, `notification_type`, `fullyIdle`, relative event times, and the states expected from those tables, without prompt or tool input and without a live harness claim.
+Run 11 replays the 15 recorded `hooks.jsonl` metadata shapes with their `event`, `fields`, `enums`, and timestamps, plus expected states and relative event times from the findings tables. The fixtures preserve hook metadata after prompt and tool input were removed. A live harness test remains open.
 
 ## Hook schema
 
-Each accepted report has `harness` (`Claude`, `Codex`, or `Agy`), normalized `kind`, source `seq`, and a monotonic `at` supplied by the session actor. The socket listener allocates `seq` in accept order, so independent hook client invocations cannot reset it. A report whose sequence is not greater than the last accepted one is ignored. The listener strips prompt text, tool arguments, transcript paths, and model names. It keeps the payload's `session_id` or `conversationId` only as `claimed_session_id` audit metadata beside the peer UID and GID.
+Each accepted report has `harness` (`Claude`, `Codex`, or `Agy`), normalized `kind`, source `seq`, and a monotonic `at` supplied by the session actor. The hook client stamps `seq` from `CLOCK_MONOTONIC` nanoseconds before reading stdin or connecting. The listener forwards it without renumbering. A report whose sequence is not greater than the last accepted one is ignored, including a late report after a newer one. The client strips prompt text, tool arguments, transcript paths, and model names. It keeps the payload's `session_id` or `conversationId` only as `claimed_session_id` audit metadata beside the peer UID and GID.
 
 The state values are `Unknown`, `Idle`, `Working`, `Blocked { reason: Approval | Input | Unknown }`, and `Exited`. The holder's own child exit sets `Exited`, even if a hook is silent. Later hook and screen observations leave that state unchanged.
 
@@ -25,14 +25,15 @@ The state values are `Unknown`, `Idle`, `Working`, `Blocked { reason: Approval |
 | Claude | SessionStart, Stop | Idle |
 | Claude | UserPromptSubmit, MessageDisplay, PreToolUse | Working |
 | Claude | PermissionRequest, Notification with `notification_type: permission_prompt` | Blocked, Approval |
-| Claude | SessionEnd | Exited |
+| Claude | SessionEnd | Unknown; `/clear` and `/resume` can end a harness session while the child continues |
 | Codex | SessionStart | No state change: it arrives at the first prompt, not at launch |
 | Codex | UserPromptSubmit, PreToolUse | Working |
 | Codex | PermissionRequest | Blocked, Approval |
 | Codex | Stop, Interrupt | Idle |
-| Codex | SessionEnd | Exited |
+| Codex | SessionEnd | Unknown until the holder observes child exit |
 | agy | PreInvocation, PostInvocation | Working |
 | agy | PreToolUse | Working, then Blocked, Unknown if no later event arrives within 500 ms |
+| agy | PostToolUse | Working, including after an unanswered approval timeout |
 | agy | Stop with `fullyIdle: true` | Idle |
 
 Other events do not change state. A later agy event cancels its pending PreToolUse deadline. The 500 ms timeout exceeds the recorded approximately 140 ms from PreToolUse to the approval prompt while limiting stale working. Run 12 must test this prototype threshold. A timeout does not distinguish an approval wait from another stalled tool call, so the reason is `Unknown`.
@@ -95,23 +96,23 @@ agy `~/.gemini/config/hooks.json`:
 
 Screen detection starts disabled. A caller enables it for a known harness with `Command::DetectScreen(Some(harness))` and disables it with `None`. When enabled, the actor samples after output batches and at least every 300 ms while quiet. `ScreenDetector` receives the emulator's grid and OSC title. This title accessor was added to the `Emulator` trait because run 3 recorded Codex's approval signal in its title; Ghostty exposes a borrowed title through `GHOSTTY_TERMINAL_DATA_TITLE`, while alacritty emits title events. The accessor copies the current value before the next terminal mutation.
 
-A rule is `(harness, region, literal pattern, resulting state, priority)`. `Title` and `BottomNonEmpty(N)` are the prototype regions. The detector selects the matching rule with the highest priority. The starter rules include both observed Codex `Action Required` title variants, Claude's `Do you want to proceed?` approval UI, agy's `Run this command?` approval UI, the `esc to cancel` and `esc to interrupt` working footers, and the idle prompt text recorded in runs 3 and 5. A visible approval rule takes precedence over a working footer or an unconfirmed hook state. Unmatched screens leave the prior hook state unchanged, so run 12 must test more prompt shapes before enabling detection by default.
+A rule is `(harness, region, literal pattern, resulting state, priority)`. `Title` and `BottomNonEmpty(N)` are the prototype regions. The detector selects the matching rule with the highest priority. The starter rules include both observed Codex `Action Required` title variants, Claude's `Do you want to proceed?` approval UI, agy's `Run this command?` approval UI, the `esc to cancel` and `esc to interrupt` working footers, and the idle prompt text recorded in runs 3 and 5. A matched blocker can override hook state, while idle and working footer matches leave the hook state intact. Unmatched screens also leave the prior hook state unchanged.
 
-The fixture for screen checkpoints records byte offsets at the end of each cell's idle and approval steps. Replaying those prefixes through Ghostty and alacritty detects Idle and Blocked, Approval in all 15 cells. The final grids are checked too: three Claude cells still display a permission question after the child exits, but the holder's Exited state ignores those screen observations. The checkpoint test validates only the recorded 120 by 40 screens, not narrow panes or live harness releases. [Herdr issue 2868](https://github.com/herdrdev/herdr/issues/2868) describes a narrow Claude selection dialog detected as idle.
+The fixture for screen checkpoints records byte offsets at the end of each cell's idle and approval steps. Replaying those prefixes through Ghostty and alacritty detects Idle and Blocked, Approval in all 15 cells. The final grids are checked too: three Claude cells still display a permission question after the child exits, but the holder's Exited state ignores those screen observations. The checkpoint test validates only the recorded 120 by 40 screens. [Issue 33](https://github.com/tbhb-dev/agent-hypervisor/issues/33) tracks narrow panes and live prompt conformance, including the selection dialog in [herdr issue 2868](https://github.com/herdrdev/herdr/issues/2868).
 
 | Recorded or historical case | Hooks alone | Screen path |
 | --- | --- | --- |
-| Main Stop followed by SubagentStop or PostToolUse | Idle: those later events do not revive Working | Idle prompt confirms if visible |
-| Claude Ctrl-C at a permission prompt | Blocked, Approval remains because run 3 did not observe an interrupt effect | Approval question confirms the visible block |
-| agy Ctrl-C at an approval prompt | Blocked, Unknown after the unanswered PreToolUse timeout; agy reported nothing on Ctrl-C | `Run this command?` upgrades the reason to Approval while visible |
-| Codex Ctrl-C at approval | Interrupt sets Idle | Idle prompt confirms after the dialog closes |
-| Codex plan-mode input prompt after a working hook | Working remains stale if no Stop or other hook arrives | Needs a prompt rule; this recording set did not include plan mode |
-| A hook source stops reporting after Working | Working remains stale | Known idle prompt rules can correct it; unmatched screens remain unclassified |
+| Main Stop followed by SubagentStop or PostToolUse | Idle: those later events do not revive Working | No override without a visible blocker |
+| Claude Ctrl-C at a permission prompt | Blocked, Approval remains because run 3 did not observe an interrupt effect | A visible approval question confirms the block; [issue 35](https://github.com/tbhb-dev/agent-hypervisor/issues/35) tracks release after Ctrl-C |
+| agy Ctrl-C at an approval prompt | Blocked, Unknown after the unanswered PreToolUse timeout; agy reported nothing on Ctrl-C | `Run this command?` upgrades the reason to Approval while visible; [issue 35](https://github.com/tbhb-dev/agent-hypervisor/issues/35) tracks release |
+| Codex Ctrl-C at approval | Interrupt sets Idle | No override after the blocker disappears |
+| Codex plan-mode input prompt after a working hook | Working remains stale if no Stop or other hook arrives | [Issue 33](https://github.com/tbhb-dev/agent-hypervisor/issues/33) tracks the missing recorded sequence and prompt rule |
+| A hook source stops reporting after Working | Working remains stale | A visible blocker can correct it; [issue 35](https://github.com/tbhb-dev/agent-hypervisor/issues/35) tracks idle classification |
 
 The subagent, post-tool, and plan-mode histories are from [RFC-40 run 18](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/485c37e54cd69d186a4b5eb0909f5bdee822fe1b/wiki/proposals/2026-10-07T2052Z-RFC-40-miscellany-spikes/findings/r18-herdr.md#L76-L80). The Ctrl-C outcomes come from runs 3 and 5. The table distinguishes tested replay sequences from screen behavior that still needs a live or narrow-pane conformance check.
 
 ## Session event stream
 
-The holder emits `Created`, `StateChanged { from, to }`, and `Exited(Exit { code, signal, raw })` as plain values. The actor attaches a per-session `u64` sequence before sending each event to subscribers, preserving order across `Created`, the existing `Running` and `Resized` events, state transitions, exit, and `Reaped`. A subscriber added with `subscribe()` receives later events in that same order. Holder exit emits a state transition to Exited before the lifecycle Exited event. `Attached` and `Detached` are defined in the event type. Run 10 owns viewer and lock wiring and will emit them if it merges second.
+The holder emits `Created`, `StateChanged { from, to }`, and `Exited(Exit { code, signal, raw })` as plain values. Run 10's holder effects for viewer changes map to `Attached { viewer }` and `Detached { viewer }` events, including the `ViewerId`. The actor attaches a per-session `u64` sequence before sending each event to subscribers, preserving order across `Created`, viewer changes, the existing `Running` and `Resized` events, state transitions, exit, and `Reaped`. A subscriber added with `subscribe()` receives later events in that same order. Holder exit emits a state transition to Exited before the lifecycle Exited event.
 
 The stream is local to the running actor. It does not include RFC-40's per-host event log, cursors, or push delivery. Event times and the agy deadline use the monotonic clock passed to the holder, following [RFC-38 run 10](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/485c37e54cd69d186a4b5eb0909f5bdee822fe1b/wiki/proposals/2026-10-07T2052Z-RFC-38-command-and-control-spikes/findings/r10-pause-and-clocks.md#L16).

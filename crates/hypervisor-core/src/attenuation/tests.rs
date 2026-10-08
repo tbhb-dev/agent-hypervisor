@@ -304,6 +304,10 @@ fn traversal_and_empty_segments_fail_closed() {
         "/repos/tbhb-dev/./x",
         "/repos//tbhb-dev/x",
         "repos/tbhb-dev/x",
+        "//",
+        "//repos/tbhb-dev/x",
+        "/repos/tbhb-dev/x/%2e%2e/%2e%2e/someone-else",
+        "/repos/tbhb-dev/x%2Fy",
     ] {
         assert_eq!(
             within(&g, &get("api.github.com", path)),
@@ -318,6 +322,61 @@ fn traversal_and_empty_segments_fail_closed() {
         ),
         Decision::Deny(Denial::MalformedPath)
     );
+}
+
+#[test]
+fn a_subpath_outside_the_mount_point_is_denied() {
+    let g = Grant {
+        mounts: vec![mount("/workspace/", MountMode::Rw, "/")],
+        ..child()
+    };
+    let outside = at("/workspace/", MountMode::Ro, "/etc/passwd");
+    assert_eq!(within(&g, &outside), Decision::Deny(Denial::NotCovered));
+    let inside = at("/workspace/", MountMode::Ro, "/workspace/a");
+    assert!(within(&g, &inside).is_allow());
+}
+
+#[test]
+fn mixed_overlaps_on_one_mount_are_reported() {
+    // One overlap keeps rw but narrows the scope; the other keeps the scope but loses rw.
+    let p = Grant {
+        mounts: vec![
+            mount("/w/", MountMode::Rw, "/w/s/"),
+            mount("/w/", MountMode::Ro, "/w/"),
+        ],
+        ..child()
+    };
+    let r = Grant {
+        mounts: vec![mount("/w/", MountMode::Rw, "/w/")],
+        ..child()
+    };
+    let (_, dropped) = intersect(&p, &r);
+    assert!(!narrows(&r, &p));
+    assert_eq!(dropped, vec![Dropped::MountNarrowed { path: "/w/".into() }]);
+}
+
+#[test]
+fn mixed_overlaps_on_one_host_are_reported() {
+    // One overlap narrows the methods, the other narrows the path prefix.
+    let p = Grant {
+        egress: vec![
+            egress("a.test", Some(&[Method::Get]), Some("/")),
+            egress("a.test", None, Some("/x/")),
+        ],
+        ..child()
+    };
+    let r = Grant {
+        egress: vec![egress(
+            "a.test",
+            Some(&[Method::Get, Method::Post]),
+            Some("/"),
+        )],
+        ..child()
+    };
+    let (_, dropped) = intersect(&p, &r);
+    assert!(!narrows(&r, &p));
+    let host = "a.test".to_string();
+    assert_eq!(dropped, vec![Dropped::EgressNarrowed { host }]);
 }
 
 #[test]
@@ -452,7 +511,7 @@ pub(super) fn grant() -> impl Strategy<Value = Grant> {
         isolation(),
         prop::collection::vec(egress, 0..4),
         prop::collection::vec(reference(), 0..3),
-        prop::collection::vec(mount, 0..4),
+        prop::collection::vec(mount, 0..6),
     )
         .prop_map(|(isolation, egress, credentials, mounts)| Grant {
             isolation,
@@ -460,6 +519,67 @@ pub(super) fn grant() -> impl Strategy<Value = Grant> {
             credentials,
             mounts,
         })
+}
+
+/// A parent and a request derived from it: a subset of the parent's entries with at most one
+/// field widened, so requests within the parent and requests just outside it both come up often.
+fn parent_and_request() -> impl Strategy<Value = (Grant, Grant)> {
+    let keep = prop::collection::vec(any::<bool>(), 16);
+    let widen = (0..10usize, any::<usize>(), scope(), prefix(), reference());
+    let sibling = (any::<usize>(), scope());
+    let parts = (grant(), keep, widen, sibling);
+    parts.prop_map(
+        |(mut p, keep, (how, i, scope, prefix, extra), (j, other))| {
+            // A second mount on an existing mount point, with the other mode and its own scope, so
+            // that one request can overlap two parent entries that narrow it differently.
+            if let Some(m) = p.mounts.get(j % p.mounts.len().max(1)).cloned() {
+                let mode = if m.mode == MountMode::Rw {
+                    MountMode::Ro
+                } else {
+                    MountMode::Rw
+                };
+                p.mounts.push(Mount {
+                    mode,
+                    scope: other,
+                    ..m
+                });
+            }
+            let mut keep = keep.into_iter().cycle();
+            let mut r = Grant {
+                isolation: p.isolation,
+                egress: p
+                    .egress
+                    .iter()
+                    .filter(|_| keep.next() == Some(true))
+                    .cloned()
+                    .collect(),
+                credentials: p
+                    .credentials
+                    .iter()
+                    .filter(|_| keep.next() == Some(true))
+                    .cloned()
+                    .collect(),
+                mounts: p
+                    .mounts
+                    .iter()
+                    .filter(|_| keep.next() == Some(true))
+                    .cloned()
+                    .collect(),
+            };
+            let (e, m) = (r.egress.len().max(1), r.mounts.len().max(1));
+            let (egress, mount) = (r.egress.get_mut(i % e), r.mounts.get_mut(i % m));
+            match (how, egress, mount) {
+                (1, _, _) => r.isolation = Isolation::Unsandboxed,
+                (2 | 7, _, Some(m)) => m.mode = MountMode::Rw,
+                (3 | 8, _, Some(m)) => m.scope = scope,
+                (4, Some(e), _) => e.path_prefix = Some(prefix),
+                (5, Some(e), _) => e.methods = None,
+                (6, _, _) => r.credentials.push(extra),
+                _ => {}
+            }
+            (p, r)
+        },
+    )
 }
 
 pub(super) fn request() -> impl Strategy<Value = Request> {
@@ -531,5 +651,19 @@ proptest! {
             prop_assert_eq!(&g.holder, &holder);
             prop_assert!(p.credentials.contains(&g.reference));
         }
+    }
+}
+
+proptest! {
+    // Derived requests are cheap to check; 1024 cases find the mixed mount overlap reliably.
+    #![proptest_config(ProptestConfig::with_cases(1024))]
+
+    #[test]
+    fn dropped_is_empty_exactly_when_a_derived_request_is_within_the_parent(
+        (p, r) in parent_and_request(),
+    ) {
+        let (c, dropped) = intersect(&p, &r);
+        prop_assert_eq!(dropped.is_empty(), narrows(&r, &p));
+        prop_assert!(narrows(&c, &p));
     }
 }

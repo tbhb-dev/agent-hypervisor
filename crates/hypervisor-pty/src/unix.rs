@@ -110,16 +110,24 @@ impl Spawn for UnixSpawner {
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
         }
-        // SAFETY: the hook runs in the forked child before exec and makes only the `setsid` and
-        // `ioctl` system calls, which are async-signal-safe, on fd 0, which `stdin` set above.
+        // SAFETY: the hook runs in the forked child before exec and makes only `setsid`,
+        // `ioctl`, and `sigaction` calls, which are async-signal-safe, on fd 0, which `stdin`
+        // set above.
         #[expect(
             unsafe_code,
-            reason = "pre_exec is the only way to set a controlling terminal"
+            reason = "pre_exec sets the controlling terminal and restores SIGHUP in the child"
         )]
         unsafe {
             cmd.pre_exec(|| {
                 rp::setsid()?;
                 rp::ioctl_tiocsctty(BorrowedFd::borrow_raw(0))?;
+                // An ignored SIGHUP survives exec. Restore its default disposition so a
+                // session spawned by a supervisor that ignores HUP can still be hung up.
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = libc::SIG_DFL;
+                if libc::sigaction(libc::SIGHUP, &raw const action, std::ptr::null_mut()) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
                 Ok(())
             });
         }

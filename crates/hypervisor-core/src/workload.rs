@@ -230,6 +230,95 @@ mod tests {
     }
 
     #[test]
+    fn host_rejects_other_runtimes() {
+        for runtime in [Runtime::Seatbelt, Runtime::AppleContainer] {
+            let mut spec = host();
+            spec.runtime = runtime;
+            assert!(validate_host(&spec).is_err());
+        }
+    }
+
+    #[test]
+    fn host_rejects_each_unsupported_field() {
+        let mut spec = host();
+        spec.image = Some("image".into());
+        assert!(validate_host(&spec).is_err());
+
+        let mut spec = host();
+        spec.mounts.push(Mount {
+            source: "/source".into(),
+            target: "/target".into(),
+            mode: MountMode::ReadOnly,
+        });
+        assert!(validate_host(&spec).is_err());
+
+        let mut spec = host();
+        spec.credential_refs.push("credential".into());
+        assert!(validate_host(&spec).is_err());
+    }
+
+    #[test]
+    fn host_rejects_each_resource_limit() {
+        let mut spec = host();
+        spec.resources.memory_bytes = Some(1024);
+        assert!(validate_host(&spec).is_err());
+
+        let mut spec = host();
+        spec.resources.cpu_count = Some(1);
+        assert!(validate_host(&spec).is_err());
+    }
+
+    #[test]
+    fn host_rejects_relative_workspace_and_cache_paths() {
+        let mut spec = host();
+        spec.workspace_dir = "relative".into();
+        assert!(validate_host(&spec).is_err());
+
+        let mut spec = host();
+        spec.cache_dir = "relative".into();
+        assert!(validate_host(&spec).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_rejects_non_utf8_workspace_and_cache_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = PathBuf::from(OsString::from_vec(b"/invalid\xff".to_vec()));
+        let mut spec = host();
+        spec.workspace_dir = invalid.clone();
+        assert!(validate_host(&spec).is_err());
+
+        let mut spec = host();
+        spec.cache_dir = invalid;
+        assert!(validate_host(&spec).is_err());
+    }
+
+    #[test]
+    fn host_rejects_driver_owned_environment_names() {
+        for name in ["WORKSPACE_DIR", "CACHE_DIR"] {
+            let mut spec = host();
+            spec.env.push((name.into(), "caller-value".into()));
+            assert!(validate_host(&spec).is_err());
+        }
+    }
+
+    #[test]
+    fn host_rejects_invalid_environment_pairs() {
+        for (name, value) in [
+            ("", "value"),
+            ("A=B", "value"),
+            ("A\0B", "value"),
+            ("A", "v\0x"),
+        ] {
+            let mut spec = host();
+            spec.env.push((name.into(), value.into()));
+            assert!(validate_host(&spec).is_err());
+        }
+    }
+
+    #[test]
     fn recovery_requires_matching_host_and_live_handshake() {
         let id = host().id;
         assert_eq!(recovery("h1", &id, true), Recovery::Running);
@@ -267,6 +356,22 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn invalid_stable_id_components_are_refused(
+            invalid in prop_oneof![
+                Just(String::new()),
+                "[a-z]{65,70}",
+                "[a-z]{0,8}[/.:\\x00][a-z]{0,8}",
+            ]
+        ) {
+            let mut id = host().id;
+            id.host = invalid.clone();
+            prop_assert!(id.validate().is_err());
+            id.host = "h1".into();
+            id.local = invalid;
+            prop_assert!(id.validate().is_err());
+        }
+
         #[test]
         fn safe_ids_never_contain_path_separators(host in "[a-zA-Z0-9_-]{1,64}", local in "[a-zA-Z0-9_-]{1,64}") {
             let id = StableId { host, local };

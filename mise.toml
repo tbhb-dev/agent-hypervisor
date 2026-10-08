@@ -58,8 +58,12 @@ description = "Lint every Rust target with clippy, warnings as errors"
 run = "cargo clippy --workspace --all-targets --locked -- -D warnings"
 
 [tasks."check:test"]
-description = "Run the Rust tests, including the conformance harness"
+description = "Run the Rust tests, including the conformance harness; launchd needs check:host"
 run = "bash tests/check-fixtures.sh"
+
+[tasks."check:host"]
+description = "Run the launchd integration tests on an unsandboxed macOS host before merge"
+run = "bash tests/check-fixtures.sh host"
 
 [tasks."check:boundary"]
 description = "Fail when a -core crate depends outside the allowlist or lacks its clippy.toml"

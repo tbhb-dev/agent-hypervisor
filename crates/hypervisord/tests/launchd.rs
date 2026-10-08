@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -347,6 +348,7 @@ fn parent_pid(pid: u32) -> u32 {
 }
 
 #[test]
+#[ignore = "requires check:host on an unsandboxed macOS host"]
 fn session_survives_daemon_restart_under_launchd() {
     let mut fixture = Fixture::new();
     let mut driver = fixture.driver();
@@ -363,6 +365,7 @@ fn session_survives_daemon_restart_under_launchd() {
 }
 
 #[test]
+#[ignore = "requires check:host on an unsandboxed macOS host"]
 fn session_survives_daemon_upgrade_under_launchd() {
     let mut fixture = Fixture::new();
     let daemon = fixture.root.join("bin/hypervisord");
@@ -404,6 +407,7 @@ fn session_survives_daemon_upgrade_under_launchd() {
 }
 
 #[test]
+#[ignore = "requires check:host on an unsandboxed macOS host"]
 fn launchd_restarts_a_crashed_shim_and_the_daemon_reports_it() {
     let mut fixture = Fixture::new();
     let mut driver = fixture.driver();
@@ -445,6 +449,7 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[test]
+#[ignore = "requires check:host on an unsandboxed macOS host"]
 fn attended_start_after_a_dead_shim_is_adopted_as_running() {
     let mut fixture = Fixture::new();
     let mut driver = fixture.driver();
@@ -476,6 +481,7 @@ fn attended_start_after_a_dead_shim_is_adopted_as_running() {
 }
 
 #[test]
+#[ignore = "requires check:host on an unsandboxed macOS host"]
 fn start_replaces_a_loaded_job_whose_shim_is_silent() {
     let mut fixture = Fixture::new();
     let mut driver = fixture.driver();
@@ -501,6 +507,7 @@ fn start_replaces_a_loaded_job_whose_shim_is_silent() {
 
 /// Child half of the killed-run tests: does nothing unless the parent test spawned it.
 #[test]
+#[ignore = "requires check:host on an unsandboxed macOS host"]
 fn killed_run_child_registers_a_job_and_waits() {
     let Some(ready) = std::env::var_os("HV_LAUNCHD_CHILD_READY") else {
         return;
@@ -527,12 +534,18 @@ fn kill_child_run(signal: Signal) -> (ProcessGroup, JobGuard, u32, PathBuf) {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "killed_run_child_registers_a_job_and_waits"])
+        .args([
+            "--exact",
+            "killed_run_child_registers_a_job_and_waits",
+            "--include-ignored",
+        ])
         .env("HV_LAUNCHD_CHILD_READY", &ready)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .unwrap();
+    let _child_group = ProcessGroup::new(child.id().cast_signed());
     let lines = wait_for(|| fs::read_to_string(&ready).ok());
     let _ = fs::remove_file(&ready);
     let lines: Vec<&str> = lines.lines().collect();
@@ -546,6 +559,7 @@ fn kill_child_run(signal: Signal) -> (ProcessGroup, JobGuard, u32, PathBuf) {
 }
 
 #[test]
+#[ignore = "requires check:host on an unsandboxed macOS host"]
 fn next_run_sweeps_the_job_of_a_sigkilled_test_run() {
     let first_run = serial();
     let (_group, job, shim, root) = kill_child_run(Signal::KILL);
@@ -562,6 +576,7 @@ fn next_run_sweeps_the_job_of_a_sigkilled_test_run() {
 }
 
 #[test]
+#[ignore = "requires check:host on an unsandboxed macOS host"]
 fn a_sigtermed_test_run_boots_out_its_own_job() {
     let _serial = serial();
     let (_group, job, shim, root) = kill_child_run(Signal::TERM);

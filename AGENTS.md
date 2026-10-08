@@ -37,6 +37,7 @@ Run project tools through mise tasks, never as bare tools or global installs. Fo
 
 - Run `mise trust`, `mise install`, `mise run vale:sync`, and `mise exec -- prek install` once in each fresh worktree.
 - Run `mise run check` before completion. It runs `check:fmt`, `check:clippy`, `check:test`, `check:boundary`, `check:secrets`, `check:actions`, `check:guard-markdown`, `check:rumdl`, `check:vale`, `check:tombi`, and `check:ryl`.
+- `check` reports the macOS launchd integration tests as not run. Before merging any PR, run `mise run check:host` on an unsandboxed macOS host at the PR's current head SHA. The reviewer and run brief must name that host and record the command, SHA, result, and fixture cleanup result. A green Linux `check` is not evidence for launchd behavior, and an unavailable host run remains a merge blocker.
 - Run `mise run fmt` to apply `cargo fmt` and `tombi format`, then inspect the diff.
 - Run `mise run build` to build every crate.
 - CI runs one job, `check`, on Linux with the mise and cargo caches. It runs `mise run check` and nothing else. A local pass predicts the CI result.

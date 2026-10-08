@@ -5,14 +5,17 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::BorrowedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 
 use hypervisor_core::emulator::Size;
 use hypervisor_core::session::{Exit, Signal, SpawnSpec, Target};
 use rustix::fs::{Mode, OFlags};
-use rustix::io::{Errno, FdFlags};
+use rustix::io::Errno;
+#[cfg(not(target_os = "linux"))]
+use rustix::io::FdFlags;
 use rustix::process::{self as rp, Pid};
 use rustix::pty::{self, OpenptFlags};
 use rustix::termios::{self, Winsize};
@@ -59,14 +62,32 @@ const fn signal_number(signal: Signal) -> rp::Signal {
     }
 }
 
+/// Held across every spawn. macOS `posix_openpt` can't set close-on-exec atomically, so a fork
+/// from another session's spawn between `openpt` and `FD_CLOEXEC` would leave that child holding
+/// this master, and dropping ours would never hang up the slave. The lock keeps this backend's
+/// own forks out of that window; forks from outside the backend are not covered.
+static SPAWN: Mutex<()> = Mutex::new(());
+
+/// Opens a PTY master that is closed on exec.
+fn open_master() -> io::Result<OwnedFd> {
+    #[cfg(target_os = "linux")]
+    let master = pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
+    #[cfg(not(target_os = "linux"))]
+    let master = {
+        let master = pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+        rustix::io::fcntl_setfd(&master, FdFlags::CLOEXEC)?;
+        master
+    };
+    Ok(master)
+}
+
 impl Spawn for UnixSpawner {
     type Pty = UnixPty;
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<UnixPty, PtyError> {
         spec.validate().map_err(PtyError::Spec)?;
-        let master =
-            pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).map_err(io::Error::from)?;
-        rustix::io::fcntl_setfd(&master, FdFlags::CLOEXEC).map_err(io::Error::from)?;
+        let _spawning = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
+        let master = open_master()?;
         pty::grantpt(&master).map_err(io::Error::from)?;
         pty::unlockpt(&master).map_err(io::Error::from)?;
         let name = pty::ptsname(&master, Vec::new()).map_err(io::Error::from)?;

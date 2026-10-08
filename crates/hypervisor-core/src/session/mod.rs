@@ -121,7 +121,8 @@ pub enum Phase {
     Starting,
     /// The child is running, or has exited while its output drains.
     Running,
-    /// The child exited. The final state is kept until `reap_at`.
+    /// The child exited and its output closed, or the exit drain passed first. The final
+    /// state is kept until `reap_at`, which counts `retain_exited` from entering this phase.
     Exited {
         /// How the child ended.
         exit: Exit,
@@ -305,6 +306,10 @@ impl Holder {
             }
             Input::OutputClosed => {
                 self.output_closed = true;
+                if matches!(self.phase, Phase::Exited { .. }) {
+                    // Nothing holds the terminal any more, so a pending group kill has no target.
+                    self.kill_at = None;
+                }
                 if let Some(exit) = self.pending_exit.take() {
                     self.exited(exit, now, &mut fx);
                 }
@@ -394,8 +399,13 @@ impl Holder {
             reap_at: now + self.config.retain_exited,
         };
         self.end_at = None;
-        self.kill_at = None;
         self.drain_until = None;
+        // Open output after the leader exits means a group member still holds the terminal. A
+        // close in progress keeps its kill deadline for it; the group ID can't be reused while
+        // the group has members.
+        if self.output_closed {
+            self.kill_at = None;
+        }
         fx.push(Effect::Emit(SessionEvent::Exited(exit)));
     }
 
@@ -405,7 +415,7 @@ impl Holder {
             self.close(now, fx);
         }
         if due(self.kill_at) {
-            // Also reaches background jobs that keep the terminal open after the leader exits.
+            // Fires after the leader's exit too, for group members that ignored the hangup.
             self.kill_at = None;
             fx.push(Effect::Signal {
                 signal: Signal::Kill,
@@ -422,6 +432,15 @@ impl Holder {
             && reap_at <= now
         {
             self.phase = Phase::Reaped;
+            self.kill_at = None;
+            if !self.output_closed {
+                // A group member still holds the terminal. Kill the group so the slave closes,
+                // the PTY's reader sees the end, and releasing the PTY frees it.
+                fx.push(Effect::Signal {
+                    signal: Signal::Kill,
+                    target: Target::Group,
+                });
+            }
             fx.push(Effect::Release);
             fx.push(Effect::Emit(SessionEvent::Reaped));
         }

@@ -11,10 +11,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[path = "build/git.rs"]
+mod git;
+
+use git::git;
+
 const GHOSTTY_URL: &str = "https://github.com/ghostty-org/ghostty.git";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build/git.rs");
     println!("cargo:rerun-if-changed=ghostty.pin");
     println!("cargo:rerun-if-env-changed=GHOSTTY_VT_SOURCE");
     println!("cargo:rerun-if-env-changed=ZIG");
@@ -91,9 +97,7 @@ fn build(pin: &str, out: &Path, link_dir: &Path) {
 
 fn fetch(pin: &str, src: &Path) {
     if let Some(local) = env::var_os("GHOSTTY_VT_SOURCE") {
-        let mut archive = Command::new("git")
-            .arg("-C")
-            .arg(&local)
+        let mut archive = git(Path::new(&local))
             .args(["archive", "--format=tar", pin])
             .stdout(Stdio::piped())
             .spawn()
@@ -112,26 +116,13 @@ fn fetch(pin: &str, src: &Path) {
             "git archive {pin} failed in GHOSTTY_VT_SOURCE; does the clone hold the pinned commit?"
         );
     } else {
+        run(git(src).args(["init", "-q"]), "git init");
         run(
-            Command::new("git").arg("-C").arg(src).args(["init", "-q"]),
-            "git init",
-        );
-        run(
-            Command::new("git").arg("-C").arg(src).args([
-                "fetch",
-                "-q",
-                "--depth",
-                "1",
-                GHOSTTY_URL,
-                pin,
-            ]),
+            git(src).args(["fetch", "-q", "--depth", "1", GHOSTTY_URL, pin]),
             "git fetch of the pinned Ghostty commit",
         );
         run(
-            Command::new("git")
-                .arg("-C")
-                .arg(src)
-                .args(["checkout", "-q", pin]),
+            git(src).args(["checkout", "-q", pin]),
             "git checkout of the pinned Ghostty commit",
         );
     }

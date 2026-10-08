@@ -10,7 +10,7 @@ Each `expected/<name>.json` file has these fields.
 | --- | --- |
 | `name` | The recording's name, and the JSON file's base name |
 | `file` | The recording's path, relative to this directory |
-| `bytes` and `sha256` | The recording's size in bytes and its SHA-256. The test checks the size |
+| `bytes` and `sha256` | The recording's size in bytes and its SHA-256. The tests check both |
 | `cols` and `rows` | The terminal size it was recorded at, and replayed at |
 | `harness` and `harness_version` | The program recorded: `claude-code`, `codex`, `agy`, `vim`, `htop`, `cargo`, or `synthetic` for a generated stream |
 | `screen_mode` | `alternate` when the session entered the alternate screen, `inline` when it never did |

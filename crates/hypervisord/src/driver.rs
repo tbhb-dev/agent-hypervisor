@@ -18,43 +18,21 @@ use std::time::{Duration, Instant};
 use hypervisor_core::channel::{WireSize, WireSpawnSpec};
 use hypervisor_core::emulator::Size;
 use hypervisor_core::session::{HolderConfig, Persistence, SessionKind, SpawnSpec};
-use hypervisor_core::workload::{self, Recovery, StableId, WorkloadSpec};
+use hypervisor_core::workload::{
+    self, HostDecision, HostRequest as Request, HostResponse as Response, Recovery, StableId,
+    WorkloadSpec,
+};
 use hypervisor_ghostty::GhosttyEmulator;
 use hypervisor_pty::UnixSpawner;
 use hypervisor_session::{Command, LogContext, spawn};
 use rustix::process::{self, Pid, Signal};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::terminal_socket::TerminalSocket;
 
-const MAX_CONTROL: u64 = 1024 * 1024;
+const MAX_CONTROL: usize = 1024 * 1024;
 const START_WAIT: Duration = Duration::from_secs(5);
-
-#[derive(Serialize, Deserialize)]
-enum Request {
-    Ping,
-    Spawn {
-        id: StableId,
-        spec: WireSpawnSpec,
-        size: WireSize,
-    },
-    List,
-    Stats,
-    Events,
-    Stop,
-}
-
-#[derive(Serialize, Deserialize)]
-enum Response {
-    Identity(StableId),
-    SessionSocket(PathBuf),
-    Sessions(Vec<StableId>),
-    Stats { sessions: usize, pid: u32 },
-    Events(Vec<String>),
-    Stopped,
-    Error(String),
-}
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A persisted workload and its observed shim state.
 #[derive(Debug)]
@@ -117,9 +95,12 @@ impl HostDriver {
                     recovery: Recovery::Stopped,
                 },
             );
-            let responded = matches!(driver.call(&id, &Request::Ping), Ok(Response::Identity(found)) if found == id);
+            let found = match driver.call(&id, &Request::Ping) {
+                Ok(Response::Identity(found)) => Some(found),
+                _ => None,
+            };
             if let Some(saved) = driver.workloads.get_mut(&id.label()) {
-                saved.recovery = workload::recovery(&driver.host, &id, responded);
+                saved.recovery = workload::recovery_identity(&driver.host, &id, found.as_ref());
             }
         }
         Ok(driver)
@@ -135,13 +116,10 @@ impl HostDriver {
     /// # Errors
     /// Invalid or duplicate workload, or filesystem failure.
     pub fn create(&mut self, mut spec: WorkloadSpec) -> io::Result<()> {
-        workload::validate_host(&spec).map_err(invalid)?;
-        if spec.id.host != self.host {
-            return Err(invalid("foreign host ID"));
-        }
+        workload::admit_host_workload(&self.host, &spec).map_err(invalid)?;
         spec.workspace_dir = fs::canonicalize(&spec.workspace_dir)?;
         spec.cache_dir = fs::canonicalize(&spec.cache_dir)?;
-        workload::validate_host(&spec).map_err(invalid)?;
+        workload::admit_host_workload(&self.host, &spec).map_err(invalid)?;
         let path = self.metadata(&spec.id);
         let mut file = OpenOptions::new()
             .write(true)
@@ -169,12 +147,8 @@ impl HostDriver {
             .workloads
             .get(&id.label())
             .ok_or_else(|| invalid("unknown workload"))?;
-        if workload.recovery == Recovery::Running {
-            return Err(invalid("workload already running"));
-        }
-        if let Ok(Response::Identity(_)) = self.call(id, &Request::Ping) {
-            return Err(invalid("a shim already answers this workload socket"));
-        }
+        let socket_answers = matches!(self.call(id, &Request::Ping), Ok(Response::Identity(_)));
+        workload::admit_start(workload.recovery, socket_answers).map_err(invalid)?;
         let mut command = ProcessCommand::new(&self.shim_exe);
         command
             .arg("shim")
@@ -326,8 +300,8 @@ impl HostDriver {
             return Err(invalid("unknown workload"));
         }
         let mut stream = UnixStream::connect(self.socket(id))?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_read_timeout(Some(CONTROL_TIMEOUT))?;
+        stream.set_write_timeout(Some(CONTROL_TIMEOUT))?;
         serde_json::to_writer(&mut stream, request)?;
         stream.shutdown(std::net::Shutdown::Write)?;
         serde_json::from_reader(stream).map_err(Into::into)
@@ -360,51 +334,18 @@ pub fn serve(metadata: &Path, root: &Path) -> io::Result<()> {
     let mut sessions: BTreeMap<String, (StableId, HostedSession)> = BTreeMap::new();
     let mut events = vec![format!("workload_started:{}", spec.id.label())];
     loop {
-        let (mut stream, _) = listener.accept()?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        let mut bytes = Vec::new();
-        (&mut stream)
-            .take(MAX_CONTROL + 1)
-            .read_to_end(&mut bytes)?;
-        let request = if bytes.len() as u64 > MAX_CONTROL {
-            None
-        } else {
-            serde_json::from_slice::<Request>(&bytes).ok()
-        };
-        let mut stopping = false;
-        let response = match request {
-            Some(Request::Ping) => Response::Identity(spec.id.clone()),
-            Some(Request::List) => {
-                Response::Sessions(sessions.keys().map(|key| sessions[key].0.clone()).collect())
+        let (mut stream, _) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                eprintln!("host shim accept failed: {error}");
+                thread::sleep(Duration::from_millis(10));
+                continue;
             }
-            Some(Request::Stats) => Response::Stats {
-                sessions: sessions.len(),
-                pid: std::process::id(),
-            },
-            Some(Request::Events) => Response::Events(events.clone()),
-            Some(Request::Spawn {
-                id,
-                spec: session,
-                size,
-            }) => match start_session(root, &spec, id, session, size, &sessions) {
-                Ok((id, hosted)) => {
-                    let path = hosted.path.clone();
-                    events.push(format!("session_created:{}", id.label()));
-                    sessions.insert(id.label(), (id, hosted));
-                    Response::SessionSocket(path)
-                }
-                Err(error) => Response::Error(error.to_string()),
-            },
-            Some(Request::Stop) => {
-                stopping = true;
-                Response::Stopped
-            }
-            None => Response::Error("invalid control request".into()),
         };
-        serde_json::to_writer(&mut stream, &response)?;
-        drop(stream);
-        if stopping {
-            break;
+        match exchange(&mut stream, root, &spec, &mut sessions, &mut events) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(error) => eprintln!("host shim control exchange failed: {error}"),
         }
     }
     for (_, (_, hosted)) in sessions {
@@ -415,6 +356,59 @@ pub fn serve(metadata: &Path, root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn exchange(
+    stream: &mut UnixStream,
+    root: &Path,
+    spec: &WorkloadSpec,
+    sessions: &mut BTreeMap<String, (StableId, HostedSession)>,
+    events: &mut Vec<String>,
+) -> io::Result<bool> {
+    let deadline = Instant::now() + CONTROL_TIMEOUT;
+    let mut bytes = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control request timed out",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let mut chunk = [0; 8192];
+        let limit = (MAX_CONTROL + 1 - bytes.len()).min(chunk.len());
+        match stream.read(&mut chunk[..limit])? {
+            0 => break,
+            count => bytes.extend_from_slice(&chunk[..count]),
+        }
+        if bytes.len() > MAX_CONTROL {
+            return Err(invalid("control request too large"));
+        }
+    }
+    let request: Request = serde_json::from_slice(&bytes)?;
+    let ids: Vec<_> = sessions.values().map(|(id, _)| id.clone()).collect();
+    let decision = workload::control_decision(request, &spec.id, &ids, std::process::id(), events);
+    let response = match decision {
+        HostDecision::Reply(reply) => reply,
+        HostDecision::Spawn {
+            id,
+            spec: session,
+            size,
+        } => match start_session(root, spec, id, session, size, sessions) {
+            Ok((id, hosted)) => {
+                let path = hosted.path.clone();
+                events.push(format!("session_created:{}", id.label()));
+                sessions.insert(id.label(), (id, hosted));
+                Response::SessionSocket(path)
+            }
+            Err(error) => Response::Error(error.to_string()),
+        },
+        HostDecision::Stop => Response::Stopped,
+    };
+    stream.set_write_timeout(Some(CONTROL_TIMEOUT))?;
+    serde_json::to_writer(stream, &response)?;
+    Ok(matches!(response, Response::Stopped))
+}
+
 fn start_session(
     root: &Path,
     workload: &WorkloadSpec,
@@ -423,10 +417,8 @@ fn start_session(
     wire_size: WireSize,
     sessions: &BTreeMap<String, (StableId, HostedSession)>,
 ) -> io::Result<(StableId, HostedSession)> {
-    id.validate().map_err(invalid)?;
-    if id.host != workload.id.host || sessions.contains_key(&id.label()) {
-        return Err(invalid("foreign or duplicate session ID"));
-    }
+    workload::admit_session(&workload.id, &id, sessions.contains_key(&id.label()))
+        .map_err(invalid)?;
     let size =
         Size::new(wire_size.cols, wire_size.rows).map_err(|_| invalid("zero terminal size"))?;
     let kind = match wire.kind {
@@ -443,10 +435,13 @@ fn start_session(
     spec.user = wire.user;
     spec.validate()
         .map_err(|error| invalid(error.to_string()))?;
+    let mut config = HolderConfig::new(Persistence::Persistent);
+    // The shim destroys this session on stop; retaining its exited state delays shutdown.
+    config.retain_exited = Duration::ZERO;
     let handle = spawn(
         UnixSpawner,
         spec,
-        HolderConfig::new(Persistence::Persistent),
+        config,
         LogContext {
             workload_id: workload.id.label(),
             session_id: id.label(),

@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -15,6 +16,7 @@ use hypervisor_core::workload::{
     Isolation, NetworkPolicy, Recovery, ResourceLimits, Runtime, StableId, WorkloadSpec,
 };
 use hypervisord::driver::HostDriver;
+use rustix::process;
 
 #[path = "../../../tests/support/process_group.rs"]
 mod process_group;
@@ -26,6 +28,7 @@ struct Fixture {
     id: StableId,
     shim: Option<process_group::ProcessGroup>,
     child: Option<process_group::ProcessGroup>,
+    child_pid: Option<i32>,
 }
 
 impl Fixture {
@@ -72,6 +75,7 @@ impl Fixture {
                 id,
                 shim: None,
                 child: None,
+                child_pid: None,
             },
             driver,
         )
@@ -106,21 +110,31 @@ impl Fixture {
             )
             .unwrap();
         let start = Instant::now();
-        while !pid_file.exists() {
+        let pid = loop {
+            if let Ok(pid) = fs::read_to_string(&pid_file)
+                && let Ok(pid) = pid.trim().parse()
+            {
+                break pid;
+            }
             assert!(
                 start.elapsed() < Duration::from_secs(5),
                 "session never wrote its PID"
             );
             thread::sleep(Duration::from_millis(10));
-        }
-        let pid = fs::read_to_string(pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        };
         self.child = Some(process_group::ProcessGroup::new(pid));
+        self.child_pid = Some(pid);
         assert_eq!(driver.list_sessions(&self.id).unwrap(), vec![id]);
         path
+    }
+
+    fn control_socket(&self) -> PathBuf {
+        let name = fs::read_dir(&self.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .unwrap();
+        name.with_extension("sock")
     }
 }
 
@@ -142,6 +156,17 @@ impl Drop for Fixture {
 
 fn shim_exe() -> &'static std::path::Path {
     std::path::Path::new(env!("CARGO_BIN_EXE_host-shim"))
+}
+
+fn shell_spec() -> WireSpawnSpec {
+    WireSpawnSpec {
+        command: "/bin/true".into(),
+        args: vec![],
+        env: vec![],
+        cwd: None,
+        user: None,
+        kind: SessionKind::Shell,
+    }
 }
 
 fn open_existing(path: &std::path::Path) {
@@ -184,11 +209,141 @@ fn starts_spawns_and_stops_with_a_terminal_socket() {
     open_existing(&socket);
     assert_eq!(driver.stats(&fixture.id).unwrap(), 1);
     assert_eq!(driver.events(&fixture.id).unwrap().len(), 2);
+    let stop_started = Instant::now();
     driver.stop(&fixture.id).unwrap();
+    assert!(stop_started.elapsed() < Duration::from_secs(20));
+    assert!(
+        process::test_kill_process_group(
+            rustix::process::Pid::from_raw(fixture.child_pid.unwrap()).unwrap()
+        )
+        .is_err(),
+        "stop left the session process group alive"
+    );
     assert_eq!(
         driver.workloads()[&fixture.id.label()].recovery,
         Recovery::Stopped
     );
+}
+
+#[test]
+fn silent_control_client_does_not_kill_shim_or_session() {
+    let (mut fixture, mut driver) = Fixture::new();
+    fixture.start(&mut driver);
+    fixture.session(&driver);
+    let _silent = UnixStream::connect(fixture.control_socket()).unwrap();
+    thread::sleep(Duration::from_secs(3));
+    assert_eq!(driver.list_sessions(&fixture.id).unwrap().len(), 1);
+}
+
+#[test]
+fn slow_control_client_does_not_kill_shim_or_session() {
+    let (mut fixture, mut driver) = Fixture::new();
+    fixture.start(&mut driver);
+    fixture.session(&driver);
+    let mut slow = UnixStream::connect(fixture.control_socket()).unwrap();
+    slow.write_all(b"{\"Pi").unwrap();
+    thread::sleep(Duration::from_secs(3));
+    assert_eq!(driver.list_sessions(&fixture.id).unwrap().len(), 1);
+}
+
+#[test]
+fn half_open_and_oversized_control_clients_do_not_kill_shim() {
+    let (mut fixture, mut driver) = Fixture::new();
+    fixture.start(&mut driver);
+    fixture.session(&driver);
+    let mut half_open = UnixStream::connect(fixture.control_socket()).unwrap();
+    half_open.write_all(b"{\"Pi").unwrap();
+    half_open.shutdown(std::net::Shutdown::Write).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(driver.list_sessions(&fixture.id).unwrap().len(), 1);
+    drop(half_open);
+
+    let mut oversized = UnixStream::connect(fixture.control_socket()).unwrap();
+    oversized
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    oversized.write_all(&vec![b' '; 1024 * 1024 + 1]).unwrap();
+    oversized.shutdown(std::net::Shutdown::Write).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(driver.list_sessions(&fixture.id).unwrap().len(), 1);
+}
+
+#[test]
+fn duplicate_start_and_session_ids_are_refused() {
+    let (mut fixture, mut driver) = Fixture::new();
+    fixture.start(&mut driver);
+    let error = driver.start(&fixture.id).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(error.to_string(), "workload already running");
+    fixture.session(&driver);
+    let duplicate = StableId {
+        host: fixture.id.host.clone(),
+        local: "session".into(),
+    };
+    let foreign = StableId {
+        host: "other".into(),
+        local: "session".into(),
+    };
+    for id in [duplicate, foreign] {
+        let error = driver
+            .spawn_session(
+                &fixture.id,
+                id,
+                shell_spec(),
+                WireSize { cols: 80, rows: 24 },
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "foreign or duplicate session ID");
+    }
+    assert_eq!(driver.list_sessions(&fixture.id).unwrap().len(), 1);
+}
+
+#[test]
+fn running_workload_cannot_be_destroyed() {
+    let (mut fixture, mut driver) = Fixture::new();
+    fixture.start(&mut driver);
+    assert!(driver.destroy(&fixture.id).is_err());
+    assert!(driver.workloads().contains_key(&fixture.id.label()));
+}
+
+#[test]
+fn foreign_workload_cannot_be_created() {
+    let (fixture, mut driver) = Fixture::new();
+    let mut spec = driver.workloads()[&fixture.id.label()].spec.clone();
+    spec.id.host = "another-host".into();
+    assert!(driver.create(spec).is_err());
+}
+
+#[test]
+fn open_rejects_identity_from_a_different_workload() {
+    let (mut fixture, mut driver) = Fixture::new();
+    fixture.start(&mut driver);
+    let first_socket = fixture.control_socket();
+    let mut second = driver.workloads()[&fixture.id.label()].spec.clone();
+    second.id.local = "second".into();
+    let second_id = second.id.clone();
+    driver.create(second).unwrap();
+    driver.start(&second_id).unwrap();
+    let mut second_group =
+        process_group::ProcessGroup::new(driver.shim_pid(&second_id).unwrap().cast_signed());
+    let second_socket = fs::read_dir(&fixture.root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
+        .find(|path| *path != first_socket)
+        .unwrap();
+    driver.stop(&fixture.id).unwrap();
+    std::os::unix::fs::symlink(second_socket, first_socket).unwrap();
+    let recovered = HostDriver::open(&fixture.root, &fixture.id.host, shim_exe()).unwrap();
+    assert_eq!(
+        recovered.workloads()[&fixture.id.label()].recovery,
+        Recovery::Stopped
+    );
+    assert_eq!(
+        recovered.workloads()[&second_id.label()].recovery,
+        Recovery::Running
+    );
+    second_group.kill();
 }
 
 #[test]

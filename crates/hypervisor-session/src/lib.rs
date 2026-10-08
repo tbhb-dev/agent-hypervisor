@@ -54,6 +54,14 @@ pub enum Command {
         NonZeroUsize,
         Sender<Result<(), Refusal>>,
     ),
+    /// Attach and report the size and output sequence in the same actor turn.
+    AttachChannel(
+        ViewerId,
+        ViewerMode,
+        Size,
+        NonZeroUsize,
+        Sender<Result<(Size, u64), Refusal>>,
+    ),
     /// Detach a viewer.
     Detach(ViewerId, Sender<Result<(), Refusal>>),
     /// Explicitly take the lock.
@@ -78,14 +86,12 @@ pub enum Command {
     ReadFrom(u64, Sender<RingRead>),
     /// The screen as VT bytes, or `None` once the session is reaped.
     Snapshot(Sender<Option<Vec<u8>>>),
-    /// Atomically read the effective size and next output byte offset.
-    ChannelInfo(Sender<(Size, u64)>),
 }
 
 #[cfg(test)]
 mod log_tests {
     use super::*;
-    use hypervisor_core::session::{Persistence, Signal, Target};
+    use hypervisor_core::session::{Persistence, Signal, Target, ViewerRead};
     use hypervisor_ghostty::GhosttyEmulator;
     use hypervisor_pty::{Caps, Resize, Support};
     use serde_json::Value;
@@ -145,6 +151,51 @@ mod log_tests {
                 resize_repaints: false,
             }
         }
+    }
+
+    #[test]
+    fn channel_attach_reports_the_first_queued_output_sequence() {
+        let mut actor: Actor<FailingWrite, GhosttyEmulator> = Actor {
+            holder: Holder::new(
+                HolderConfig::new(Persistence::Persistent),
+                Size::new(80, 24).unwrap(),
+            ),
+            pty: Some(FailingWrite),
+            emulator: None,
+            events: Vec::new(),
+            event_seq: 0,
+            origin: Instant::now(),
+            log: LogContext {
+                workload_id: "test".into(),
+                session_id: "test".into(),
+            },
+            queries: QueryScanner::default(),
+            screen_harness: None,
+            screen_at: None,
+            error_lines: Vec::new(),
+        };
+        actor.step(Input::Spawned).unwrap();
+        actor.handle(Msg::Output(b"before".to_vec()));
+        let viewer = ViewerId(1);
+        let (reply, answer) = mpsc::channel();
+        actor.handle(Msg::Command(Command::AttachChannel(
+            viewer,
+            ViewerMode::ReadOnly,
+            Size::new(80, 24).unwrap(),
+            NonZeroUsize::new(64).unwrap(),
+            reply,
+        )));
+        actor.handle(Msg::Output(b"after".to_vec()));
+        let (size, starting_sequence) = answer.recv().unwrap().unwrap();
+        assert_eq!(size, Size::new(80, 24).unwrap());
+        assert_eq!(starting_sequence, 6);
+        assert_eq!(
+            actor.holder.read_viewer(viewer),
+            Ok(ViewerRead::Output {
+                seq: starting_sequence,
+                bytes: b"after".to_vec(),
+            })
+        );
     }
 
     #[test]
@@ -361,6 +412,22 @@ impl SessionHandle {
         self.request(|reply| Command::Attach(id, mode, size, budget, reply))
     }
 
+    /// Attach a channel and return the size and sequence at that attachment point.
+    ///
+    /// # Errors
+    /// If the viewer is already attached or the actor has ended.
+    pub fn attach_channel(
+        &self,
+        id: ViewerId,
+        mode: ViewerMode,
+        size: Size,
+        budget: NonZeroUsize,
+    ) -> Result<(Size, u64), Refusal> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Command::AttachChannel(id, mode, size, budget, reply));
+        answer.recv().unwrap_or(Err(Refusal::UnknownViewer))
+    }
+
     /// Detach a viewer.
     ///
     /// # Errors
@@ -421,14 +488,6 @@ impl SessionHandle {
     /// If the caller does not hold the lock or the actor has ended.
     pub fn signal(&self, who: Writer, signal: Signal) -> Result<(), Refusal> {
         self.request(|reply| Command::Signal(who, signal, reply))
-    }
-
-    /// Effective PTY size and the next output byte sequence, in one actor turn.
-    #[must_use]
-    pub fn channel_info(&self) -> Option<(Size, u64)> {
-        let (reply, answer) = mpsc::channel();
-        self.send(Command::ChannelInfo(reply));
-        answer.recv().ok()
     }
 
     /// Pop the next output item, including a resync notice after overflow.
@@ -701,6 +760,17 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                     let _ = reply.send(result);
                     return;
                 }
+                Command::AttachChannel(id, mode, size, budget, reply) => {
+                    let result = self.step(Input::Attach {
+                        viewer: id,
+                        mode,
+                        size,
+                        budget,
+                    });
+                    let _ = reply
+                        .send(result.map(|()| (self.holder.size(), self.holder.ring().next())));
+                    return;
+                }
                 Command::Detach(id, reply) => {
                     let _ = reply.send(self.step(Input::Detach(id)));
                     return;
@@ -748,10 +818,6 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                 Command::Snapshot(reply) => {
                     let screen = self.emulator.as_ref().filter(|_| self.holder.has_screen());
                     let _ = reply.send(screen.map(Emulator::serialize_vt));
-                    return;
-                }
-                Command::ChannelInfo(reply) => {
-                    let _ = reply.send((self.holder.size(), self.holder.ring().next()));
                     return;
                 }
             },

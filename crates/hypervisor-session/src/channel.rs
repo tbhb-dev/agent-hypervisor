@@ -38,13 +38,9 @@ impl<'a> Channel<'a> {
             .into_session()
             .map_err(|_| refusal(OpenRefusal::InvalidRequest))?;
         let events = session.subscribe();
-        session
-            .attach(viewer, request.mode.into_viewer(), size, VIEWER_BUDGET)
+        let (effective_size, starting_sequence) = session
+            .attach_channel(viewer, request.mode.into_viewer(), size, VIEWER_BUDGET)
             .map_err(|_| refusal(OpenRefusal::SessionRefused))?;
-        let Some((effective_size, starting_sequence)) = session.channel_info() else {
-            let _ = session.detach(viewer);
-            return Err(refusal(OpenRefusal::SessionRefused));
-        };
         let response = Frame::OpenResponse(OpenResponse::from_session(
             request.mode,
             effective_size,

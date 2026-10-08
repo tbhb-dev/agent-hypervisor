@@ -203,7 +203,6 @@ fn terminal_channel_open_input_resize_controls_and_events() {
         channel
             .receive(Frame::Input(b"blocked\n".to_vec()))
             .unwrap();
-        assert!(!output(session).contains("got:blocked"));
         assert_eq!(
             channel.receive(Frame::Control(Control::Signal(WireSignal::Interrupt))),
             Ok(Some(Frame::ControlResult(ControlResult::Refused)))
@@ -224,7 +223,8 @@ fn terminal_channel_open_input_resize_controls_and_events() {
             Event::WriterChanged(Some(_))
         ));
         channel.receive(Frame::Input(b"one\n".to_vec())).unwrap();
-        wait_for_output(session, "got:one");
+        let observed = wait_for_output(session, "got:one");
+        assert!(!observed.contains("got:blocked"));
         channel
             .receive(Frame::Resize(WireSize {
                 cols: 100,
@@ -258,11 +258,15 @@ fn terminal_channel_open_input_resize_controls_and_events() {
         channel
             .receive(Frame::Input(b"blocked2\n".to_vec()))
             .unwrap();
-        assert!(!output(session).contains("got:blocked2"));
         assert_eq!(
             channel.receive(Frame::Control(Control::Take)),
             Ok(Some(Frame::ControlResult(ControlResult::Accepted)))
         );
+        channel
+            .receive(Frame::Input(b"sentinel\n".to_vec()))
+            .unwrap();
+        let observed = wait_for_output(session, "got:sentinel");
+        assert!(!observed.contains("got:blocked2"));
         assert_eq!(
             channel.receive(Frame::Control(Control::Signal(WireSignal::Kill))),
             Ok(Some(Frame::ControlResult(ControlResult::Accepted)))
@@ -308,13 +312,27 @@ fn terminal_channel_reports_resync_after_viewer_overflow() {
     let session = fixture.session();
     let pgid = fixture_pgid(&wait_for_output(session, "ready"));
     {
-        let (mut channel, _) = Channel::open(session, ViewerId(83), &open_request())
+        let (mut channel, response) = Channel::open(session, ViewerId(83), &open_request())
             .unwrap_or_else(|_| panic!("open refused"));
+        let Frame::OpenResponse(response) = response else {
+            panic!("wrong open response")
+        };
         channel.receive(Frame::Control(Control::Take)).unwrap();
         channel.receive(Frame::Input(b"go\n".to_vec())).unwrap();
+        let Event::ResyncRequired { oldest } =
+            channel_event(&channel, |e| matches!(e, Event::ResyncRequired { .. }))
+        else {
+            panic!("wrong resync event")
+        };
+        let retained_oldest = match session.read_from(0) {
+            Some(RingRead::Bytes(_)) => 0,
+            Some(RingRead::Gone { oldest }) => oldest,
+            other => panic!("unexpected ring read: {other:?}"),
+        };
+        assert_eq!(oldest, retained_oldest);
         assert!(matches!(
-            channel_event(&channel, |e| matches!(e, Event::ResyncRequired { .. })),
-            Event::ResyncRequired { .. }
+            session.read_from(response.starting_sequence),
+            Some(RingRead::Bytes(bytes)) if !bytes.is_empty()
         ));
     }
     fixture.finish(pgid);

@@ -105,7 +105,7 @@ It holds 20 recordings at 120 by 40: nine Claude Code and Codex sessions from ru
 - `diff` compares only the area two grids share: [#9](https://github.com/tbhb-dev/agent-hypervisor/issues/9).
 - The build stamp ignores the Zig version: [#10](https://github.com/tbhb-dev/agent-hypervisor/issues/10).
 - Zig's global cache is outside the build directory, and a cold build fetches over the network: [#11](https://github.com/tbhb-dev/agent-hypervisor/issues/11).
-- `serialize_vt` omits the primary screen behind an active alternate screen, scrollback, scroll regions, tab stops, charsets, hyperlinks, titles, palette changes, kitty flags, or a pending wrap. Run 14 decides which of these the channel needs.
+- `serialize_vt` omits the primary screen behind an active alternate screen, scrollback, scroll regions, tab stops, charsets, titles, palette changes, kitty flags, or a pending wrap. Run 15 adds OSC 8 links for active-screen cells. Run 14 decides which remaining state the byte snapshot needs.
 - Grid reads take one FFI lookup per cell, and their cost at scale is untested.
 - A cold build compiles libghostty-vt twice, once each for clippy and test.
 

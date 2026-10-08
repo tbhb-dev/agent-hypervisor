@@ -1,7 +1,7 @@
 //! Query replies, modes, and sizes on small hand-written inputs.
 
 use hypervisor_core::emulator::{
-    Emulator, MouseFormat, MouseTracking, Screen, Size, XTVERSION_NAME, diff,
+    Emulator, MouseFormat, MouseTracking, PROFILE, Screen, Size, diff,
 };
 use hypervisor_ghostty::GhosttyEmulator;
 
@@ -22,7 +22,7 @@ fn device_attributes_report_a_vt220_with_ansi_color() {
 #[test]
 fn xtversion_names_the_hypervisor() {
     let r = reply(b"\x1b[>q");
-    assert!(r.contains(XTVERSION_NAME), "{r:?}");
+    assert!(r.contains(PROFILE.version), "{r:?}");
 }
 
 #[test]

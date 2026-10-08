@@ -11,7 +11,10 @@ mod supplement;
 mod vt;
 
 pub use diff::{CellDiff, diff};
-pub use reply::{DEVICE_ATTRIBUTES, DeviceAttributes, XTVERSION_NAME, admit_reply};
+pub use reply::{
+    CapabilityProfile, DeviceAttributes, PROFILE, QueryScanner, ViewerInputFilter, admit_reply,
+    is_terminal_reply,
+};
 pub use supplement::{CsiEffect, TRACKED_MODES, csi_effects};
 pub use vt::serialize;
 

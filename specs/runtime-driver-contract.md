@@ -18,6 +18,8 @@ Run 17 provisionally places shim creation, reconnection, and stop in the privile
 
 Host stop asks the merged holder to hang up and then kill each PTY process group. A descendant that escapes its group with `setsid()` can keep running after host stop ([#47](https://github.com/tbhb-dev/agent-hypervisor/issues/47)). The host user boundary limits containment here. Session sockets remain direct local transports from run 16. The later proxy and authorization phases must constrain who can use them ([#76](https://github.com/tbhb-dev/agent-hypervisor/issues/76)).
 
+The shim limits each control request to 1 MiB and two seconds from connection, then drops a malformed, oversized, silent, or slow connection without ending the shim or its sessions. A stop request closes every held session and waits for its process group to end before removing the shim socket. Shim-owned sessions do not retain their exited state during stop. This avoids the holder's default 60-second retention delay while keeping the two-second group-kill grace.
+
 ## Source and merged-code differences
 
 The source is `tbhb-dev/agent-orchestration-poc.internal` commit `27a69f821634b71243ac76e837ca322f34ef68cb`, `wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/source.md`, lines 29 to 34, 95 to 120, 157 to 173, and 343. The run table in the proposal at that commit assigns launchd registration to run 18.

@@ -10,8 +10,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -417,6 +417,13 @@ struct HostedSession {
     thread: JoinHandle<()>,
 }
 
+struct ShimState {
+    sessions: BTreeMap<String, (StableId, HostedSession)>,
+    events: Vec<String>,
+    stopping: bool,
+    stop_replied: bool,
+}
+
 /// Run the shim process. The caller passes paths from its private registry.
 ///
 /// # Errors
@@ -426,8 +433,8 @@ pub fn serve(metadata: &Path, root: &Path) -> io::Result<()> {
     workload::validate_host(&spec).map_err(invalid)?;
     let socket = root.join(format!("{}.sock", label_hash(&spec.id)));
     // A stale socket from a dead shim is removed only after connection fails.
-    let stale = socket.exists();
-    if stale {
+    let stale_socket = socket.exists();
+    if stale_socket {
         if UnixStream::connect(&socket).is_ok() {
             return Err(invalid("shim already running"));
         }
@@ -435,23 +442,54 @@ pub fn serve(metadata: &Path, root: &Path) -> io::Result<()> {
     }
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, Permissions::from_mode(0o600))?;
-    let mut sessions: BTreeMap<String, (StableId, HostedSession)> = BTreeMap::new();
-    let mut events = workload::start_events(&spec.id, stale);
+    listener.set_nonblocking(true)?;
+    let state = Arc::new(Mutex::new(ShimState {
+        sessions: BTreeMap::new(),
+        events: workload::start_events(&spec.id, stale_socket),
+        stopping: false,
+        stop_replied: false,
+    }));
+    let spec = Arc::new(spec);
     loop {
+        if state
+            .lock()
+            .map_err(|_| io::Error::other("shim state poisoned"))?
+            .stop_replied
+        {
+            break;
+        }
         let (mut stream, _) = match listener.accept() {
             Ok(accepted) => accepted,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             Err(error) => {
                 eprintln!("host shim accept failed: {error}");
                 thread::sleep(Duration::from_millis(10));
                 continue;
             }
         };
-        match exchange(&mut stream, root, &spec, &mut sessions, &mut events) {
-            Ok(true) => break,
-            Ok(false) => {}
-            Err(error) => eprintln!("host shim control exchange failed: {error}"),
+        if let Err(error) = stream.set_nonblocking(false) {
+            eprintln!("host shim control setup failed: {error}");
+            continue;
         }
+        let state = Arc::clone(&state);
+        let spec = Arc::clone(&spec);
+        let root = root.to_path_buf();
+        let deadline = Instant::now() + CONTROL_TIMEOUT;
+        thread::spawn(move || {
+            if let Err(error) = exchange(&mut stream, &root, &spec, &state, deadline) {
+                eprintln!("host shim control exchange failed: {error}");
+            }
+        });
     }
+    let sessions = std::mem::take(
+        &mut state
+            .lock()
+            .map_err(|_| io::Error::other("shim state poisoned"))?
+            .sessions,
+    );
     for (_, (_, hosted)) in sessions {
         hosted.stop.store(true, Ordering::Relaxed);
         let _ = hosted.thread.join();
@@ -464,10 +502,9 @@ fn exchange(
     stream: &mut UnixStream,
     root: &Path,
     spec: &WorkloadSpec,
-    sessions: &mut BTreeMap<String, (StableId, HostedSession)>,
-    events: &mut Vec<String>,
-) -> io::Result<bool> {
-    let deadline = Instant::now() + CONTROL_TIMEOUT;
+    state: &Mutex<ShimState>,
+    deadline: Instant,
+) -> io::Result<()> {
     let mut bytes = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -489,28 +526,48 @@ fn exchange(
         }
     }
     let request: Request = serde_json::from_slice(&bytes)?;
-    let ids: Vec<_> = sessions.values().map(|(id, _)| id.clone()).collect();
-    let decision = workload::control_decision(request, &spec.id, &ids, std::process::id(), events);
-    let response = match decision {
-        HostDecision::Reply(reply) => reply,
-        HostDecision::Spawn {
-            id,
-            spec: session,
-            size,
-        } => match start_session(root, spec, id, session, size, sessions) {
-            Ok((id, hosted)) => {
-                let path = hosted.path.clone();
-                events.push(format!("session_created:{}", id.label()));
-                sessions.insert(id.label(), (id, hosted));
-                Response::SessionSocket(path)
+    let response = {
+        let mut state = state
+            .lock()
+            .map_err(|_| io::Error::other("shim state poisoned"))?;
+        if state.stopping {
+            return Ok(());
+        }
+        let ids: Vec<_> = state.sessions.values().map(|(id, _)| id.clone()).collect();
+        let decision =
+            workload::control_decision(request, &spec.id, &ids, std::process::id(), &state.events);
+        match decision {
+            HostDecision::Reply(reply) => reply,
+            HostDecision::Spawn {
+                id,
+                spec: session,
+                size,
+            } => match start_session(root, spec, id, session, size, &state.sessions) {
+                Ok((id, hosted)) => {
+                    let path = hosted.path.clone();
+                    state.events.push(format!("session_created:{}", id.label()));
+                    state.sessions.insert(id.label(), (id, hosted));
+                    Response::SessionSocket(path)
+                }
+                Err(error) => Response::Error(error.to_string()),
+            },
+            HostDecision::Stop => {
+                state.stopping = true;
+                Response::Stopped
             }
-            Err(error) => Response::Error(error.to_string()),
-        },
-        HostDecision::Stop => Response::Stopped,
+        }
     };
-    stream.set_write_timeout(Some(CONTROL_TIMEOUT))?;
-    serde_json::to_writer(stream, &response)?;
-    Ok(matches!(response, Response::Stopped))
+    let stopped = matches!(response, Response::Stopped);
+    let result = stream
+        .set_write_timeout(Some(CONTROL_TIMEOUT))
+        .and_then(|()| serde_json::to_writer(stream, &response).map_err(Into::into));
+    if stopped {
+        state
+            .lock()
+            .map_err(|_| io::Error::other("shim state poisoned"))?
+            .stop_replied = true;
+    }
+    result
 }
 
 fn start_session(

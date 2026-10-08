@@ -236,6 +236,40 @@ fn silent_control_client_does_not_kill_shim_or_session() {
 }
 
 #[test]
+fn silent_and_slow_control_clients_do_not_delay_another_request() {
+    let (mut fixture, mut driver) = Fixture::new();
+    fixture.start(&mut driver);
+    let _silent = UnixStream::connect(fixture.control_socket()).unwrap();
+    let mut slow = UnixStream::connect(fixture.control_socket()).unwrap();
+    slow.write_all(b"{\"Pi").unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    assert_eq!(driver.stats(&fixture.id).unwrap(), 0);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a silent client delayed another control request"
+    );
+}
+
+#[test]
+fn delayed_control_request_gets_a_reply() {
+    let (mut fixture, mut driver) = Fixture::new();
+    fixture.start(&mut driver);
+    let mut stream = UnixStream::connect(fixture.control_socket()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    stream.write_all(b"\"Stats\"").unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let reply: hypervisor_core::workload::HostResponse = serde_json::from_reader(stream).unwrap();
+    assert!(matches!(
+        reply,
+        hypervisor_core::workload::HostResponse::Stats { sessions: 0, .. }
+    ));
+}
+
+#[test]
 fn slow_control_client_does_not_kill_shim_or_session() {
     let (mut fixture, mut driver) = Fixture::new();
     fixture.start(&mut driver);

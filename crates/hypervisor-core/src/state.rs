@@ -60,6 +60,53 @@ impl HookKind {
     }
 }
 
+/// State-bearing fields decoded from a harness payload. The shell supplies plain values;
+/// this core chooses among the harness-specific names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HookFields<'a> {
+    pub hook_event_name: Option<&'a str>,
+    pub event: Option<&'a str>,
+    pub notification_type: Option<&'a str>,
+    pub enums_notification_type: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub conversation_id: Option<&'a str>,
+    pub fully_idle: Option<bool>,
+    pub fully_idle_snake: Option<bool>,
+    pub enums_fully_idle: Option<bool>,
+}
+
+/// A payload with only the fields needed for state or audit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormalizedHook<'a> {
+    pub name: &'a str,
+    pub kind: HookKind,
+    pub notification_type: Option<&'a str>,
+    pub claimed_session_id: Option<&'a str>,
+    pub fully_idle: Option<bool>,
+}
+
+#[must_use]
+pub fn normalize_hook_fields(harness: Harness, fields: HookFields<'_>) -> NormalizedHook<'_> {
+    let name = fields.hook_event_name.or(fields.event).unwrap_or("");
+    let fully_idle = fields
+        .fully_idle
+        .or(fields.fully_idle_snake)
+        .or(fields.enums_fully_idle);
+    let notification_type = fields.notification_type.or(fields.enums_notification_type);
+    NormalizedHook {
+        name,
+        kind: HookKind::from_fields(
+            harness,
+            name,
+            notification_type,
+            fully_idle.unwrap_or(false),
+        ),
+        notification_type,
+        claimed_session_id: fields.session_id.or(fields.conversation_id),
+        fully_idle,
+    }
+}
+
 /// A report received from one session's socket. The listener, not a payload session ID,
 /// determines which holder gets the report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,7 +179,9 @@ impl StateMachine {
         // Any subsequent event cancels an outstanding agy PreToolUse timeout.
         self.pending_agy_tool = None;
         let next = match (report.harness, report.kind) {
-            (_, HookKind::SessionEnd) => AgentState::Exited,
+            // Claude sends SessionEnd on /clear and /resume while the child keeps running.
+            // Only the holder's child exit is terminal.
+            (_, HookKind::SessionEnd) => AgentState::Unknown,
             (Harness::Claude, HookKind::SessionStart)
             | (Harness::Claude | Harness::Codex, HookKind::Stop { .. })
             | (Harness::Codex, HookKind::Interrupt)
@@ -142,9 +191,10 @@ impl StateMachine {
                 HookKind::UserPromptSubmit | HookKind::PreToolUse,
             )
             | (Harness::Claude, HookKind::MessageDisplay)
-            | (Harness::Agy, HookKind::PreInvocation | HookKind::PostInvocation) => {
-                AgentState::Working
-            }
+            | (
+                Harness::Agy,
+                HookKind::PreInvocation | HookKind::PostInvocation | HookKind::PostToolUse,
+            ) => AgentState::Working,
             (Harness::Claude | Harness::Codex, HookKind::PermissionRequest)
             | (Harness::Claude, HookKind::NotificationPermission) => AgentState::Blocked {
                 reason: BlockReason::Approval,
@@ -296,20 +346,115 @@ mod tests {
     }
 
     #[test]
-    fn unreported_ctrl_c_plan_prompt_and_silence_leave_stale_working() {
-        for harness in [Harness::Claude, Harness::Agy, Harness::Codex] {
-            let mut s = StateMachine::default();
-            let start = if harness == Harness::Agy {
-                HookKind::PreInvocation
-            } else {
-                HookKind::UserPromptSubmit
-            };
-            s.report(report(harness, start, 1, 0));
-            // Claude and agy did not fire a hook on Ctrl-C at their approval prompts.
-            // Codex plan-mode input and a silent hook source also have no event here.
-            s.tick(Duration::from_secs(60));
-            assert_eq!(s.state(), AgentState::Working);
+    fn claude_clear_restarts_a_live_session() {
+        let mut s = StateMachine::default();
+        s.report(report(Harness::Claude, HookKind::UserPromptSubmit, 1, 0));
+        s.report(report(Harness::Claude, HookKind::SessionEnd, 2, 1));
+        assert_eq!(s.state(), AgentState::Unknown);
+        s.report(report(Harness::Claude, HookKind::SessionStart, 3, 2));
+        assert_eq!(s.state(), AgentState::Idle);
+        s.report(report(Harness::Claude, HookKind::UserPromptSubmit, 4, 3));
+        assert_eq!(s.state(), AgentState::Working);
+    }
+
+    #[test]
+    fn claude_ctrl_c_at_approval_has_no_hook() {
+        let mut s = StateMachine::default();
+        for (seq, kind) in [
+            HookKind::UserPromptSubmit,
+            HookKind::PreToolUse,
+            HookKind::PermissionRequest,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.report(report(Harness::Claude, kind, seq as u64 + 1, seq as u64));
         }
+        s.tick(Duration::from_secs(60)); // Ctrl-C produced no hook in run 3.
+        assert_eq!(
+            s.state(),
+            AgentState::Blocked {
+                reason: BlockReason::Approval
+            }
+        );
+    }
+
+    #[test]
+    fn agy_ctrl_c_at_approval_has_no_hook() {
+        let mut s = StateMachine::default();
+        s.report(report(Harness::Agy, HookKind::PreInvocation, 1, 0));
+        s.report(report(Harness::Agy, HookKind::PreToolUse, 2, 1));
+        s.tick(Duration::from_millis(501));
+        s.tick(Duration::from_secs(60)); // Ctrl-C produced no hook in run 5.
+        assert_eq!(
+            s.state(),
+            AgentState::Blocked {
+                reason: BlockReason::Unknown
+            }
+        );
+    }
+
+    #[test]
+    fn silent_source_after_working_remains_stale() {
+        let mut s = StateMachine::default();
+        s.report(report(Harness::Codex, HookKind::UserPromptSubmit, 1, 0));
+        s.tick(Duration::from_secs(60));
+        assert_eq!(s.state(), AgentState::Working);
+    }
+
+    #[test]
+    fn notification_can_be_first_approval_signal() {
+        let mut s = StateMachine::default();
+        s.report(report(Harness::Claude, HookKind::UserPromptSubmit, 1, 0));
+        s.report(report(
+            Harness::Claude,
+            HookKind::NotificationPermission,
+            2,
+            1,
+        ));
+        assert_eq!(
+            s.state(),
+            AgentState::Blocked {
+                reason: BlockReason::Approval
+            }
+        );
+    }
+
+    #[test]
+    fn recorded_agy_stop_uses_nested_fully_idle() {
+        let hook = normalize_hook_fields(
+            Harness::Agy,
+            HookFields {
+                event: Some("Stop"),
+                enums_fully_idle: Some(true),
+                conversation_id: Some("audit-only"),
+                ..HookFields::default()
+            },
+        );
+        assert_eq!(hook.kind, HookKind::Stop { fully_idle: true });
+        assert_eq!(hook.claimed_session_id, Some("audit-only"));
+    }
+
+    #[test]
+    fn agy_post_tool_unblocks_after_approval() {
+        let mut s = StateMachine::default();
+        s.report(report(Harness::Agy, HookKind::PreToolUse, 1, 0));
+        s.tick(Duration::from_millis(500));
+        s.report(report(Harness::Agy, HookKind::PostToolUse, 2, 501));
+        assert_eq!(s.state(), AgentState::Working);
+    }
+
+    #[test]
+    fn claude_notification_normalizes_before_permission_request() {
+        let hook = normalize_hook_fields(
+            Harness::Claude,
+            HookFields {
+                hook_event_name: Some("Notification"),
+                notification_type: Some("permission_prompt"),
+                ..HookFields::default()
+            },
+        );
+        assert_eq!(hook.kind, HookKind::NotificationPermission);
     }
 
     #[test]

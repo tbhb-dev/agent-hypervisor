@@ -94,7 +94,7 @@ fn hook_client_delivers_and_fails_open() {
     assert!(child.wait().unwrap().success());
     assert_eq!(received.kind, HookKind::PermissionRequest);
     assert_eq!(received.claimed_session_id.as_deref(), Some("claimed"));
-    assert_eq!(received.seq, 1);
+    assert!(received.seq > 0);
     println!("live listener: {:?}", start.elapsed());
     let missing = root.join("missing.s");
     let start = Instant::now();
@@ -143,7 +143,7 @@ fn socket_directory_is_private_and_identity_is_listener() {
     );
     let mut stream = UnixStream::connect(socket.path()).unwrap();
     stream
-        .write_all(b"{\"harness\":\"codex\",\"event\":\"Stop\",\"claimed_session_id\":\"some-other-session\"}\n")
+        .write_all(b"{\"harness\":\"codex\",\"event\":\"Stop\",\"seq\":1,\"claimed_session_id\":\"some-other-session\"}\n")
         .unwrap();
     let report = socket.receive_one().unwrap();
     drop(stream);
@@ -152,6 +152,33 @@ fn socket_directory_is_private_and_identity_is_listener() {
         Some("some-other-session")
     );
     assert_eq!(report.kind, HookKind::Stop { fully_idle: false });
+    drop(socket);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn source_sequence_rejects_a_late_report() {
+    let root = std::env::temp_dir().join(format!("hv-hook-order-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let mut socket = HookSocket::bind(&root, "workspace", "session").unwrap();
+    let mut machine = StateMachine::default();
+    for (seq, event) in [(20, "Stop"), (19, "PreToolUse")] {
+        let mut stream = UnixStream::connect(socket.path()).unwrap();
+        writeln!(
+            stream,
+            "{{\"harness\":\"codex\",\"event\":\"{event}\",\"seq\":{seq}}}"
+        )
+        .unwrap();
+        let received = socket.receive_one().unwrap();
+        assert_eq!(received.seq, seq);
+        machine.report(HookReport {
+            harness: received.harness,
+            kind: received.kind,
+            seq: received.seq,
+            at: Duration::ZERO,
+        });
+    }
+    assert_eq!(machine.state(), AgentState::Idle);
     drop(socket);
     let _ = fs::remove_dir_all(root);
 }

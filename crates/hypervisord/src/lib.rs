@@ -8,7 +8,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hypervisor_core::state::{Harness, HookKind};
+use hypervisor_core::state::{Harness, HookFields, HookKind, normalize_hook_fields};
 use hypervisor_session::{Command, SessionHandle};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -30,11 +30,10 @@ pub struct ReceivedHook {
     pub peer_gid: u32,
 }
 
-/// One session's private listener. Sequential accepts allocate source sequence numbers.
+/// One session's private listener.
 pub struct HookSocket {
     listener: UnixListener,
     path: PathBuf,
-    seq: u64,
 }
 
 impl HookSocket {
@@ -56,11 +55,7 @@ impl HookSocket {
             ));
         }
         let listener = UnixListener::bind(&path)?;
-        Ok(Self {
-            listener,
-            path,
-            seq: 0,
-        })
+        Ok(Self { listener, path })
     }
 
     #[must_use]
@@ -97,28 +92,19 @@ impl HookSocket {
                 ));
             }
         };
-        let name = value
-            .get("event")
-            .and_then(Value::as_str)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing event"))?;
-        let kind = HookKind::from_fields(
-            harness,
-            name,
-            value.get("notification_type").and_then(Value::as_str),
-            value
-                .get("fully_idle")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        );
-        self.seq = self
-            .seq
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("hook sequence exhausted"))?;
+        let hook = normalize_hook_fields(harness, decoded_fields(&value));
+        if hook.name.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "missing event"));
+        }
+        let seq = value
+            .get("seq")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing source seq"))?;
         let _ = stream.write_all(b"\n");
         Ok(ReceivedHook {
             harness,
-            kind,
-            seq: self.seq,
+            kind: hook.kind,
+            seq,
             claimed_session_id: value
                 .get("claimed_session_id")
                 .and_then(Value::as_str)
@@ -205,31 +191,39 @@ fn peer_ids(stream: &UnixStream) -> io::Result<(u32, u32)> {
 /// Keep only the fields that state mapping needs from a raw hook payload.
 #[must_use]
 pub fn trimmed_event(harness: Harness, value: &Value) -> Value {
-    let name = value
-        .get("hook_event_name")
-        .or_else(|| value.get("event"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let hook = normalize_hook_fields(harness, decoded_fields(value));
     let mut event = serde_json::json!({
         "harness": match harness { Harness::Claude => "claude", Harness::Codex => "codex", Harness::Agy => "agy" },
-        "event": name,
+        "event": hook.name,
     });
-    if let Some(kind) = value.get("notification_type").and_then(Value::as_str) {
+    if let Some(kind) = hook.notification_type {
         event["notification_type"] = Value::String(kind.to_owned());
     }
-    if let Some(id) = value
-        .get("session_id")
-        .or_else(|| value.get("conversationId"))
-        .and_then(Value::as_str)
-    {
+    if let Some(id) = hook.claimed_session_id {
         event["claimed_session_id"] = Value::String(id.to_owned());
     }
-    if let Some(idle) = value
-        .get("fullyIdle")
-        .or_else(|| value.get("fully_idle"))
-        .and_then(Value::as_bool)
-    {
+    if let Some(idle) = hook.fully_idle {
         event["fully_idle"] = Value::Bool(idle);
     }
     event
+}
+
+fn decoded_fields(value: &Value) -> HookFields<'_> {
+    HookFields {
+        hook_event_name: value.get("hook_event_name").and_then(Value::as_str),
+        event: value.get("event").and_then(Value::as_str),
+        notification_type: value.get("notification_type").and_then(Value::as_str),
+        enums_notification_type: value
+            .get("enums")
+            .and_then(|enums| enums.get("notification_type"))
+            .and_then(Value::as_str),
+        session_id: value.get("session_id").and_then(Value::as_str),
+        conversation_id: value.get("conversationId").and_then(Value::as_str),
+        fully_idle: value.get("fullyIdle").and_then(Value::as_bool),
+        fully_idle_snake: value.get("fully_idle").and_then(Value::as_bool),
+        enums_fully_idle: value
+            .get("enums")
+            .and_then(|enums| enums.get("fullyIdle"))
+            .and_then(Value::as_bool),
+    }
 }

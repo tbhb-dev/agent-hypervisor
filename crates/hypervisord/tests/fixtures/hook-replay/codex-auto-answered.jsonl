@@ -1,8 +1,8 @@
-{"event":"SessionStart","notification_type":null,"fully_idle":null,"expected":"Unknown","at_ms":0}
-{"event":"UserPromptSubmit","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":51}
-{"event":"Stop","notification_type":null,"fully_idle":null,"expected":"Idle","at_ms":2338}
-{"event":"UserPromptSubmit","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":7764}
-{"event":"PreToolUse","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":9936}
-{"event":"PermissionRequest","notification_type":null,"fully_idle":null,"expected":"Approval","at_ms":10001}
-{"event":"Interrupt","notification_type":null,"fully_idle":null,"expected":"Idle","at_ms":24836}
-{"event":"SessionEnd","notification_type":null,"fully_idle":null,"expected":"Exited","at_ms":25806}
+{"t":1791406304.305,"event":"SessionStart","fields":["cwd","hook_event_name","model","permission_mode","session_id","source","transcript_path"],"enums":{"hook_event_name":"SessionStart","permission_mode":"default","source":"startup"},"expected":"Unknown","at_ms":0}
+{"t":1791406304.356,"event":"UserPromptSubmit","fields":["cwd","hook_event_name","model","permission_mode","prompt","session_id","transcript_path","turn_id"],"enums":{"hook_event_name":"UserPromptSubmit","permission_mode":"default"},"expected":"Working","at_ms":51}
+{"t":1791406306.643,"event":"Stop","fields":["cwd","hook_event_name","last_assistant_message","model","permission_mode","session_id","stop_hook_active","transcript_path","turn_id"],"enums":{"hook_event_name":"Stop","permission_mode":"default","stop_hook_active":false},"expected":"Idle","at_ms":2338}
+{"t":1791406312.069,"event":"UserPromptSubmit","fields":["cwd","hook_event_name","model","permission_mode","prompt","session_id","transcript_path","turn_id"],"enums":{"hook_event_name":"UserPromptSubmit","permission_mode":"default"},"expected":"Working","at_ms":7764}
+{"t":1791406314.241,"event":"PreToolUse","fields":["cwd","hook_event_name","model","permission_mode","session_id","tool_input","tool_name","tool_use_id","transcript_path","turn_id"],"enums":{"hook_event_name":"PreToolUse","permission_mode":"default","tool_name":"Bash"},"tool_input_fields":["command"],"expected":"Working","at_ms":9936}
+{"t":1791406314.306,"event":"PermissionRequest","fields":["cwd","hook_event_name","model","permission_mode","session_id","tool_input","tool_name","transcript_path","turn_id"],"enums":{"hook_event_name":"PermissionRequest","permission_mode":"default","tool_name":"Bash"},"tool_input_fields":["command","description"],"expected":"Approval","at_ms":10001}
+{"t":1791406329.141,"event":"Interrupt","fields":["cwd","hook_event_name","model","permission_mode","session_id","transcript_path","turn_id"],"enums":{"hook_event_name":"Interrupt","permission_mode":"default"},"expected":"Idle","at_ms":24836}
+{"t":1791406330.111,"event":"SessionEnd","fields":["cwd","hook_event_name","reason","session_id","transcript_path"],"enums":{"hook_event_name":"SessionEnd","reason":"other"},"expected":"Unknown","at_ms":25806}

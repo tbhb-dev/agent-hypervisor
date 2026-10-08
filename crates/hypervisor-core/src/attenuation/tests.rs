@@ -2,17 +2,17 @@
 //! `grant-set.json`; properties cover each attenuation invariant.
 
 use super::{
-    BrokerGrant, CredentialRef, Decision, Denial, Dropped, Egress, Grant, Isolation, Method, Mount,
-    MountMode, Request, SpiffeId, broker_grants, intersect, narrows, within,
+    CredentialRef, Decision, Denial, Dropped, Egress, Grant, Isolation, Method, Mount, MountMode,
+    Request, SpiffeId, intersect, narrows, within,
 };
 use proptest::prelude::*;
 use std::collections::BTreeSet;
 
-fn id(s: &str) -> SpiffeId {
+pub(super) fn id(s: &str) -> SpiffeId {
     SpiffeId::parse(s).expect("test SPIFFE ID")
 }
 
-fn cred(s: &str) -> CredentialRef {
+pub(super) fn cred(s: &str) -> CredentialRef {
     CredentialRef::parse(s).expect("test reference")
 }
 
@@ -33,9 +33,10 @@ fn mount(path: &str, mode: MountMode, scope: &str) -> Mount {
 }
 
 const GH: &str = "api.github.com";
-const CHILD_ID: &str = "spiffe://air.local/workspace/ws-7f3a-c1/session/s1";
+pub(super) const PARENT_ID: &str = "spiffe://air.local/workspace/ws-7f3a/session/s1";
+pub(super) const CHILD_ID: &str = "spiffe://air.local/workspace/ws-7f3a-c1/session/s1";
 
-fn parent() -> Grant {
+pub(super) fn parent() -> Grant {
     use Method::{Get, Patch, Post};
     Grant {
         isolation: Isolation::Container,
@@ -62,7 +63,7 @@ fn parent() -> Grant {
     }
 }
 
-fn child() -> Grant {
+pub(super) fn child() -> Grant {
     Grant {
         isolation: Isolation::Container,
         egress: vec![
@@ -81,7 +82,7 @@ fn child() -> Grant {
     }
 }
 
-fn widen() -> Grant {
+pub(super) fn widen() -> Grant {
     Grant {
         isolation: Isolation::Unsandboxed,
         egress: vec![
@@ -115,7 +116,7 @@ fn http(host: &str, method: Method, path: &str) -> Request {
     }
 }
 
-fn use_cred(s: &str) -> Request {
+pub(super) fn use_cred(s: &str) -> Request {
     Request::Credential { reference: cred(s) }
 }
 
@@ -141,7 +142,7 @@ const WIDEN_TARGETS: [&str; 6] = [
     "spawn-unsandboxed",
 ];
 
-fn case(name: &str) -> Request {
+pub(super) fn case(name: &str) -> Request {
     let found = cases().into_iter().find(|c| c.0 == name);
     found.expect("known case").1
 }
@@ -156,7 +157,7 @@ fn run_case(request: &Request, want_parent: bool, want_child: bool) {
 /// Defines `cases()`, the request cases with their parent and child answers, and one test each.
 macro_rules! cases {
     ($($test:ident: $name:literal, $request:expr, $parent:literal, $child:literal;)*) => {
-        fn cases() -> Vec<(&'static str, Request, bool, bool)> {
+        pub(super) fn cases() -> Vec<(&'static str, Request, bool, bool)> {
             vec![$(($name, $request, $parent, $child)),*]
         }
         $(#[test] fn $test() { run_case(&$request, $parent, $child); })*
@@ -262,19 +263,6 @@ fn credential_outside_the_parent_fails() {
     assert_eq!(
         within(&grant, &request),
         Decision::Deny(Denial::UnknownCredential)
-    );
-}
-
-#[test]
-fn broker_grants_are_scoped_to_the_child_identity() {
-    let (grant, _) = intersect(&parent(), &child());
-    let grants = broker_grants(&id(CHILD_ID), &grant);
-    assert_eq!(
-        grants,
-        vec![BrokerGrant {
-            holder: id(CHILD_ID),
-            reference: cred("broker:github/tbhb-dev/contents-write"),
-        }]
     );
 }
 
@@ -490,7 +478,7 @@ fn reference() -> impl Strategy<Value = CredentialRef> {
     prop::sample::select(REFS.to_vec()).prop_map(cred)
 }
 
-fn grant() -> impl Strategy<Value = Grant> {
+pub(super) fn grant() -> impl Strategy<Value = Grant> {
     let egress = (
         host(),
         prop::option::of(prop::collection::btree_set(method(), 0..4)),
@@ -581,7 +569,7 @@ fn parent_and_request() -> impl Strategy<Value = (Grant, Grant)> {
     )
 }
 
-fn request() -> impl Strategy<Value = Request> {
+pub(super) fn request() -> impl Strategy<Value = Request> {
     prop_oneof![
         (host(), method(), path()).prop_map(|(host, method, path)| Request::Egress {
             host,
@@ -638,18 +626,6 @@ proptest! {
     ) {
         let (_, dropped) = intersect(&p, &r);
         prop_assert_eq!(dropped.is_empty(), narrows(&r, &p));
-    }
-
-    #[test]
-    fn broker_grants_name_only_the_holder_and_parent_held_references(
-        p in grant(), r in grant(),
-    ) {
-        let (c, _) = intersect(&p, &r);
-        let holder = id(CHILD_ID);
-        for g in broker_grants(&holder, &c) {
-            prop_assert_eq!(&g.holder, &holder);
-            prop_assert!(p.credentials.contains(&g.reference));
-        }
     }
 }
 

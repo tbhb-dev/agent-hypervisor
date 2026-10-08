@@ -31,6 +31,7 @@ rustix = {
     "termios",
   ]
 }
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"
 xtask-core = { path = "crates/xtask-core" }
@@ -47,4 +48,4 @@ unsafe_op_in_unsafe_fn = "deny"
 # The functional core boundary: a `-core` crate's normal dependencies must be other `-core` crates
 # or a crate named here. `mise run check:boundary` reads this list through `cargo metadata`.
 [workspace.metadata.boundary]
-allow = []
+allow = ["serde", "serde_json"]  # Pure value serialization for terminal channel frames.

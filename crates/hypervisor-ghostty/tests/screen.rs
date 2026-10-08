@@ -27,6 +27,45 @@ fn at_prefix(f: &Fixture, count: usize) -> (GhosttyEmulator, AlacrittyEmulator) 
 }
 
 #[test]
+fn both_emulators_expose_osc_8_cell_uri() {
+    let size = hypervisor_core::emulator::Size::new(2, 1).unwrap();
+    let mut ghostty = GhosttyEmulator::new(size).unwrap();
+    let mut alacritty = AlacrittyEmulator::new(size);
+    let input = b"\x1b]8;;https://example.test/a\x1b\\X\x1b]8;;\x1b\\Y";
+    ghostty.feed(input);
+    alacritty.feed(input);
+    assert_eq!(
+        ghostty.grid().cells()[0].hyperlink.as_deref(),
+        Some("https://example.test/a")
+    );
+    assert_eq!(
+        alacritty.grid().cells()[0].hyperlink.as_deref(),
+        Some("https://example.test/a")
+    );
+    assert_eq!(ghostty.grid().cells()[1].hyperlink, None);
+    assert_eq!(alacritty.grid().cells()[1].hyperlink, None);
+}
+
+#[test]
+fn both_emulators_expose_long_osc_8_cell_uri() {
+    let size = hypervisor_core::emulator::Size::new(1, 1).unwrap();
+    let mut ghostty = GhosttyEmulator::new(size).unwrap();
+    let mut alacritty = AlacrittyEmulator::new(size);
+    let uri = format!("https://example.test/{}", "a".repeat(300));
+    let input = format!("\u{1b}]8;;{uri}\u{1b}\\X\u{1b}]8;;\u{1b}\\");
+    ghostty.feed(input.as_bytes());
+    alacritty.feed(input.as_bytes());
+    assert_eq!(
+        ghostty.grid().cells()[0].hyperlink.as_deref(),
+        Some(uri.as_str())
+    );
+    assert_eq!(
+        alacritty.grid().cells()[0].hyperlink.as_deref(),
+        Some(uri.as_str())
+    );
+}
+
+#[test]
 fn recorded_idle_approval_and_final_grids_follow_screen_rules() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),

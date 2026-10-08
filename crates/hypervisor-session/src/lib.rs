@@ -94,6 +94,10 @@ pub enum Command {
 #[cfg(test)]
 mod log_tests {
     use super::*;
+    use hypervisor_core::channel::{
+        Capabilities, Encoding, Mode, OpenRequest, OpenTarget, WireSize,
+    };
+    use hypervisor_core::channel_policy::ClientError;
     use hypervisor_core::session::{Persistence, Signal, Target, ViewerRead};
     use hypervisor_ghostty::GhosttyEmulator;
     use hypervisor_pty::{Caps, Resize, Support};
@@ -154,6 +158,57 @@ mod log_tests {
                 resize_repaints: false,
             }
         }
+    }
+
+    #[test]
+    fn grid_open_skips_byte_snapshot_and_byte_methods_are_refused() {
+        let (tx, rx) = mpsc::channel();
+        let (_events_tx, events) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            while let Ok(Msg::Command(command)) = rx.recv() {
+                match command {
+                    Command::Subscribe(_) => {}
+                    Command::AttachChannel(_, _, size, _, reply) => {
+                        let _ = reply.send(Ok((size, 0)));
+                    }
+                    Command::Detach(_, reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::Close => break,
+                    other => panic!("unexpected byte command on grid channel: {other:?}"),
+                }
+            }
+        });
+        let session = SessionHandle {
+            tx,
+            events,
+            thread: Some(thread),
+        };
+        let request = OpenRequest {
+            versions: vec![1],
+            target: OpenTarget::Session("test".into()),
+            mode: Mode::ReadOnly,
+            encoding: Encoding::Grid,
+            size: WireSize { cols: 1, rows: 1 },
+            client: Capabilities {
+                terminal: "test".into(),
+                flags: 0,
+            },
+            resume: None,
+            max_frames_per_second: None,
+        };
+        let (mut channel, _) = channel::Channel::open(&session, ViewerId(42), &request).unwrap();
+        assert_eq!(
+            channel.next_output(),
+            Err(channel::ChannelError::Client(ClientError::UnexpectedFrame))
+        );
+        assert_eq!(
+            channel.snapshot(),
+            Err(channel::ChannelError::Client(ClientError::UnexpectedFrame))
+        );
+        drop(channel);
+        session.send(Command::Close);
+        session.join();
     }
 
     #[test]

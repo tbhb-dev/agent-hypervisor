@@ -165,6 +165,9 @@ impl<'a> Channel<'a> {
         if self.policy.detached() {
             return Err(ChannelError::Client(ClientError::Detached));
         }
+        if self.grid.is_some() {
+            return Err(ChannelError::Client(ClientError::UnexpectedFrame));
+        }
         let (next_sequence, bytes) = self
             .session
             .viewer_snapshot(self.viewer)

@@ -1,5 +1,6 @@
 //! The session actor with ghostty-vt and `/bin/sh` children.
 
+use std::fmt::Write;
 use std::num::NonZeroUsize;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -177,6 +178,98 @@ fn a_slow_viewer_gets_one_resync_then_a_fresh_snapshot() {
         session.read_viewer(VIEWER).unwrap(),
         ViewerRead::Output { .. }
     ));
+}
+
+#[test]
+fn viewer_terminal_replies_never_reach_the_child() {
+    let session = start(
+        "stty -echo; echo ready; IFS= read -r line; printf 'got:%s\\n' \"$line\"",
+        persistent(),
+    );
+    wait_for_output(&session, "ready");
+    session
+        .attach(
+            VIEWER,
+            ViewerMode::ReadOnly,
+            size(80, 24),
+            NonZeroUsize::new(4096).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        session.submit(Writer::Viewer(VIEWER), b"\x1b[?62;22c".to_vec()),
+        Ok(())
+    );
+    session.take(Writer::Viewer(VIEWER)).unwrap();
+    session
+        .submit(Writer::Viewer(VIEWER), b"\x1b[3;5Rgood\n".to_vec())
+        .unwrap();
+    wait_for_output(&session, "got:good");
+    assert!(!output(&session).contains("got:\x1b["));
+}
+
+#[test]
+fn a_viewer_cpr_is_filtered_but_modified_f3_reaches_the_child() {
+    let session = start(
+        r#"echo ready; sleep 0.1; stty raw -echo; printf '\033[6n'; dd bs=1 count=6 2>/dev/null >/dev/null; printf 'asked\n'; r=$(dd bs=1 count=6 2>/dev/null); printf 'got:%s\n' "$r" | cat -v"#,
+        persistent(),
+    );
+    wait_for_output(&session, "ready");
+    attach_writer(&session);
+    wait_for_output(&session, "asked");
+    session
+        .submit(Writer::Viewer(VIEWER), b"\x1b[1;5R\x1b[1;2R".to_vec())
+        .unwrap();
+    let text = wait_for_output(&session, "got:");
+    assert!(text.contains("got:^[[1;2R"), "{text:?}");
+}
+
+#[test]
+fn codex_batch_replies_are_ordered_with_no_viewer() {
+    let script = r#"stty raw -echo; printf '\033[6n\033]10;?\033\\\033]11;?\033\\\033[?u\033[c'; r=$(dd bs=1 count=65 2>/dev/null); printf 'got:%s\n' "$r" | cat -v"#;
+    let session = start(script, persistent());
+    let text = wait_for_output(&session, "got:");
+    assert!(
+        text.contains(
+            "got:^[[1;1R^[]10;rgb:d0d0/d0d0/d0d0^[\\^[]11;rgb:1c1c/1c1c/1c1c^[\\^[[?62;22c"
+        ),
+        "{text:?}"
+    );
+}
+
+#[test]
+fn osc_11_reply_precedes_a_later_cpr() {
+    let script = r#"stty raw -echo; printf '\033]11;?\007\033[6n'; r=$(dd bs=1 count=30 2>/dev/null); printf 'got:%s\n' "$r" | cat -v"#;
+    let session = start(script, persistent());
+    let text = wait_for_output(&session, "got:");
+    assert!(
+        text.contains("got:^[]11;rgb:1c1c/1c1c/1c1c^G^[[1;1R"),
+        "{text:?}"
+    );
+}
+
+#[test]
+fn a_pre_raw_da1_reply_is_echoed_by_the_line_discipline() {
+    let recording = include_bytes!("../../../tests/fixtures/corpus/recordings/agy-alt-answered.vt");
+    let echo = b"^[[?62;22c";
+    let at = recording
+        .windows(echo.len())
+        .position(|w| w == echo)
+        .unwrap();
+    let queries = &recording[..at];
+    assert_eq!(queries, b"\x1b_Ga=q,f=32,s=1,v=1,i=31;AAAAAA==\x1b\\\x1b[c");
+    let mut octal = String::new();
+    for byte in queries {
+        write!(&mut octal, "\\{byte:03o}").unwrap();
+    }
+    let script = format!("printf '{octal}'; sleep 0.1; stty raw -echo; echo ready");
+    let session = start(&script, persistent());
+    let text = wait_for_output(&session, "ready");
+    assert!(text.as_bytes().starts_with(queries), "{text:?}");
+    assert_eq!(
+        &text.as_bytes()[queries.len()..queries.len() + echo.len()],
+        echo
+    );
+    assert_eq!(text.matches("^[[?62;22c").count(), 1, "{text:?}");
 }
 
 #[test]

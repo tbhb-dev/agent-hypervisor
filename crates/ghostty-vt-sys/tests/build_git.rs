@@ -44,10 +44,12 @@ fn git_init_lands_in_the_named_directory_under_a_hook_environment() {
         assert!(status.success());
         return;
     }
-    let root = PathBuf::from(format!(
-        "/private/tmp/ghostty-git-env-{}",
-        std::process::id()
-    ));
+    // A short directory outside the worktree: `/private/tmp` on macOS, `/tmp` on Linux CI.
+    let tmp = ["/private/tmp", "/tmp"]
+        .into_iter()
+        .find(|dir| Path::new(dir).is_dir())
+        .expect("a temporary directory");
+    let root = PathBuf::from(format!("{tmp}/ghostty-git-env-{}", std::process::id()));
     let (enclosing, named) = (root.join("enclosing"), root.join("named"));
     fs::create_dir_all(&enclosing).expect("create the enclosing directory");
     fs::create_dir_all(&named).expect("create the named directory");

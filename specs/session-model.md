@@ -1,8 +1,32 @@
 # Session model
 
-Status: stub. Drafted in Phase 1 and stable after Phase 5 of the RFC-36 run plan.
+Status: draft. Drafted in Phase 1 and stable after Phase 5 of the RFC-36 run plan.
 
 This spec covers session kinds, lifecycle, viewers, the write lock, size ownership, and ephemeral versus persistent sessions.
+
+## Phase 1 contract
+
+`hypervisor_session::spawn` starts one actor for one `SpawnSpec`. Its public handle accepts attach, detach, take, release, resize, input, interrupt, hook, snapshot, ring read, subscription, and close requests. The holder decides lifecycle and authorization. The actor stores the PTY and emulator and carries out the effects. A viewer attaches without acquiring the write lock. Only an explicit take grants input and size ownership, and programmatic input competes for that same lock. A slow viewer gets a `Resync` notice and must request a snapshot before live output resumes. The ring's sequence counts bytes, while the event stream's sequence counts events. The stream is local to the actor and has no durable cursor.
+
+The first server-side conformance cases use the public `SessionHandle` on the Unix PTY backend. They cover spawn, attach, detach, byte-offset resume, read-only refusal, write-lock handoff, state events, and exit. A common runtime-driver contract and channel framing arrive in later phases. These cases apply to the Unix driver only.
+
+The caller supplies `LogContext` with workload and session ids when spawning. Every emitted `SessionEvent` produces one JSON line on standard error with those ids, an event sequence and type, and a `channel_id` field. Viewer attach and detach use `viewer:<id>` as a local Phase 1 channel label. Session-wide events have `channel_id: null` because the terminal channel protocol and its ids are Phase 2 work. The event detail is a debug string with lifecycle, state, size, exit status, or viewer identity. It contains no PTY output or hook payload. The source's full per-channel logging target remains open until channels exist.
+
+## Source and code differences
+
+The RFC-36 source at `tbhb-dev/agent-orchestration-poc.internal` commit `63ab6a891a2d167dfdf1faf6ec497b38996e93fa`, `wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/source.md`, lines 95 to 120 and 310 to 347, describes the Phase 1 target. The draft follows the merged run 9 to 11 code in these cases:
+
+| Source target | Phase 1 code and decision |
+| --- | --- |
+| A ghostty-vt handle is `!Send + !Sync` and one library serves host and guest. | `GhosttyEmulator` is neither `Send` nor `Sync`. The actor creates it on its own thread. The guest agent and runtime-driver reuse have not been built. This draft specifies the actor boundary. |
+| A slow viewer is dropped and told to resync. | The registry clears its pending output and pauses the viewer until a snapshot. It retains the attachment. This draft specifies that behavior. |
+| An ephemeral session ends when the last viewer leaves. | The holder acts only after at least one viewer attached, then applies its configured grace, which defaults to zero. This prevents an unviewed new session from ending immediately. |
+| A read-only viewer cannot send input. | Read-only input is refused until the viewer explicitly takes the lock. Take promotes its mode to read-write. The draft treats take as the authorization transition, while later authorization work must restrict who may invoke it. |
+| A server-side suite applies to any driver. | The first cases use `UnixSpawner` through `SessionHandle`. There is no common driver test adapter yet. |
+| Logs have workload, session, and channel ids on every line. | Emitted session events have workload and session ids. Attach and detach use a provisional viewer label. Session-wide events have a null channel id until Phase 2 framing exists. |
+| The emulator can serialize its screen to VT for viewers. | The merged ghostty adapter builds viewer VT snapshots from grid reads because the native formatter lost cells in the run 2 recordings. Binary ghostty snapshots remain available for server-side copies. |
+
+The run 2 finding proposed a handle that is `Send` but not `Sync`, while the run 7 emulator and run 9 actor use a handle that is neither. The actor construction on its own thread follows the merged code. That code supersedes the thread-safety claim in the earlier finding.
 
 ## Inputs
 
@@ -90,7 +114,7 @@ The emulator runs in the daemon's process. A ghostty-vt crash takes every sessio
 
 On Linux `openpt` sets `O_CLOEXEC` atomically. macOS `posix_openpt` has no such flag. There the backend sets `FD_CLOEXEC` right after it and serializes its own spawns with a process-wide lock. A fork from code outside the backend can still inherit the master in that window.
 
-The tests run on macOS locally and on Linux in CI. A panic on the actor thread, such as the `unreachable!` for an effect it doesn't know, ends the session with no event: subscribers see only the event channel disconnect, and run 12's logs should record it.
+The tests run on macOS locally and on Linux in CI. A panic on the actor thread, such as the `unreachable!` for an effect it doesn't know, ends the session with no event: subscribers see only the event channel disconnect. The Phase 1 event logger cannot produce a session event for that panic. A structured panic record remains untested.
 
 ### Run 9 evidence
 

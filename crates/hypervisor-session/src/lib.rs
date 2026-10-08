@@ -8,7 +8,7 @@
 //! into the ring and the emulator, and queries keep getting answers, with no viewer attached.
 //!
 //! This crate decides nothing. The holder decides; the actor reads the clock, moves bytes, and
-//! calls the backend. Errors from writes and signals are dropped until run 12 adds logs.
+//! calls the backend. Each emitted session event is logged with its workload and session ids.
 
 use std::fmt;
 use std::io::Read;
@@ -24,6 +24,7 @@ use hypervisor_core::session::{
 };
 use hypervisor_core::state::{Harness, HookKind, HookReport};
 use hypervisor_pty::{Pty, PtyError, Spawn, Wait};
+use serde_json::json;
 use std::num::NonZeroUsize;
 
 /// The most messages handled before pending size requests settle.
@@ -75,6 +76,70 @@ pub enum Command {
     Snapshot(Sender<Option<Vec<u8>>>),
 }
 
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn event_log_has_ids_and_structured_channel() {
+        let context = LogContext {
+            workload_id: "workload-1".into(),
+            session_id: "session-2".into(),
+        };
+        let attached = serde_json::from_str::<Value>(&context.event_line(SequencedEvent {
+            seq: 3,
+            event: SessionEvent::Attached {
+                viewer: ViewerId(4),
+            },
+        }))
+        .unwrap();
+        assert_eq!(attached["workload_id"], "workload-1");
+        assert_eq!(attached["session_id"], "session-2");
+        assert_eq!(attached["channel_id"], "viewer:4");
+        assert_eq!(attached["event_seq"], 3);
+        assert_eq!(attached["event_type"], "attached");
+        assert_eq!(attached["event"], "Attached { viewer: ViewerId(4) }");
+        let created = serde_json::from_str::<Value>(&context.event_line(SequencedEvent {
+            seq: 1,
+            event: SessionEvent::Created,
+        }))
+        .unwrap();
+        assert!(created["channel_id"].is_null());
+    }
+
+    #[test]
+    fn log_json_escapes_caller_supplied_ids() {
+        let context = LogContext {
+            workload_id: "workload\"\nname".into(),
+            session_id: "session\\name".into(),
+        };
+        let line = context.event_line(SequencedEvent {
+            seq: 1,
+            event: SessionEvent::Created,
+        });
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["workload_id"], context.workload_id);
+        assert_eq!(value["session_id"], context.session_id);
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
+    fn signal_error_line_carries_session_ids() {
+        let context = LogContext {
+            workload_id: "workload-1".into(),
+            session_id: "session-2".into(),
+        };
+        let line = context.error_line("signal", &"permission denied");
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["workload_id"], "workload-1");
+        assert_eq!(value["session_id"], "session-2");
+        assert!(value["channel_id"].is_null());
+        assert_eq!(value["operation"], "signal");
+        assert_eq!(value["error"], "permission denied");
+    }
+}
+
 enum Msg {
     Command(Command),
     Output(Vec<u8>),
@@ -110,6 +175,55 @@ impl std::error::Error for StartError {}
 pub struct SequencedEvent {
     pub seq: u64,
     pub event: SessionEvent,
+}
+
+/// Identities supplied by the caller for structured session logs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogContext {
+    pub workload_id: String,
+    pub session_id: String,
+}
+
+impl LogContext {
+    fn error_line(&self, operation: &str, error: &impl fmt::Display) -> String {
+        json!({
+            "level": "error",
+            "workload_id": self.workload_id,
+            "session_id": self.session_id,
+            "channel_id": null,
+            "event_type": "effect_error",
+            "operation": operation,
+            "error": error.to_string(),
+        })
+        .to_string()
+    }
+
+    /// Serialize one event as a JSON log line. A viewer is the local channel until the
+    /// terminal channel protocol assigns independent channel identities in Phase 2.
+    #[must_use]
+    fn event_line(&self, envelope: SequencedEvent) -> String {
+        let (event_type, channel_id) = match envelope.event {
+            SessionEvent::Created => ("created", None),
+            SessionEvent::Attached { viewer } => ("attached", Some(format!("viewer:{}", viewer.0))),
+            SessionEvent::Detached { viewer } => ("detached", Some(format!("viewer:{}", viewer.0))),
+            SessionEvent::StateChanged { .. } => ("state_changed", None),
+            SessionEvent::Running => ("running", None),
+            SessionEvent::Resized(_) => ("resized", None),
+            SessionEvent::Exited(_) => ("exited", None),
+            SessionEvent::Reaped => ("reaped", None),
+            _ => ("unknown", None),
+        };
+        json!({
+            "level": "info",
+            "workload_id": self.workload_id,
+            "session_id": self.session_id,
+            "channel_id": channel_id,
+            "event_seq": envelope.seq,
+            "event_type": event_type,
+            "event": format!("{:?}", envelope.event),
+        })
+        .to_string()
+    }
 }
 
 /// The caller's side of a session. Dropping it closes the session.
@@ -280,6 +394,7 @@ pub fn spawn<S, E, F>(
     spawner: S,
     spec: SpawnSpec,
     config: HolderConfig,
+    log: LogContext,
     make_emulator: F,
 ) -> Result<SessionHandle, StartError>
 where
@@ -322,6 +437,7 @@ where
                 events: vec![events_tx],
                 event_seq: 0,
                 origin,
+                log,
                 queries: QueryScanner::default(),
                 screen_harness: None,
                 screen_at: None,
@@ -384,6 +500,7 @@ struct Actor<P, E> {
     events: Vec<Sender<SequencedEvent>>,
     event_seq: u64,
     origin: Instant,
+    log: LogContext,
     queries: QueryScanner,
     screen_harness: Option<Harness>,
     screen_at: Option<Duration>,
@@ -587,8 +704,10 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                 }
             }
             Effect::Signal { signal, target } => {
-                if let Some(pty) = self.pty.as_ref() {
-                    let _ = pty.signal(signal, target);
+                if let Some(pty) = self.pty.as_ref()
+                    && let Err(error) = pty.signal(signal, target)
+                {
+                    eprintln!("{}", self.log.error_line("signal", &error));
                 }
             }
             Effect::Release => {
@@ -601,6 +720,7 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                     seq: self.event_seq,
                     event,
                 };
+                eprintln!("{}", self.log.event_line(envelope));
                 self.events
                     .retain(|subscriber| subscriber.send(envelope).is_ok());
             }

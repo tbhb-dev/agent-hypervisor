@@ -1,8 +1,18 @@
 # Capability profile
 
-Status: stub. Drafted in Phase 1 and stable after Phase 8 of the RFC-36 run plan.
+Status: draft. Drafted in Phase 1 and stable after Phase 8 of the RFC-36 run plan.
 
 This spec covers the terminal modes and query responses the server advertises, and what each client must render.
+
+## Phase 1 contract and limits
+
+The fixed server answers below are the Phase 1 profile. The actor for a session answers queries without a viewer and preserves their output order. It also filters terminal replies from viewer input. Rendering conformance waits for clients in Phases 5 and 8, and the server does not claim kitty keyboard input or graphics queries.
+
+The RFC-36 source at `tbhb-dev/agent-orchestration-poc.internal` commit `63ab6a891a2d167dfdf1faf6ec497b38996e93fa`, `wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/source.md`, lines 99 to 111 and 340 to 341, asks for a fixed conservative profile and client rendering. The merged run 10 code supplies the server replies but no client renderer. The source names keyboard protocol queries, while the merged profile leaves the kitty query unanswered after the run 3 Ctrl-C finding. This draft follows the server behavior and leaves rendering untested. The run 3 capture tool reported synchronized output mode 2026 as reset. The merged profile reports it as set, and the table below follows that result.
+
+## Client rendering contract
+
+A client in a later phase must present the server's current rows, columns, cell contents, styles, and cursor without issuing its own device replies to the child. It applies a fresh snapshot before later output after a resync. Alternate-screen contents and terminal mode changes come from the server's emulator state. The Phase 5 snapshot-fidelity suite and Phase 8 native renderer tests must check these proposed requirements. No Phase 1 client test verifies them.
 
 ## Inputs
 

@@ -366,6 +366,10 @@ pub fn serve(metadata: &Path, root: &Path) -> io::Result<()> {
                 continue;
             }
         };
+        if let Err(error) = stream.set_nonblocking(false) {
+            eprintln!("host shim control setup failed: {error}");
+            continue;
+        }
         let state = Arc::clone(&state);
         let spec = Arc::clone(&spec);
         let root = root.to_path_buf();

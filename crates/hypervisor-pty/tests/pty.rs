@@ -126,15 +126,7 @@ fn a_group_signal_reaches_background_jobs_and_the_signal_number_is_kept() {
     );
     let exit = pty.take_waiter().unwrap().wait().unwrap();
     assert_eq!((exit.code, exit.signal), (None, Some(15)));
-    // The background `sleep` shared the group, so the group empties once its orphan is reaped.
-    let start = Instant::now();
-    while pty.signal(Signal::Kill, Target::Group).is_ok() {
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "the group outlived its leader"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    // The post-suite check detects any group member left after the leader is reaped.
 }
 
 #[test]

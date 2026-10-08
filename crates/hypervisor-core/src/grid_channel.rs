@@ -95,7 +95,7 @@ impl GridFrame {
                 hyperlinks,
                 ..
             } => {
-                if *base_frame == 0 || *base_frame >= *frame {
+                if *base_frame == 0 || base_frame.checked_add(1) != Some(*frame) {
                     return Err(FrameError::InvalidValue);
                 }
                 if size.cols == 0
@@ -511,6 +511,118 @@ mod tests {
             .unwrap();
         bytes[at + 13] = b'2';
         assert_eq!(Frame::decode(&bytes), Err(FrameError::InvalidValue));
+    }
+
+    #[test]
+    fn full_and_diff_reject_invalid_wire_values() {
+        let mut encoder = GridEncoder::new(None).unwrap();
+        let first = screen(&["ab", "cd"], Cursor::default());
+        let full = encoder
+            .poll(Duration::ZERO, first, Modes::default(), 0, false)
+            .unwrap()
+            .unwrap();
+        let next = screen(&["ab", "xy"], Cursor::default());
+        let diff = encoder
+            .poll(Duration::from_millis(1), next, Modes::default(), 2, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Frame::decode(&Frame::Grid(diff.clone()).encode().unwrap())
+                .unwrap()
+                .unwrap()
+                .0,
+            Frame::Grid(diff.clone())
+        );
+        let mut invalid = Vec::new();
+        let mut zero_frame = full.clone();
+        if let GridFrame::Full { frame, .. } = &mut zero_frame {
+            *frame = 0;
+        }
+        invalid.push(zero_frame);
+        let mut short = full.clone();
+        if let GridFrame::Full { cells, .. } = &mut short {
+            cells.pop();
+        }
+        invalid.push(short);
+        let mut cursor = full.clone();
+        if let GridFrame::Full { cursor, .. } = &mut cursor {
+            cursor.col = 2;
+        }
+        invalid.push(cursor);
+        let mut empty_cluster = full.clone();
+        if let GridFrame::Full { cells, .. } = &mut empty_cluster {
+            cells[0].cluster.clear();
+        }
+        invalid.push(empty_cluster);
+        let mut duplicate_link = full.clone();
+        if let GridFrame::Full { hyperlinks, .. } = &mut duplicate_link {
+            hyperlinks.extend([
+                Hyperlink {
+                    id: 1,
+                    uri: "a".into(),
+                },
+                Hyperlink {
+                    id: 1,
+                    uri: "b".into(),
+                },
+            ]);
+        }
+        invalid.push(duplicate_link);
+        let mut link = full;
+        if let GridFrame::Full { cells, .. } = &mut link {
+            cells[0].hyperlink_id = Some(1);
+        }
+        invalid.push(link);
+        let mut bad_row = diff.clone();
+        if let GridFrame::Diff { rows, .. } = &mut bad_row {
+            rows[0].row = 2;
+        }
+        invalid.push(bad_row);
+        let mut short_row = diff.clone();
+        if let GridFrame::Diff { rows, .. } = &mut short_row {
+            rows[0].cells.pop();
+        }
+        invalid.push(short_row);
+        let mut gap = diff.clone();
+        if let GridFrame::Diff { frame, .. } = &mut gap {
+            *frame = 4;
+        }
+        invalid.push(gap);
+        let mut bad_base = diff;
+        if let GridFrame::Diff { base_frame, .. } = &mut bad_base {
+            *base_frame = 0;
+        }
+        invalid.push(bad_base);
+        for value in invalid {
+            assert_eq!(Frame::Grid(value).encode(), Err(FrameError::InvalidValue));
+        }
+    }
+
+    #[test]
+    fn grid_decoder_rejects_unknown_fields_and_wrong_header_version() {
+        let mut encoder = GridEncoder::new(None).unwrap();
+        let full = encoder
+            .poll(
+                Duration::ZERO,
+                screen(&["a"], Cursor::default()),
+                Modes::default(),
+                0,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        let mut bytes = Frame::Grid(full).encode().unwrap();
+        bytes[4..6].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(Frame::decode(&bytes), Err(FrameError::UnsupportedVersion));
+        let mut body: serde_json::Value = serde_json::from_slice(&bytes[7..]).unwrap();
+        body["extra"] = serde_json::json!(1);
+        let payload = body.to_string();
+        let length = u32::try_from(payload.len() + 3).unwrap();
+        let mut invalid = length.to_be_bytes().to_vec();
+        invalid.extend_from_slice(&crate::channel::VERSION.to_be_bytes());
+        invalid.push(9);
+        invalid.extend_from_slice(payload.as_bytes());
+        assert_eq!(Frame::decode(&invalid), Err(FrameError::MalformedPayload));
     }
 
     proptest! {

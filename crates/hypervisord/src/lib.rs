@@ -13,6 +13,7 @@ use hypervisor_session::{Command, SessionHandle};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub mod driver;
 pub mod terminal_socket;
 
 /// Maximum byte length of a socket pathname on the capture host is 103.

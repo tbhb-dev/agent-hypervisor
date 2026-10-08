@@ -4,11 +4,34 @@ Status: draft. Drafted in Phase 3 and stable after Phase 3 of the RFC-36 run pla
 
 This spec covers the workload spec, driver operations, isolation levels, and mount modes.
 
-## Run 17 contract values
+## Run 17 contract
 
 The caller supplies a `StableId { host, local }` for each workload and session. Both components contain one to 64 ASCII letters, digits, `_`, or `-`. The host component specifies the authoritative host. The local component is unique within that host's workloads or sessions. The saved IDs remain the same after a daemon restart and never derive from a PID. Callers allocate and preserve these IDs because the prototype has no allocator or cross-host registry.
 
-`WorkloadSpec` contains the runtime (`host`, `seatbelt`, or `apple_container`), visible isolation (`none`, `seatbelt`, or `virtual_machine`), optional image, mounts with read-only or read-write modes, environment pairs, credential references, network policy (`host`, `deny`, or `isolated`), optional memory and CPU limits, and host workspace and cache paths. The host policy accepts only `host` with `none` isolation, host network, no image, mounts, credential references, or resource limits. Unsupported controls fail validation. The pure recovery rule reports a matching host workload as running only after a shim identity handshake. The shell and its lifecycle tests complete the run 17 draft in the follow-up PR.
+`WorkloadSpec` contains the runtime (`host`, `seatbelt`, or `apple_container`), visible isolation (`none`, `seatbelt`, or `virtual_machine`), optional image, mounts with read-only or read-write modes, environment pairs, credential references, network policy (`host`, `deny`, or `isolated`), optional memory and CPU limits, and host workspace and cache paths. The shell canonicalizes both paths before saving a workload. It gives each host session `WORKSPACE_DIR` and `CACHE_DIR` with those physical paths, overriding the session's values for those names. The host driver accepts only `host` with `none` isolation, host network, no image, mounts, credential references, or resource limits. Unsupported controls fail before the shim starts. A host process has no effective isolation boundary.
+
+The driver operations are `create`, `start`, `stop`, `destroy`, `spawn_session`, `list_sessions`, `stats`, and `events`. `create` writes private workload metadata. `start` creates one detached shim process and confirms the expected workload ID on its private control socket. `spawn_session` starts the merged PTY and session actor inside that shim and returns a per-session terminal channel socket. `list_sessions` returns held stable IDs. `stats` returns the held session count, while `shim_pid` exposes the PID for supervision diagnostics from the same control reply. `events` returns the shim's in-memory workload and session creation events. `stop` asks the shim to close and join its sessions before the shim exits. `destroy` removes stopped metadata. The Phase 4 control API and durable event log do not exist yet.
+
+On daemon startup, the host driver reads the private metadata directory and probes each deterministic shim socket. A response containing the saved stable ID gives running status. A failed probe gives stopped status without automatically restarting the shim. A later explicit `start` removes a stale socket pathname after finding that no process answers it. Reconnection rebuilds the workload table without merging stores or replaying session commands. The shim holds PTY and emulator state. The daemon can exit while the session remains attachable at its channel socket.
+
+Run 17 assumes the privileged host daemon owns shim creation, reconnection, and stop. RFC-45 may move these calls across a daemon/proxy boundary. The proxy would still have no shim ownership or authorization authority. Run 18 adds launchd registration after operator approval. This run detaches a shim with `setsid()` and does not install or register a launch agent. A detached shim can keep running after the daemon exits. Without launchd, the driver cannot restart a crashed shim or recover its exit status after daemon death. Its behavior under a Linux systemd cgroup is untested.
+
+Host stop asks the merged holder to hang up and then kill each PTY process group. A descendant that escapes its group with `setsid()` can keep running after host stop. The host user boundary limits containment here. Session sockets remain direct local transports from run 16. The later proxy and authorization phases must constrain who can use them.
+
+## Source and merged-code differences
+
+The source is `tbhb-dev/agent-orchestration-poc.internal` commit `27a69f821634b71243ac76e837ca322f34ef68cb`, `wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/source.md`, lines 29 to 34, 95 to 120, 157 to 173, and 343. The run table in the proposal at that commit assigns launchd registration to run 18.
+
+| Source target | Run 17 decision |
+| --- | --- |
+| A launchd-managed host shim keeps running after daemon restart. | The run table calls for a detached shim now and reserves launchd for run 18. This run follows the table and tests daemon reconnection through the shim socket. |
+| One session library serves host and guest, with the host actor in the daemon in the merged runs 9 to 16. | The merged `hypervisor-session` actor is reused without a new holder. Run 17 moves its instantiation to the per-workload shim. A guest agent remains for later runs. |
+| Each driver hosts sessions behind one contract. | Core values define three runtimes. Run 17 builds the unsandboxed host shell. It refuses controls it cannot enforce. |
+| A proxy provides local channels and control. | The merged run 16 terminal socket binds directly to a `SessionHandle`. The shim hosts that socket and keeps it open after daemon exit. Proxy routing and authorization remain Phase 4 work. |
+| A server suite applies to any driver, with state events. | The merged conformance suite applies to the Unix PTY actor. Run 17 adds host lifecycle and recovery tests. Shim `events` reports creation only. Actor state events remain on the session channel without a durable workload event log. |
+| Stable workload and session IDs are globally unique. | The core checks safe host and local components, and the host shim refuses a duplicate live session. Global host-name allocation is outside this prototype. |
+
+The previous draft's input findings remain applicable. [RFC-40 run 11](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/69dc14c7a0e864329c4f8a4301e8688b67363fd4/wiki/proposals/2026-10-07T2052Z-RFC-40-miscellany-spikes/findings/r11-pty-supervision.md#L16) motivates an identity handshake rather than PID adoption. [RFC-39 run 13](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/69dc14c7a0e864329c4f8a4301e8688b67363fd4/wiki/proposals/2026-10-07T2052Z-RFC-39-filesystem-spikes/findings/r13-paths-ownership.md#L13) supplies the physical path contract. [RFC-38 run 7](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/69dc14c7a0e864329c4f8a4301e8688b67363fd4/wiki/proposals/2026-10-07T2052Z-RFC-38-command-and-control-spikes/findings/r7-host-stop.md#L16) limits host process-group stop.
 
 ## Inputs
 

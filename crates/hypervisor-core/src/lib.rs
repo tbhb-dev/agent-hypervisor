@@ -18,6 +18,7 @@ pub mod screen;
 pub mod session;
 pub mod state;
 pub mod terminal_transport;
+pub mod workload;
 
 /// Formats the line a binary prints to report its name and version.
 #[must_use]

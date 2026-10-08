@@ -8,7 +8,7 @@
 //! into the ring and the emulator, and queries keep getting answers, with no viewer attached.
 //!
 //! This crate decides nothing. The holder decides; the actor reads the clock, moves bytes, and
-//! calls the backend. Each emitted session event is logged with its workload and session ids.
+//! calls the backend. Session events and failed effects are logged with workload and session ids.
 
 use std::fmt;
 use std::io::Read;
@@ -79,7 +79,97 @@ pub enum Command {
 #[cfg(test)]
 mod log_tests {
     use super::*;
+    use hypervisor_core::session::{Persistence, Signal, Target};
+    use hypervisor_ghostty::GhosttyEmulator;
+    use hypervisor_pty::{Caps, Resize, Support};
     use serde_json::Value;
+    use std::io;
+
+    struct FailingWrite;
+
+    struct NoWait;
+
+    impl Wait for NoWait {
+        fn wait(self) -> io::Result<Exit> {
+            unreachable!()
+        }
+    }
+
+    impl Pty for FailingWrite {
+        type Reader = io::Empty;
+        type Waiter = NoWait;
+
+        fn reader(&self) -> io::Result<Self::Reader> {
+            Ok(io::empty())
+        }
+
+        fn take_waiter(&mut self) -> Option<Self::Waiter> {
+            None
+        }
+
+        fn write(&mut self, _: &[u8]) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected write failure",
+            ))
+        }
+
+        fn resize(&mut self, _: Size) -> io::Result<Resize> {
+            Ok(Resize::Unchanged)
+        }
+
+        fn signal(&self, _: Signal, _: Target) -> io::Result<Support> {
+            Ok(Support::Ok)
+        }
+
+        fn redraw_hint(&self) -> io::Result<Support> {
+            Ok(Support::Ok)
+        }
+
+        fn foreground(&self) -> Option<i32> {
+            None
+        }
+
+        fn caps(&self) -> Caps {
+            Caps {
+                foreground: false,
+                signals: true,
+                redraw_hint: true,
+                backend_queries: &[],
+                resize_repaints: false,
+            }
+        }
+    }
+
+    #[test]
+    fn failed_pty_write_is_logged_with_session_ids() {
+        let mut actor: Actor<FailingWrite, GhosttyEmulator> = Actor {
+            holder: Holder::new(
+                HolderConfig::new(Persistence::Persistent),
+                Size::new(80, 24).unwrap(),
+            ),
+            pty: Some(FailingWrite),
+            emulator: None,
+            events: Vec::new(),
+            event_seq: 0,
+            origin: Instant::now(),
+            log: LogContext {
+                workload_id: "workload-1".into(),
+                session_id: "session-2".into(),
+            },
+            queries: QueryScanner::default(),
+            screen_harness: None,
+            screen_at: None,
+            error_lines: Vec::new(),
+        };
+        actor.apply(Effect::WritePty(b"input".to_vec()));
+        assert_eq!(actor.error_lines.len(), 1);
+        let value: Value = serde_json::from_str(&actor.error_lines[0]).unwrap();
+        assert_eq!(value["workload_id"], "workload-1");
+        assert_eq!(value["session_id"], "session-2");
+        assert_eq!(value["operation"], "write_pty");
+        assert_eq!(value["error"], "injected write failure");
+    }
 
     #[test]
     fn event_log_has_ids_and_structured_channel() {
@@ -441,6 +531,8 @@ where
                 queries: QueryScanner::default(),
                 screen_harness: None,
                 screen_at: None,
+                #[cfg(test)]
+                error_lines: Vec::new(),
             };
             actor.run(&rx);
         })
@@ -504,9 +596,18 @@ struct Actor<P, E> {
     queries: QueryScanner,
     screen_harness: Option<Harness>,
     screen_at: Option<Duration>,
+    #[cfg(test)]
+    error_lines: Vec<String>,
 }
 
 impl<P: Pty, E: Emulator> Actor<P, E> {
+    fn log_error(&mut self, operation: &str, error: &impl fmt::Display) {
+        let line = self.log.error_line(operation, error);
+        eprintln!("{line}");
+        #[cfg(test)]
+        self.error_lines.push(line);
+    }
+
     fn now(&self) -> Duration {
         self.origin.elapsed()
     }
@@ -681,33 +782,43 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                 }
             }
             Effect::WritePty(bytes) => {
-                if let Some(pty) = self.pty.as_mut() {
-                    let _ = pty.write(&bytes);
+                if let Some(pty) = self.pty.as_mut()
+                    && let Err(error) = pty.write(&bytes)
+                {
+                    self.log_error("write_pty", &error);
                 }
             }
             Effect::ApplySize(size) => {
-                if let Some(pty) = self.pty.as_mut() {
-                    let _ = pty.resize(size);
+                if let Some(pty) = self.pty.as_mut()
+                    && let Err(error) = pty.resize(size)
+                {
+                    self.log_error("resize_pty", &error);
                 }
-                if let Some(emulator) = self.emulator.as_mut() {
-                    let _ = emulator.resize(size);
+                if let Some(emulator) = self.emulator.as_mut()
+                    && let Err(error) = emulator.resize(size)
+                {
+                    self.log_error("resize_emulator", &error);
                 }
             }
             Effect::RedrawHint => {
-                if let Some(pty) = self.pty.as_ref() {
-                    let _ = pty.redraw_hint();
+                if let Some(pty) = self.pty.as_ref()
+                    && let Err(error) = pty.redraw_hint()
+                {
+                    self.log_error("redraw_hint", &error);
                 }
             }
             Effect::Interrupt => {
-                if let Some(pty) = self.pty.as_mut() {
-                    let _ = pty.interrupt();
+                if let Some(pty) = self.pty.as_mut()
+                    && let Err(error) = pty.interrupt()
+                {
+                    self.log_error("interrupt", &error);
                 }
             }
             Effect::Signal { signal, target } => {
                 if let Some(pty) = self.pty.as_ref()
                     && let Err(error) = pty.signal(signal, target)
                 {
-                    eprintln!("{}", self.log.error_line("signal", &error));
+                    self.log_error("signal", &error);
                 }
             }
             Effect::Release => {

@@ -8,11 +8,11 @@ This spec covers the terminal modes and query responses the server advertises, a
 
 The fixed server answers below are the Phase 1 profile. The actor for a session answers queries without a viewer and preserves their output order. It also filters terminal replies from viewer input. Rendering conformance waits for clients in Phases 5 and 8, and the server does not claim kitty keyboard input or graphics queries.
 
-The RFC-36 source at `tbhb-dev/agent-orchestration-poc.internal` commit `63ab6a891a2d167dfdf1faf6ec497b38996e93fa`, `wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/source.md`, lines 99 to 111 and 340 to 341, asks for a fixed conservative profile and client rendering. The merged run 10 code supplies the server replies but no client renderer. The source names keyboard protocol queries, while the merged profile leaves the kitty query unanswered after the run 3 Ctrl-C finding. This draft follows the server behavior and leaves rendering untested. The run 3 capture tool reported synchronized output mode 2026 as reset. The merged profile reports it as set, and the table below follows that result.
+The RFC-36 source at `tbhb-dev/agent-orchestration-poc.internal` commit `63ab6a891a2d167dfdf1faf6ec497b38996e93fa`, `wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/source.md`, lines 99 to 111 and 340 to 341, asks for a fixed conservative profile and client rendering. The merged run 10 code supplies the server replies but no client renderer. The source names keyboard protocol queries, while the merged profile leaves the kitty query unanswered after the run 3 Ctrl-C finding. This draft follows the server behavior and leaves rendering untested ([#44](https://github.com/tbhb-dev/agent-hypervisor/issues/44)). The run 3 capture tool reported synchronized output mode 2026 as reset. The merged profile reports it as set, and the table below follows that result.
 
 ## Client rendering contract
 
-A client in a later phase must present the server's current rows, columns, cell contents, styles, and cursor without issuing its own device replies to the child. It applies a fresh snapshot before later output after a resync. Alternate-screen contents and terminal mode changes come from the server's emulator state. The Phase 5 snapshot-fidelity suite and Phase 8 native renderer tests must check these proposed requirements. No Phase 1 client test verifies them.
+A client in a later phase must present the server's current rows, columns, cell contents, styles, and cursor without issuing its own device replies to the child. It applies a fresh snapshot before later output after a resync. Alternate-screen contents and terminal mode changes come from the server's emulator state. The Phase 5 snapshot-fidelity suite and Phase 8 native renderer tests must check these proposed requirements. No Phase 1 client test verifies them ([#44](https://github.com/tbhb-dev/agent-hypervisor/issues/44)).
 
 ## Inputs
 
@@ -43,7 +43,7 @@ Here `ESC`, `CSI`, `OSC`, `DCS`, `BEL`, and `ST` name their usual escape bytes. 
 | `CSI 14 t`, `CSI 16 t`, `CSI 18 t` | `CSI 4 ; 384 ; 640 t`, `CSI 6 ; 16 ; 8 t`, `CSI 8 ; 24 ; 80 t` | Run 3 conservative size reports |
 | `CSI ? u`, kitty graphics `APC G ... ST` | silence | Run 3 Ctrl-C finding and run 5 query capture |
 | `OSC 4 ; index ; ?`, `OSC 12 ; ?`, `DCS + q ... ST`, `DCS $ q ... ST` | silence | Outside this profile's fixed answers |
-| Other terminal queries | silence | Untested beyond this fixed profile |
+| Other terminal queries | silence | Untested beyond this fixed profile ([#48](https://github.com/tbhb-dev/agent-hypervisor/issues/48)) |
 
 For OSC 10 and 11, a `BEL` query receives a `BEL` answer and an `ST` query receives an `ST` answer.
 

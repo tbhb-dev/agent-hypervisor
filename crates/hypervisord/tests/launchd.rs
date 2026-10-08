@@ -1,15 +1,19 @@
 //! Host shims under launchd: daemon restart, daemon upgrade, and crash restart.
 //!
 //! Every job lives in the user's `gui/<uid>` domain under a `dev.tbhb.hypervisor.test.`
-//! label, loads from a temporary plist, and is booted out by `JobGuard` on every exit path.
+//! label naming the owning test PID, and loads from a temporary plist. `JobGuard` boots it
+//! out on return or panic, the SIGTERM handler on SIGTERM, and the next run's sweep after
+//! SIGKILL.
 #![cfg(target_os = "macos")]
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, Once, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,7 +21,7 @@ use hypervisor_core::channel::{
     Capabilities, Encoding, Frame, Mode, OpenRequest, OpenTarget, SessionKind, WireSize,
     WireSpawnSpec,
 };
-use hypervisor_core::launchd::JobConfig;
+use hypervisor_core::launchd::{self, JobConfig};
 use hypervisor_core::workload::{
     Isolation, NetworkPolicy, Recovery, ResourceLimits, Runtime, StableId, WorkloadSpec,
 };
@@ -30,6 +34,66 @@ mod process_group;
 use process_group::ProcessGroup;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+static SERIAL: Mutex<()> = Mutex::new(());
+static TERMINATED: AtomicBool = AtomicBool::new(false);
+
+/// Serialize launchd tests and boot out jobs left by dead test runs before registering any.
+fn serial() -> MutexGuard<'static, ()> {
+    static HANDLER: Once = Once::new();
+    let guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    HANDLER.call_once(handle_sigterm);
+    sweep(false);
+    guard
+}
+
+/// Boot out every test job whose owner is dead, or owned by this process when `exiting`.
+fn sweep(exiting: bool) {
+    let domain = format!("gui/{}", process::geteuid().as_raw());
+    let output = Command::new("launchctl")
+        .args(["print", &domain])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "launchctl print {domain} failed");
+    let jobs = launchd::test_jobs(&String::from_utf8_lossy(&output.stdout));
+    let me = std::process::id();
+    let live: BTreeSet<u32> = jobs
+        .values()
+        .copied()
+        .filter(|&owner| {
+            (!exiting || owner != me)
+                && !matches!(
+                    process::test_kill_process(Pid::from_raw(owner.cast_signed()).unwrap()),
+                    Err(rustix::io::Errno::SRCH)
+                )
+        })
+        .collect();
+    for label in launchd::sweep_targets(&jobs, &live) {
+        let _ = launchctl(&["bootout", &format!("{domain}/{label}")]).status();
+    }
+}
+
+extern "C" fn on_sigterm(_: libc::c_int) {
+    TERMINATED.store(true, Ordering::SeqCst);
+}
+
+/// The test harness does not unwind on a signal, so a watcher boots out this process's jobs.
+fn handle_sigterm() {
+    let handler: extern "C" fn(libc::c_int) = on_sigterm;
+    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+    #[expect(unsafe_code, reason = "install a SIGTERM handler for job cleanup")]
+    unsafe {
+        libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
+    }
+    thread::spawn(|| {
+        loop {
+            if TERMINATED.load(Ordering::SeqCst) {
+                sweep(true);
+                std::process::exit(143);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    });
+}
 
 /// Boots out its launchd job on drop, including when the test panics.
 struct JobGuard(String);
@@ -74,10 +138,12 @@ struct Fixture {
     job: Option<JobGuard>,
     groups: Vec<ProcessGroup>,
     child_pid: Option<i32>,
+    _serial: MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     fn new() -> Self {
+        let serial = serial();
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let root = PathBuf::from(format!("/private/tmp/hv-r18-{}-{n}", std::process::id()));
         fs::create_dir_all(root.join("ws")).unwrap();
@@ -86,7 +152,7 @@ impl Fixture {
         let shim_exe = root.join("bin/host-shim-v1");
         fs::copy(env!("CARGO_BIN_EXE_host-shim"), &shim_exe).unwrap();
         let config = JobConfig {
-            prefix: format!("dev.tbhb.hypervisor.test.r18-{}-{n}", std::process::id()),
+            prefix: launchd::test_prefix(std::process::id(), n),
             uid: process::geteuid().as_raw(),
             throttle_seconds: 1,
         };
@@ -102,6 +168,7 @@ impl Fixture {
             job: None,
             groups: vec![],
             child_pid: None,
+            _serial: serial,
         };
         fixture
             .driver()
@@ -136,8 +203,10 @@ impl Fixture {
     }
 
     fn start(&mut self, driver: &mut HostDriver) -> u32 {
-        let service = driver.launchd_service(&self.id).unwrap();
-        self.job = Some(JobGuard::new(service));
+        // Keep an existing guard: replacing it would boot the job out before the driver could.
+        if self.job.is_none() {
+            self.job = Some(JobGuard::new(driver.launchd_service(&self.id).unwrap()));
+        }
         driver.start(&self.id).unwrap();
         assert!(self.job.as_ref().unwrap().loaded());
         let pid = driver.shim_pid(&self.id).unwrap();
@@ -360,4 +429,143 @@ fn launchd_restarts_a_crashed_shim_and_the_daemon_reports_it() {
 
     driver.stop(&fixture.id).unwrap();
     assert!(!fixture.job.as_ref().unwrap().loaded());
+}
+
+fn control_socket(root: &Path) -> PathBuf {
+    let metadata = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .unwrap();
+    metadata.with_extension("sock")
+}
+
+fn process_alive(pid: u32) -> bool {
+    process::test_kill_process(Pid::from_raw(pid.cast_signed()).unwrap()).is_ok()
+}
+
+#[test]
+fn attended_start_after_a_dead_shim_is_adopted_as_running() {
+    let mut fixture = Fixture::new();
+    let mut driver = fixture.driver();
+    let old = fixture.start(&mut driver);
+    drop(driver);
+    // bootout sends SIGTERM, which the shim does not handle, so its socket stays behind.
+    let service = fixture.job.as_ref().unwrap().0.clone();
+    assert!(
+        launchctl(&["bootout", &service])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_for(|| (!process_alive(old)).then_some(()));
+    assert!(control_socket(&fixture.root).exists());
+
+    let mut driver = fixture.driver();
+    assert_eq!(
+        driver.workloads()[&fixture.id.label()].recovery,
+        Recovery::Stopped
+    );
+    let pid = fixture.start(&mut driver);
+    drop(driver);
+    let daemon = Path::new(env!("CARGO_BIN_EXE_hypervisord"));
+    assert_eq!(
+        fixture.adopt(daemon, &fixture.shim_exe),
+        format!("testhost:workload Running 0 {pid}\n")
+    );
+}
+
+#[test]
+fn start_replaces_a_loaded_job_whose_shim_is_silent() {
+    let mut fixture = Fixture::new();
+    let mut driver = fixture.driver();
+    let old = fixture.start(&mut driver);
+    drop(driver);
+    process::kill_process(Pid::from_raw(old.cast_signed()).unwrap(), Signal::STOP).unwrap();
+
+    let mut driver = fixture.driver();
+    assert_eq!(
+        driver.workloads()[&fixture.id.label()].recovery,
+        Recovery::Stopped
+    );
+    assert!(fixture.job.as_ref().unwrap().loaded());
+    let new = fixture.start(&mut driver);
+    assert_ne!(new, old);
+    assert_eq!(parent_pid(new), 1);
+    assert_eq!(
+        driver.workloads()[&fixture.id.label()].recovery,
+        Recovery::Running
+    );
+    wait_for(|| (!process_alive(old)).then_some(()));
+}
+
+/// Child half of the killed-run tests: does nothing unless the parent test spawned it.
+#[test]
+fn killed_run_child_registers_a_job_and_waits() {
+    let Some(ready) = std::env::var_os("HV_LAUNCHD_CHILD_READY") else {
+        return;
+    };
+    let mut fixture = Fixture::new();
+    let mut driver = fixture.driver();
+    let pid = fixture.start(&mut driver);
+    let staged = PathBuf::from(&ready).with_extension("tmp");
+    let job = &fixture.job.as_ref().unwrap().0;
+    fs::write(
+        &staged,
+        format!("{job}\n{pid}\n{}\n", fixture.root.display()),
+    )
+    .unwrap();
+    fs::rename(staged, ready).unwrap();
+    thread::sleep(Duration::from_secs(60));
+}
+
+/// Kill a child test run after it registers a job; return guards for the leaked job.
+fn kill_child_run(signal: Signal) -> (ProcessGroup, JobGuard, u32, PathBuf) {
+    let ready = PathBuf::from(format!(
+        "/private/tmp/hv-r18-child-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "killed_run_child_registers_a_job_and_waits"])
+        .env("HV_LAUNCHD_CHILD_READY", &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let lines = wait_for(|| fs::read_to_string(&ready).ok());
+    let _ = fs::remove_file(&ready);
+    let lines: Vec<&str> = lines.lines().collect();
+    let shim: u32 = lines[1].parse().unwrap();
+    // Declared before the job guard, the group is killed only after the job is booted out.
+    let group = ProcessGroup::new(shim.cast_signed());
+    let job = JobGuard::new(lines[0].into());
+    process::kill_process(Pid::from_raw(child.id().cast_signed()).unwrap(), signal).unwrap();
+    child.wait().unwrap();
+    (group, job, shim, PathBuf::from(lines[2]))
+}
+
+#[test]
+fn next_run_sweeps_the_job_of_a_sigkilled_test_run() {
+    let first_run = serial();
+    let (_group, job, shim, root) = kill_child_run(Signal::KILL);
+    assert!(
+        job.loaded(),
+        "SIGKILL ran no cleanup, so the job is still loaded"
+    );
+    assert!(process_alive(shim));
+    drop(first_run);
+    let _next_run = serial();
+    assert!(!job.loaded());
+    wait_for(|| (!process_alive(shim)).then_some(()));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_sigtermed_test_run_boots_out_its_own_job() {
+    let _serial = serial();
+    let (_group, job, shim, root) = kill_child_run(Signal::TERM);
+    assert!(!job.loaded());
+    wait_for(|| (!process_alive(shim)).then_some(()));
+    let _ = fs::remove_dir_all(root);
 }

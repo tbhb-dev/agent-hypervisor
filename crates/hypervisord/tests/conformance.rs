@@ -359,7 +359,7 @@ fn terminal_socket_refuses_peer_with_unlisted_uid() {
 #[test]
 fn terminal_socket_replaces_byte_snapshot_after_resync() {
     let mut fixture = Fixture::start(
-        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; IFS= read -r line; i=0; while [ $i -lt 70 ]; do printf '%1024s' x; i=$((i+1)); done; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; IFS= read -r line; i=0; while [ $i -lt 70 ]; do printf '%1024s' x; i=$((i+1)); done; while IFS= read -r line; do if [ \"$line\" = after-resync ]; then printf 'got:after-'; IFS= read -r line; printf 'resync\\n'; else printf 'got:%s\\n' \"$line\"; fi; done",
     );
     let pgid = fixture_pgid(&wait_for_output(fixture.session(), "ready"));
     let root = SocketRoot::new("s");
@@ -389,16 +389,33 @@ fn terminal_socket_replaces_byte_snapshot_after_resync() {
     }
     let next_sequence = next_sequence.expect("resync notice must be followed by a snapshot");
     wire_send(&mut stream, &Frame::Input(b"after-resync\n".to_vec()));
+    let mut expected_sequence = next_sequence;
+    let mut output = Vec::new();
+    let mut saw_first_half = false;
     let mut found = false;
     for _ in 0..100 {
         if let Frame::Output { sequence, bytes } = wire_frame(&mut stream) {
-            assert_eq!(sequence, next_sequence);
-            if String::from_utf8_lossy(&bytes).contains("got:after-resync") {
+            assert_eq!(sequence, expected_sequence);
+            expected_sequence += bytes.len() as u64;
+            output.extend_from_slice(&bytes);
+            if !saw_first_half
+                && output
+                    .windows(b"got:after-".len())
+                    .any(|part| part == b"got:after-")
+            {
+                saw_first_half = true;
+                wire_send(&mut stream, &Frame::Input(b"continue\n".to_vec()));
+            }
+            if output
+                .windows(b"got:after-resync".len())
+                .any(|part| part == b"got:after-resync")
+            {
                 found = true;
                 break;
             }
         }
     }
+    assert!(saw_first_half, "fixture must split the post-resync marker");
     assert!(found, "live output must continue at the snapshot sequence");
     server.finish();
     fixture.finish(pgid);

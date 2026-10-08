@@ -11,7 +11,9 @@ license = "UNLICENSED"
 publish = false
 
 [workspace.dependencies]
+alacritty_terminal = { version = "=0.26.0", default-features = false }
 ghostty-vt-sys = { path = "crates/ghostty-vt-sys" }
+hypervisor-alacritty = { path = "crates/hypervisor-alacritty" }
 hypervisor-core = { path = "crates/hypervisor-core" }
 hypervisor-ghostty = { path = "crates/hypervisor-ghostty" }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }

@@ -349,9 +349,19 @@ fn terminal_socket_refuses_peer_with_unlisted_uid() {
     let uid = rustix::process::geteuid().as_raw();
     let (server, path) = serve_fixture(&mut fixture, &root.0, uid.wrapping_add(1));
     let mut stream = UnixStream::connect(path).unwrap();
-    stream.set_read_timeout(Some(WAIT)).unwrap();
+    stream.set_nonblocking(true).unwrap();
     let mut byte = [0];
-    assert_eq!(stream.read(&mut byte).unwrap(), 0);
+    let start = Instant::now();
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(start.elapsed() < WAIT, "unlisted peer was not refused");
+                thread::sleep(Duration::from_millis(10));
+            }
+            other => panic!("expected refused peer to close, got {other:?}"),
+        }
+    }
     server.finish();
     fixture.finish(pgid);
 }

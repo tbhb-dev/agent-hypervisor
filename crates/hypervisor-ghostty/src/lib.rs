@@ -21,8 +21,8 @@ use std::ptr::{self, NonNull};
 
 use ghostty_vt_sys as sys;
 use hypervisor_core::emulator::{
-    self, Attrs, Cell, CellWidth, Color, Cursor, DEVICE_ATTRIBUTES, Emulator, Grid, Modes,
-    MouseFormat, MouseTracking, Screen, Size, Underline, XTVERSION_NAME,
+    self, Attrs, Cell, CellWidth, Color, Cursor, Emulator, Grid, Modes, MouseFormat, MouseTracking,
+    PROFILE, Screen, Size, Underline,
 };
 
 /// A libghostty-vt call returned an error code.
@@ -450,7 +450,7 @@ unsafe extern "C" fn on_device_attributes(
     if out.is_null() {
         return false;
     }
-    let profile = DEVICE_ATTRIBUTES;
+    let profile = PROFILE.device;
     // SAFETY: the library passes a valid out pointer for the duration of the call.
     let out = unsafe { &mut *out };
     out.primary.conformance_level = profile.conformance_level;
@@ -469,7 +469,7 @@ unsafe extern "C" fn on_xtversion(
     _userdata: *mut c_void,
 ) -> sys::GhosttyString {
     sys::GhosttyString {
-        ptr: XTVERSION_NAME.as_ptr(),
-        len: XTVERSION_NAME.len(),
+        ptr: PROFILE.version.as_ptr(),
+        len: PROFILE.version.len(),
     }
 }

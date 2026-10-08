@@ -3,10 +3,10 @@
 //! `alacritty_terminal` hard-codes its own device attributes, ignores DA3 and XTVERSION, and keeps
 //! no state for modes 2026 and 2027. Its shell crate runs a second parser beside it and passes
 //! each CSI it sees to [`csi_effects`], which says what to answer and which mode changed. The
-//! answers come from [`DEVICE_ATTRIBUTES`] and [`XTVERSION_NAME`], the same values ghostty-vt
+//! answers come from [`PROFILE`], the same values ghostty-vt
 //! answers with.
 
-use super::reply::{DEVICE_ATTRIBUTES, XTVERSION_NAME};
+use super::reply::PROFILE;
 
 /// The private modes [`csi_effects`] reports changes to: 2026, synchronized output, and 2027,
 /// grapheme clustering.
@@ -32,7 +32,7 @@ pub enum CsiEffect {
 pub fn csi_effects(intermediates: &[u8], params: &[u16], action: char) -> Vec<CsiEffect> {
     let first = params.first().copied().unwrap_or(0);
     let reply = |bytes: String| vec![CsiEffect::Reply(bytes.into_bytes())];
-    let da = DEVICE_ATTRIBUTES;
+    let da = PROFILE.device;
     match (intermediates, action) {
         ([], 'c') if first == 0 => {
             let levels: Vec<String> = std::iter::once(da.conformance_level)
@@ -46,7 +46,7 @@ pub fn csi_effects(intermediates: &[u8], params: &[u16], action: char) -> Vec<Cs
             da.device_type, da.firmware_version
         )),
         (b"=", 'c') if first == 0 => reply(format!("\x1bP!|{:08X}\x1b\\", da.unit_id)),
-        (b">", 'q') if first == 0 => reply(format!("\x1bP>|{XTVERSION_NAME}\x1b\\")),
+        (b">", 'q') if first == 0 => reply(format!("\x1bP>|{}\x1b\\", PROFILE.version)),
         (b"?", 'h' | 'l') => params
             .iter()
             .filter(|m| TRACKED_MODES.contains(m))

@@ -1,4 +1,4 @@
-//! Host shims under launchd: registration, start paths, and test job cleanup.
+//! Host shims under launchd: daemon restart, daemon upgrade, and crash restart.
 //!
 //! Every job lives in the user's `gui/<uid>` domain under a `dev.tbhb.hypervisor.test.`
 //! label naming the owning test PID, and loads from a temporary plist. `JobGuard` boots it
@@ -8,7 +8,8 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,6 +17,10 @@ use std::sync::{Mutex, MutexGuard, Once, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hypervisor_core::channel::{
+    Capabilities, Encoding, Frame, Mode, OpenRequest, OpenTarget, SessionKind, WireSize,
+    WireSpawnSpec,
+};
 use hypervisor_core::launchd::{self, JobConfig};
 use hypervisor_core::workload::{
     Isolation, NetworkPolicy, Recovery, ResourceLimits, Runtime, StableId, WorkloadSpec,
@@ -132,6 +137,7 @@ struct Fixture {
     shim_exe: PathBuf,
     job: Option<JobGuard>,
     groups: Vec<ProcessGroup>,
+    child_pid: Option<i32>,
     _serial: MutexGuard<'static, ()>,
 }
 
@@ -161,6 +167,7 @@ impl Fixture {
             shim_exe,
             job: None,
             groups: vec![],
+            child_pid: None,
             _serial: serial,
         };
         fixture
@@ -212,6 +219,40 @@ impl Fixture {
         self.groups.push(ProcessGroup::new(pid.cast_signed()));
     }
 
+    fn session(&mut self, driver: &HostDriver) -> PathBuf {
+        let id = StableId {
+            host: self.id.host.clone(),
+            local: "session".into(),
+        };
+        let path = driver
+            .spawn_session(
+                &self.id,
+                id,
+                WireSpawnSpec {
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), "echo $$ > pid; exec sleep 120".into()],
+                    env: vec![("PATH".into(), "/bin:/usr/bin".into())],
+                    cwd: None,
+                    user: None,
+                    kind: SessionKind::Shell,
+                },
+                WireSize { cols: 80, rows: 24 },
+            )
+            .unwrap();
+        let pid = wait_for(|| {
+            fs::read_to_string(self.root.join("ws/pid"))
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok())
+        });
+        self.groups.push(ProcessGroup::new(pid));
+        self.child_pid = Some(pid);
+        path
+    }
+
+    fn child_alive(&self) -> bool {
+        process::test_kill_process_group(Pid::from_raw(self.child_pid.unwrap()).unwrap()).is_ok()
+    }
+
     /// Run a daemon binary that adopts this fixture's shims and prints their state.
     fn adopt(&self, daemon: &Path, shim: &Path) -> String {
         let output = Command::new(daemon)
@@ -261,6 +302,38 @@ fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
     }
 }
 
+fn open_existing(path: &Path) {
+    let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let request = OpenRequest {
+        versions: vec![1],
+        target: OpenTarget::Session("testhost:session".into()),
+        mode: Mode::ReadOnly,
+        encoding: Encoding::Bytes,
+        size: WireSize { cols: 80, rows: 24 },
+        client: Capabilities {
+            terminal: "test".into(),
+            flags: 0,
+        },
+        resume: None,
+        max_frames_per_second: None,
+    };
+    stream
+        .write_all(&Frame::OpenRequest(request).encode().unwrap())
+        .unwrap();
+    let mut prefix = [0; 4];
+    stream.read_exact(&mut prefix).unwrap();
+    let mut frame = vec![0; u32::from_be_bytes(prefix) as usize + 4];
+    frame[..4].copy_from_slice(&prefix);
+    stream.read_exact(&mut frame[4..]).unwrap();
+    assert!(matches!(
+        Frame::decode(&frame).unwrap().unwrap().0,
+        Frame::OpenResponse(_)
+    ));
+}
+
 fn parent_pid(pid: u32) -> u32 {
     let output = Command::new("ps")
         .args(["-o", "ppid=", "-p", &pid.to_string()])
@@ -271,6 +344,91 @@ fn parent_pid(pid: u32) -> u32 {
         .trim()
         .parse()
         .unwrap()
+}
+
+#[test]
+fn session_survives_daemon_restart_under_launchd() {
+    let mut fixture = Fixture::new();
+    let mut driver = fixture.driver();
+    let pid = fixture.start(&mut driver);
+    let socket = fixture.session(&driver);
+    assert_eq!(parent_pid(pid), 1, "launchd does not own the shim");
+    drop(driver);
+
+    let daemon = Path::new(env!("CARGO_BIN_EXE_hypervisord"));
+    let adopted = fixture.adopt(daemon, &fixture.shim_exe);
+    assert_eq!(adopted, format!("testhost:workload Running 1 {pid}\n"));
+    assert!(fixture.child_alive());
+    open_existing(&socket);
+}
+
+#[test]
+fn session_survives_daemon_upgrade_under_launchd() {
+    let mut fixture = Fixture::new();
+    let daemon = fixture.root.join("bin/hypervisord");
+    fs::copy(env!("CARGO_BIN_EXE_hypervisord"), &daemon).unwrap();
+    let mut driver = fixture.driver();
+    let pid = fixture.start(&mut driver);
+    let socket = fixture.session(&driver);
+    drop(driver);
+    let v1 = fixture.shim_exe.clone();
+    assert_eq!(
+        fixture.adopt(&daemon, &v1),
+        format!("testhost:workload Running 1 {pid}\n")
+    );
+
+    // Upgrade: install a new shim beside the old one and swap the daemon binary by rename.
+    let v2 = fixture.root.join("bin/host-shim-v2");
+    fs::copy(&v1, &v2).unwrap();
+    let staged = fixture.root.join("bin/hypervisord.new");
+    fs::copy(&daemon, &staged).unwrap();
+    let old_inode = fs::metadata(&daemon).unwrap().ino();
+    fs::rename(&staged, &daemon).unwrap();
+    assert_ne!(fs::metadata(&daemon).unwrap().ino(), old_inode);
+
+    assert_eq!(
+        fixture.adopt(&daemon, &v2),
+        format!("testhost:workload Running 1 {pid}\n")
+    );
+    let print = Command::new("launchctl")
+        .args(["print", &fixture.job.as_ref().unwrap().0])
+        .output()
+        .unwrap();
+    let print = String::from_utf8(print.stdout).unwrap();
+    assert!(
+        print.contains(&format!("program = {}", v1.display())),
+        "the running job no longer names its pinned shim"
+    );
+    assert!(fixture.child_alive());
+    open_existing(&socket);
+}
+
+#[test]
+fn launchd_restarts_a_crashed_shim_and_the_daemon_reports_it() {
+    let mut fixture = Fixture::new();
+    let mut driver = fixture.driver();
+    let old = fixture.start(&mut driver);
+    fixture.session(&driver);
+    drop(driver);
+
+    process::kill_process(Pid::from_raw(old.cast_signed()).unwrap(), Signal::KILL).unwrap();
+    let mut driver = wait_for(|| {
+        let driver = fixture.driver();
+        (driver.workloads()[&fixture.id.label()].recovery == Recovery::Restarted).then_some(driver)
+    });
+    let new = driver.shim_pid(&fixture.id).unwrap();
+    fixture.guard_shim(new);
+    assert_ne!(new, old);
+    assert_eq!(parent_pid(new), 1);
+    // The PTY closed with the old shim, so its sessions ended and are not re-adopted.
+    assert!(driver.list_sessions(&fixture.id).unwrap().is_empty());
+    wait_for(|| (!fixture.child_alive()).then_some(()));
+    assert!(
+        driver.events(&fixture.id).unwrap()[1].starts_with("shim_restarted_after_unclean_exit:")
+    );
+
+    driver.stop(&fixture.id).unwrap();
+    assert!(!fixture.job.as_ref().unwrap().loaded());
 }
 
 fn control_socket(root: &Path) -> PathBuf {

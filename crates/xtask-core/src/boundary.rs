@@ -191,15 +191,11 @@ pub fn banned_paths(config: &str) -> Vec<&str> {
 }
 
 /// Returns the lints named in every `#![forbid(...)]` attribute of a crate root, ignoring
-/// line comments.
+/// line and nested block comments.
 #[must_use]
 pub fn forbidden_lints(lib_root: &str) -> Vec<String> {
-    let code: String = lib_root
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .flat_map(str::chars)
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let uncommented = strip_comments(lib_root);
+    let code: String = uncommented.chars().filter(|c| !c.is_whitespace()).collect();
     code.split("#![forbid(")
         .skip(1)
         .filter_map(|rest| rest.split_once(")]").map(|(list, _)| list))
@@ -207,6 +203,48 @@ pub fn forbidden_lints(lib_root: &str) -> Vec<String> {
         .filter(|lint| !lint.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn strip_comments(source: &str) -> String {
+    let mut chars = source.chars().peekable();
+    let mut code = String::with_capacity(source.len());
+    let mut block_depth = 0;
+    let mut line_comment = false;
+    while let Some(ch) = chars.next() {
+        if line_comment {
+            if ch == '\n' {
+                line_comment = false;
+                code.push(ch);
+            }
+        } else if block_depth > 0 {
+            match (ch, chars.peek()) {
+                ('/', Some('*')) => {
+                    chars.next();
+                    block_depth += 1;
+                }
+                ('*', Some('/')) => {
+                    chars.next();
+                    block_depth -= 1;
+                }
+                _ => {}
+            }
+        } else {
+            match (ch, chars.peek()) {
+                ('/', Some('/')) => {
+                    chars.next();
+                    line_comment = true;
+                    code.push(' ');
+                }
+                ('/', Some('*')) => {
+                    chars.next();
+                    block_depth = 1;
+                    code.push(' ');
+                }
+                _ => code.push(ch),
+            }
+        }
+    }
+    code
 }
 
 /// Returns every boundary violation among `packages`, in package order.
@@ -422,6 +460,36 @@ mod tests {
     }
 
     #[test]
+    fn block_commented_forbid_does_not_override_allow() {
+        let root = format!(
+            "/* #![forbid({})] */\n#![allow(clippy::disallowed_methods)]\n",
+            REQUIRED_FORBID.join(", ")
+        );
+        assert_eq!(
+            violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]),
+            REQUIRED_FORBID
+                .iter()
+                .map(|lint| missing_forbid(lint))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn nested_block_commented_forbid_does_not_count() {
+        let root = format!(
+            "/* outer /* nested */ #![forbid({})] */\n",
+            REQUIRED_FORBID.join(", ")
+        );
+        assert_eq!(
+            violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]),
+            REQUIRED_FORBID
+                .iter()
+                .map(|lint| missing_forbid(lint))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn missing_lib_root_is_a_violation() {
         assert_eq!(
             violations(&[core(Some(CLIPPY), None, vec![])], &[]),
@@ -493,6 +561,20 @@ mod tests {
             prop_assert_eq!(
                 violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]),
                 vec![missing_forbid(REQUIRED_FORBID[index])]
+            );
+        }
+
+        #[test]
+        fn nested_comment_never_supplies_forbid(depth in 1..6usize) {
+            let root = format!(
+                "{}#![forbid({})]{}",
+                "/*".repeat(depth),
+                REQUIRED_FORBID.join(", "),
+                "*/".repeat(depth)
+            );
+            prop_assert_eq!(
+                violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]),
+                REQUIRED_FORBID.iter().map(|lint| missing_forbid(lint)).collect::<Vec<_>>()
             );
         }
     }

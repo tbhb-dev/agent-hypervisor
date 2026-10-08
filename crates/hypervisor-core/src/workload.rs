@@ -178,7 +178,7 @@ pub fn adopted(recovery: Recovery, events: &[String]) -> Recovery {
 /// # Errors
 /// Unsupported controls or an ID owned by another host.
 pub fn admit_host_workload(expected_host: &str, spec: &WorkloadSpec) -> Result<(), &'static str> {
-    validate_host(spec)?;
+    validate_workload(spec)?;
     if spec.id.host != expected_host {
         return Err("foreign host ID");
     }
@@ -280,7 +280,6 @@ pub fn control_decision(
 /// # Errors
 /// An unsupported field or an invalid path or ID.
 pub fn validate_host(spec: &WorkloadSpec) -> Result<(), &'static str> {
-    spec.id.validate()?;
     if spec.runtime != Runtime::Host || spec.isolation != Isolation::None {
         return Err("host driver requires host runtime and no isolation");
     }
@@ -293,6 +292,24 @@ pub fn validate_host(spec: &WorkloadSpec) -> Result<(), &'static str> {
     {
         return Err("host driver cannot enforce network or resource limits");
     }
+    validate_common(spec)
+}
+
+/// Check a workload against the driver its runtime names.
+///
+/// # Errors
+/// A runtime without a driver here, or the driver's own refusal.
+pub fn validate_workload(spec: &WorkloadSpec) -> Result<(), &'static str> {
+    match spec.runtime {
+        Runtime::Host => validate_host(spec),
+        Runtime::Seatbelt => crate::seatbelt::validate(spec),
+        Runtime::AppleContainer => Err("no driver for the apple_container runtime"),
+    }
+}
+
+/// Checks every driver applies: a safe ID, absolute UTF-8 paths, and caller-owned environment.
+pub(crate) fn validate_common(spec: &WorkloadSpec) -> Result<(), &'static str> {
+    spec.id.validate()?;
     if !spec.workspace_dir.is_absolute() || !spec.cache_dir.is_absolute() {
         return Err("workload paths must be absolute");
     }

@@ -32,6 +32,51 @@ Test labels start with `dev.tbhb.hypervisor.test.owner-<pid>-`, which records th
 
 Three more macOS-only tests cover survival. A separate daemon process adopts a launchd shim and its session. A daemon binary swapped by rename adopts the same shim PID, whose job still names its pinned program. A shim killed with `SIGKILL` is restarted by launchd and reported as restarted with no sessions.
 
+## Run 19 Seatbelt driver
+
+Run 19 builds source lines 177 and 178 and proposal line 116 at vault commit `331d791c3704663135a8899cb44867714e9dc800`. The host shim also serves `seatbelt` workloads. `validate_workload` dispatches on the runtime and refuses `apple_container`. A seatbelt workload needs `seatbelt` isolation, no image, credential references, or resource limits, and `host` or `deny` network. `isolated` is refused ([#113](https://github.com/tbhb-dev/agent-hypervisor/issues/113)). A mount specifies one absolute path, with its source equal to its target, because Seatbelt grants access and cannot remap. `create` canonicalizes mount paths, since Seatbelt matches physical paths such as `/private/tmp`.
+
+The shim runs unsandboxed with run 17's start, stop, and adoption behavior. Each session runs as `/usr/bin/sandbox-exec -p <profile> -- <command> <args>`. `sandbox-exec` runs the command in its own process, so the PTY process group and stop behave as on the host driver. `hypervisor_core::seatbelt::profile` generates the profile text from the workload spec, the user's home, and the driver root. The profile starts from `(allow default)`, then applies these path rules in order, and the last matching rule decides:
+
+1. Deny `file-write*` everywhere.
+2. Allow writes below `/dev`, the workspace, the cache, and read-write mounts.
+3. Deny `file-read-data` below the home directory.
+4. Allow reads of the workspace, the cache, and every mount.
+5. Deny reads and writes of `.ssh`, `.gnupg`, `.aws`, `.netrc`, `.config/gh`, `.codex/auth.json`, and `Library/Keychains` under home, and of the driver root, even when a mount covers them.
+
+It also denies Unix socket connections into the driver root, so a session cannot connect to the shim control socket or other terminal sockets. It adds `(deny network*)` for `deny` network. It denies the four Keychain mach services from RFC-37 run 9, plus `lsopen` and `appleevent-send`, so a session cannot open a Keychain prompt or a GUI app. The core's `allowed` function evaluates the same rules with Seatbelt's `subpath` and last-match semantics. Property tests use it to show that any mounts leave secret paths and the driver root denied, and that writes outside the write roots are denied. The base allows reads outside home and every other mach service, which differs from RFC-37 run 9's deny-default recommendation ([#112](https://github.com/tbhb-dev/agent-hypervisor/issues/112)). Sessions can still read file metadata under home.
+
+`crates/hypervisord/tests/seatbelt_driver.rs` covers the session boundary and the lifecycle on macOS only ([#115](https://github.com/tbhb-dev/agent-hypervisor/issues/115)). A session writes in its workspace but not outside it. It cannot read the driver root or list home, and with `deny` network, `nc` to a loopback listener fails. Stop ends the sandboxed process group, and a new daemon reports the running seatbelt shim and its session as `Running`.
+
+### Harness matrix
+
+Versions: macOS 26.5.1 (25F80), Claude Code 2.1.294, Codex CLI 0.161.0. Each cell ran `/usr/bin/sandbox-exec -f <profile> -- /usr/bin/env -i PATH=<stub>:/usr/bin:/bin HOME=<cache>/home TMPDIR=<cache>/tmp CODEX_HOME=<cache>/codex TERM=xterm-256color LANG=en_US.UTF-8 <command>` with a 60-second `timeout --foreground` and stdin from `/dev/null`. `host-shim profile <metadata> <root>` printed the profile, the same text the shim passes to `-p`. The workload had read-only mounts on the two harness install directories, `~/.local/share/claude/versions/2.1.294` and `~/.codex/packages/standalone/releases/0.161.0-aarch64-apple-darwin`. Cells used `deny` network unless marked `host`. `<stub>` held `security` and `open` scripts that exit 1. `$C` and `$X` below name the two binaries. Outside paths were `/private/tmp/hv-r19-matrix/outside` for writes and `~/.cache/hv-r19-probe` for reads. No prompt, window, or refusal occurred.
+
+| Cell | Command | Result | Label |
+| --- | --- | --- | --- |
+| Claude version | `$C --version` | `2.1.294 (Claude Code)`, exit 0 | observed |
+| Codex version | `$X --version` | `codex-cli 0.161.0`, exit 0 | observed |
+| Claude help | `$C --help` | usage text, exit 0 | observed |
+| Codex help | `$X --help` | usage text, exit 0 | observed |
+| Claude write inside | `$C mcp add -s project probe -- /bin/sh -c "$MCP"` in the workspace | wrote `.mcp.json`, exit 0 | observed |
+| Claude write outside | same command with the outside directory as `cwd` | `EPERM: operation not permitted, open '.../outside/.mcp.json.tmp...'`, exit 1 | observed |
+| Claude read inside | `$C mcp list` in the workspace | read `.mcp.json` and listed `probe` as pending approval, exit 0 | observed |
+| Claude read outside | `$C --settings ~/.cache/hv-r19-probe/settings.json mcp list` | `Error processing settings: EPERM`, exit 1 | observed |
+| Codex write inside | `$X mcp add probe -- /bin/sh -c "$MCP"` | wrote `CODEX_HOME/config.toml` in the cache, exit 0 | observed |
+| Codex write outside | `env CODEX_HOME=<outside> $X mcp add probe -- /bin/cat` | `failed to persist config ... Operation not permitted`, exit 1 | observed |
+| Codex read inside | `$X mcp list` | listed `probe`, exit 0 | observed |
+| Codex read outside | `env CODEX_HOME=~/.cache/hv-r19-probe/codex $X mcp list` | `Failed to read config file ... Operation not permitted`, exit 1 | observed |
+| Claude subprocess | `$C mcp list` with a user-scope server running `$MCP` plus `/bin/ps -p $$` | the child wrote `ws/marker`. Its outside write and setuid `/bin/ps` failed with `Operation not permitted` | observed |
+| Codex subprocess | `$X exec --skip-git-repo-check 'Reply with the word ok.'`, killed after 15 seconds | the configured server wrote `ws/marker`, and its outside write failed | observed |
+| Network deny | `/usr/bin/curl -sS -m 10 https://example.com/` | `Could not resolve host`, exit 6 | observed |
+| Network host | same command, `host` profile | HTTP 200, exit 0 | observed |
+| Claude headless, deny and host | `$C -p 'Reply with the word ok.'` | `Not logged in · Please run /login`, exit 1 | observed |
+| Codex headless, deny | `$X exec --skip-git-repo-check 'Reply with the word ok.'` | `failed to lookup address information` for `wss://api.openai.com/v1/responses`, retried until timeout 124 | observed |
+| Codex headless, host | same command, `host` profile | `invalid peer certificate: UnknownIssuer`, retried until timeout 124 ([#111](https://github.com/tbhb-dev/agent-hypervisor/issues/111)) | observed; Keychain service cause is inference |
+| Authenticated headless prompt | none | blocked because Claude Code keeps its credential in the Keychain, which the profile denies. The profile also denies `~/.codex/auth.json`, and the workload spec has no way to pass a credential ([#110](https://github.com/tbhb-dev/agent-hypervisor/issues/110)) | untested |
+
+`$MCP` is `echo spawned > <ws>/marker; echo escaped > <outside>/marker; exec /bin/cat`. Both harnesses also ran `mcp list` without `TMPDIR` and exited 0. Codex printed `could not create PATH aliases: Operation not permitted` when `CODEX_HOME` was not writable. Interactive sessions, tool commands, and the harnesses' own sandboxes, which cannot nest, remain untested ([#114](https://github.com/tbhb-dev/agent-hypervisor/issues/114)). A descendant that calls `setsid()` can keep running after stop ([#47](https://github.com/tbhb-dev/agent-hypervisor/issues/47)).
+
 ## Source and merged-code differences
 
 The source is `tbhb-dev/agent-orchestration-poc.internal` commit `27a69f821634b71243ac76e837ca322f34ef68cb`, `wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/source.md`, lines 29 to 34, 95 to 120, 157 to 173, and 343. The run table in the proposal at that commit assigns launchd registration to run 18. Run 18 reads source line 172 and proposal line 115 at commit `817c486df13414cd4b223f3aaa49251b1abd0837`, under operator decision ADR-221.
@@ -41,7 +86,7 @@ The source is `tbhb-dev/agent-orchestration-poc.internal` commit `27a69f821634b7
 | A launchd-managed host shim keeps running after daemon restart. | Run 17 detached the shim. Run 18 registers it with launchd through `open_launchd` on macOS, and Linux keeps the detached shim ([#86](https://github.com/tbhb-dev/agent-hypervisor/issues/86)). |
 | Sessions survive daemon restarts and upgrades. | Daemon restarts and daemon binary upgrades keep sessions. A shim crash or a shim binary upgrade ends them ([#93](https://github.com/tbhb-dev/agent-hypervisor/issues/93)). |
 | One session library serves host and guest, with the host actor in the daemon in the merged runs 9 to 16. | The merged `hypervisor-session` actor is reused without a new holder. Run 17 moves its instantiation to the per-workload shim. A guest agent remains for later runs. |
-| Each driver hosts sessions behind one contract. | Core values define three runtimes. Run 17 builds the unsandboxed host shell. It refuses controls it cannot enforce. |
+| Each driver hosts sessions behind one contract. | Core values define three runtimes. Run 17 builds the unsandboxed host shell, and run 19 runs seatbelt sessions in the same shim under a generated profile. Each refuses controls it cannot enforce. |
 | A proxy provides local channels and control. | The merged run 16 terminal socket binds directly to a `SessionHandle`. The shim hosts that socket and keeps it open after daemon exit. Proxy routing is tracked in [#74](https://github.com/tbhb-dev/agent-hypervisor/issues/74), and client authorization is tracked in [#76](https://github.com/tbhb-dev/agent-hypervisor/issues/76). |
 | A server suite applies to any driver, with state events. | The merged conformance suite applies to the Unix PTY actor. Run 17 adds host lifecycle and recovery tests. Cross-driver coverage is tracked in [#84](https://github.com/tbhb-dev/agent-hypervisor/issues/84). Shim `events` reports creation only ([#83](https://github.com/tbhb-dev/agent-hypervisor/issues/83)). Actor state events remain on the session channel without a durable workload event log ([#87](https://github.com/tbhb-dev/agent-hypervisor/issues/87)). |
 | Stable workload and session IDs are globally unique. | The core checks safe host and local components, and the host shim refuses a duplicate live session. Global host-name allocation is tracked in [#82](https://github.com/tbhb-dev/agent-hypervisor/issues/82). |

@@ -16,6 +16,7 @@ pub mod emulator;
 pub mod grid_channel;
 pub mod launchd;
 pub mod screen;
+pub mod seatbelt;
 pub mod session;
 pub mod state;
 pub mod terminal_transport;

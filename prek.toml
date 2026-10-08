@@ -6,7 +6,7 @@
 # that gates the commit. `prek install` writes both shims (see default_install_hook_types).
 
 default_install_hook_types = ["pre-commit", "commit-msg"]
-exclude = '^(\.worktrees/|target/|crates/hypervisor-ghostty/tests/fixtures/recordings/)'
+exclude = '^(\.worktrees/|target/|tests/fixtures/corpus/recordings/)'
 
 [[repos]]
 repo = "builtin"

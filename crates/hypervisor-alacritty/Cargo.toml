@@ -1,20 +1,16 @@
 [package]
-name = "hypervisor-ghostty"
+name = "hypervisor-alacritty"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "The hypervisor's terminal emulator on ghostty-vt"
+description = "The hypervisor's fallback terminal emulator on alacritty_terminal"
 repository.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-ghostty-vt-sys.workspace = true
+alacritty_terminal.workspace = true
 hypervisor-core.workspace = true
-
-[dev-dependencies]
-hypervisor-alacritty.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true

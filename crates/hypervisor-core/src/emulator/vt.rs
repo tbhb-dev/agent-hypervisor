@@ -1,4 +1,4 @@
-//! Serialize a grid and its modes to VT bytes that redraw it on a fresh terminal.
+//! Serialize a grid and its modes to VT bytes that redraw it on a terminal.
 //!
 //! This replaces ghostty-vt's VT formatter for viewers. The formatter fills a gap between two
 //! text runs with spaces under the earlier run's SGR, which restyled 189 cells on spike 2's
@@ -7,7 +7,7 @@
 //!
 //! The output assumes a terminal of the grid's size. It redraws only the active screen: entering
 //! the alternate screen leaves the viewer's primary screen blank. Scroll regions, tab stops,
-//! charsets, hyperlinks, titles, the palette, and kitty keyboard flags are not carried, nor is
+//! charsets, hyperlinks, titles, and the palette are not carried, nor is
 //! a pending wrap at the cursor.
 
 use std::fmt::Write as _;
@@ -15,30 +15,37 @@ use std::fmt::Write as _;
 use super::{Attrs, Cell, CellWidth, Color, Cursor, Grid, Modes, MouseFormat, MouseTracking};
 use super::{Screen, Underline};
 
-/// VT bytes that redraw `grid` and restore `modes` on a fresh terminal of the same size.
+/// VT bytes that redraw `grid` and restore `modes` on a terminal of the same size.
 ///
-/// The bytes enter the alternate screen when it is active, soft-reset the terminal (DECSTR),
+/// The bytes select the active screen, soft-reset the terminal (DECSTR),
 /// clear it, draw each row from its first column to its last non-blank cell, restore the input
 /// modes, and place the cursor. They never set synchronized output (mode 2026), which would hold
 /// the viewer's rendering.
 #[must_use]
 pub fn serialize(grid: &Grid, modes: &Modes) -> Vec<u8> {
     let mut out = String::new();
-    if modes.screen == Screen::Alternate {
-        out.push_str("\x1b[?1049h");
-    }
+    out.push_str("\x1b[?2026l");
+    out.push_str(if modes.screen == Screen::Alternate {
+        "\x1b[?1049h"
+    } else {
+        "\x1b[?1049l"
+    });
     out.push_str("\x1b[!p\x1b[?7h");
-    if modes.grapheme_clustering {
-        out.push_str("\x1b[?2027h");
-    }
+    out.push_str(if modes.grapheme_clustering {
+        "\x1b[?2027h"
+    } else {
+        "\x1b[?2027l"
+    });
     out.push_str("\x1b[0m\x1b[H\x1b[2J");
     draw_rows(&mut out, grid);
     out.push_str("\x1b[0m");
     restore_modes(&mut out, modes);
     cup(&mut out, grid.cursor());
-    if !modes.cursor_visible {
-        out.push_str("\x1b[?25l");
-    }
+    out.push_str(if modes.cursor_visible {
+        "\x1b[?25h"
+    } else {
+        "\x1b[?25l"
+    });
     out.into_bytes()
 }
 
@@ -150,14 +157,21 @@ fn cup(out: &mut String, at: Cursor) {
 }
 
 fn restore_modes(out: &mut String, modes: &Modes) {
-    let set = |out: &mut String, on: bool, seq: &str| {
-        if on {
-            out.push_str(seq);
-        }
-    };
-    set(out, modes.application_cursor_keys, "\x1b[?1h");
-    set(out, modes.application_keypad, "\x1b=");
-    set(out, !modes.wraparound, "\x1b[?7l");
+    out.push_str(if modes.application_cursor_keys {
+        "\x1b[?1h"
+    } else {
+        "\x1b[?1l"
+    });
+    out.push_str(if modes.application_keypad {
+        "\x1b="
+    } else {
+        "\x1b>"
+    });
+    out.push_str(if modes.wraparound {
+        "\x1b[?7h"
+    } else {
+        "\x1b[?7l"
+    });
     // Terminals disagree on mode 1007's default (ghostty sets it, xterm resets it), so it is
     // always written out.
     out.push_str(if modes.alternate_scroll {
@@ -165,8 +179,17 @@ fn restore_modes(out: &mut String, modes: &Modes) {
     } else {
         "\x1b[?1007l"
     });
-    set(out, modes.focus_events, "\x1b[?1004h");
-    set(out, modes.bracketed_paste, "\x1b[?2004h");
+    out.push_str(if modes.focus_events {
+        "\x1b[?1004h"
+    } else {
+        "\x1b[?1004l"
+    });
+    out.push_str(if modes.bracketed_paste {
+        "\x1b[?2004h"
+    } else {
+        "\x1b[?2004l"
+    });
+    out.push_str("\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l");
     let tracking = match modes.mouse_tracking {
         MouseTracking::Off => "",
         MouseTracking::X10 => "\x1b[?9h",
@@ -175,6 +198,7 @@ fn restore_modes(out: &mut String, modes: &Modes) {
         MouseTracking::Any => "\x1b[?1003h",
     };
     out.push_str(tracking);
+    out.push_str("\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l");
     let format = match modes.mouse_format {
         MouseFormat::X10 => "",
         MouseFormat::Utf8 => "\x1b[?1005h",
@@ -183,6 +207,7 @@ fn restore_modes(out: &mut String, modes: &Modes) {
         MouseFormat::SgrPixels => "\x1b[?1016h",
     };
     out.push_str(format);
+    let _ = write!(out, "\x1b[>{}u", modes.kitty_keyboard_flags);
 }
 
 #[cfg(test)]
@@ -194,7 +219,7 @@ mod tests {
     };
     use proptest::prelude::*;
 
-    const PREAMBLE: &str = "\x1b[!p\x1b[?7h\x1b[0m\x1b[H\x1b[2J";
+    const PREAMBLE: &str = "\x1b[?2026l\x1b[?1049l\x1b[!p\x1b[?7h\x1b[?2027l\x1b[0m\x1b[H\x1b[2J";
 
     fn text(s: &str) -> Cell {
         Cell {
@@ -215,7 +240,8 @@ mod tests {
     fn blank_grid_is_preamble_reset_and_cursor() {
         let g = Grid::blank(Size::new(3, 2).unwrap());
         let out = as_text(&serialize(&g, &Modes::default()));
-        assert_eq!(out, format!("{PREAMBLE}\x1b[0m\x1b[?1007l\x1b[1;1H"));
+        assert!(out.starts_with(PREAMBLE), "{out:?}");
+        assert!(out.ends_with("\x1b[1;1H\x1b[?25h"), "{out:?}");
     }
 
     #[test]
@@ -235,10 +261,11 @@ mod tests {
         ];
         let g = grid(6, 1, cells, Cursor { row: 0, col: 4 });
         let out = as_text(&serialize(&g, &Modes::default()));
-        assert_eq!(
-            out,
-            format!("{PREAMBLE}\x1b[1;1Ha \x1b[0;1;38;5;1mbb\x1b[0m\x1b[?1007l\x1b[1;5H")
+        assert!(
+            out.starts_with(&format!("{PREAMBLE}\x1b[1;1Ha \x1b[0;1;38;5;1mbb")),
+            "{out:?}"
         );
+        assert!(out.ends_with("\x1b[1;5H\x1b[?25h"), "{out:?}");
     }
 
     #[test]
@@ -306,14 +333,17 @@ mod tests {
         };
         let g = Grid::blank(Size::new(2, 2).unwrap());
         let out = as_text(&serialize(&g, &modes));
-        assert!(out.starts_with("\x1b[?1049h\x1b[!p"), "{out:?}");
+        assert!(out.starts_with("\x1b[?2026l\x1b[?1049h\x1b[!p"), "{out:?}");
         assert!(
-            out.ends_with(
-                "\x1b[0m\x1b[?1h\x1b[?1007l\x1b[?1004h\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[1;1H\x1b[?25l"
-            ),
+            out.contains("\x1b[?1h")
+                && out.contains("\x1b[?1004h")
+                && out.contains("\x1b[?2004h")
+                && out.contains("\x1b[?1003h")
+                && out.contains("\x1b[?1006h")
+                && out.ends_with("\x1b[1;1H\x1b[?25l"),
             "{out:?}"
         );
-        assert!(!out.contains("2026"));
+        assert!(!out.contains("\x1b[?2026h"));
     }
 
     #[test]
@@ -350,7 +380,7 @@ mod tests {
             let g = grid(cols, rows, cells, Cursor::default());
             let modes = Modes { synchronized_output: sync, ..Modes::default() };
             let out = as_text(&serialize(&g, &modes));
-            prop_assert!(!out.contains("2026"));
+            prop_assert!(!out.contains("\x1b[?2026h"));
             let mut rest = out.as_str();
             for line in lines.iter().filter(|l| !l.is_empty()) {
                 let at = rest.find(line.as_str());

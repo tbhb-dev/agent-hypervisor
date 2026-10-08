@@ -9,6 +9,8 @@
     clippy::disallowed_macros
 )]
 
+pub mod emulator;
+
 /// Formats the line a binary prints to report its name and version.
 #[must_use]
 pub fn version_line(name: &str, version: &str) -> String {

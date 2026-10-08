@@ -17,6 +17,8 @@ hypervisor-alacritty = { path = "crates/hypervisor-alacritty" }
 hypervisor-core = { path = "crates/hypervisor-core" }
 hypervisor-ghostty = { path = "crates/hypervisor-ghostty" }
 hypervisor-pty = { path = "crates/hypervisor-pty" }
+hypervisor-session = { path = "crates/hypervisor-session" }
+libc = "0.2.190"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 rustix = {
   version = "1.1.5",

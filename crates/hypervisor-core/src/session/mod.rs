@@ -12,10 +12,12 @@
 mod ring;
 mod size;
 mod spec;
+mod viewer;
 
 pub use ring::{OutputRing, RingRead};
 pub use size::{Settled, SizeState};
 pub use spec::{SessionKind, SpawnError, SpawnSpec};
+pub use viewer::{Refusal, ViewerId, ViewerMode, ViewerRead, ViewerRegistry, Writer};
 
 use std::num::NonZeroUsize;
 use std::time::Duration;

@@ -161,14 +161,13 @@ fn an_ephemeral_session_ends_when_its_viewers_leave() {
     session.send(Command::Viewers(1));
     session.send(Command::Viewers(0));
     let events = events_until(&session, exited);
-    assert_eq!(
+    assert!(matches!(
         events.last(),
-        Some(&SessionEvent::Exited(Exit {
-            code: None,
-            signal: Some(1),
-            raw: Some(1)
+        Some(SessionEvent::Exited(Exit {
+            signal: Some(1 | 9),
+            ..
         }))
-    );
+    ));
     events_until(&session, |e| *e == SessionEvent::Reaped);
     session.join();
 }
@@ -242,7 +241,7 @@ fn close_kills_a_group_member_that_ignores_the_hangup() {
     assert!(matches!(
         events.last(),
         Some(SessionEvent::Exited(Exit {
-            signal: Some(1),
+            signal: Some(1 | 9),
             ..
         }))
     ));

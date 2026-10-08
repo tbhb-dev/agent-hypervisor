@@ -15,6 +15,7 @@ use hypervisor_core::emulator::{
     CellDiff, CellWidth, Emulator, Modes, MouseFormat, MouseTracking, Screen, Size, diff,
 };
 use hypervisor_ghostty::GhosttyEmulator;
+use sha2::{Digest, Sha256};
 
 fn ghostty(f: &Fixture) -> (GhosttyEmulator, Vec<u8>) {
     let mut emu = GhosttyEmulator::new(f.size).expect("terminal");
@@ -63,6 +64,18 @@ fn restorable(m: Modes) -> Modes {
         synchronized_output: false,
         kitty_keyboard_flags: 0,
         ..m
+    }
+}
+
+#[test]
+fn recording_hashes_match_the_metadata() {
+    for f in fixtures() {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&f.bytes)),
+            f.sha256,
+            "{}: SHA-256",
+            f.name
+        );
     }
 }
 
@@ -185,13 +198,28 @@ fn ghostty_serialized_screen_redraws_in_alacritty() {
 #[test]
 fn binary_snapshot_restores_grid_and_modes() {
     for f in fixtures() {
-        let (emu, _) = ghostty(&f);
+        let (mut emu, _) = ghostty(&f);
         let snapshot = emu.snapshot().expect("snapshot");
-        let restored = GhosttyEmulator::restore(&snapshot).expect("restore");
+        let mut restored = GhosttyEmulator::restore(&snapshot).expect("restore");
         let d = diff(&emu.grid(), &restored.grid());
         assert!(d.is_empty(), "{}\n{}", f.name, describe(&d));
         assert_eq!(emu.grid().cursor(), restored.grid().cursor(), "{}", f.name);
         assert_eq!(emu.modes(), restored.modes(), "{}: modes", f.name);
+        for query in [&b"\x1b[c"[..], b"\x1b[6n", b"\x1b[?2026$p", b"\x1b[?u"] {
+            let reply = restored.feed(query);
+            assert_eq!(
+                reply,
+                emu.feed(query),
+                "{}: restored reply to {query:?}",
+                f.name
+            );
+            if query == b"\x1b[c" {
+                assert_eq!(reply, b"\x1b[?62;22c", "{}: restored DA1", f.name);
+            }
+            if query == b"\x1b[?u" {
+                assert!(reply.is_empty(), "{}: restored kitty query", f.name);
+            }
+        }
     }
 }
 

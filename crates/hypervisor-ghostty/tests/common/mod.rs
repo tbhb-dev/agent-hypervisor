@@ -9,6 +9,7 @@ use serde_json::Value;
 pub struct Fixture {
     pub name: String,
     pub bytes: Vec<u8>,
+    pub sha256: String,
     pub size: Size,
     pub cursor: Cursor,
     pub text: Vec<String>,
@@ -62,6 +63,7 @@ pub fn fixture(name: &str) -> Fixture {
             other => panic!("{name}: screen {other:?}"),
         },
         alacritty_grid_diffs: usize::try_from(num("alacritty_grid_diffs")).expect("count"),
+        sha256: expected["sha256"].as_str().expect("sha256").to_owned(),
         bytes,
     }
 }

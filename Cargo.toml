@@ -18,6 +18,7 @@ hypervisor-core = { path = "crates/hypervisor-core" }
 hypervisor-ghostty = { path = "crates/hypervisor-ghostty" }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 serde_json = "1.0.151"
+sha2 = "0.10.9"
 xtask-core = { path = "crates/xtask-core" }
 
 [workspace.lints.clippy]

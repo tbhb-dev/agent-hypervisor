@@ -21,6 +21,7 @@ use hypervisor_core::session::{
     Effect, Exit, Holder, HolderConfig, Input, Phase, Refusal, RingRead, SessionEvent, SpawnSpec,
     ViewerId, ViewerMode, ViewerRead, Writer,
 };
+use hypervisor_core::state::{Harness, HookKind, HookReport};
 use hypervisor_pty::{Pty, PtyError, Spawn, Wait};
 use std::num::NonZeroUsize;
 
@@ -31,6 +32,12 @@ const BATCH: usize = 64;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Command {
+    /// A normalized event from this session's hook listener.
+    Hook {
+        harness: Harness,
+        kind: HookKind,
+        seq: u64,
+    },
     /// Attach a viewer without taking the lock.
     Attach(
         ViewerId,
@@ -388,6 +395,12 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
             Msg::OutputClosed => Input::OutputClosed,
             Msg::Exited(exit) => Input::ChildExited(exit),
             Msg::Command(command) => match command {
+                Command::Hook { harness, kind, seq } => Input::Hook(HookReport {
+                    harness,
+                    kind,
+                    seq,
+                    at: self.now(),
+                }),
                 Command::Attach(id, mode, size, budget, reply) => {
                     let result = self.step(Input::Attach {
                         viewer: id,

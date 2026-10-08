@@ -12,6 +12,7 @@
 pub mod attenuation;
 pub mod emulator;
 pub mod session;
+pub mod state;
 
 /// Formats the line a binary prints to report its name and version.
 #[must_use]

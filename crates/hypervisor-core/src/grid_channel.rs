@@ -174,10 +174,17 @@ impl GridEncoder {
         })
     }
 
-    #[must_use]
-    pub fn due(&self, now: Duration) -> bool {
-        self.sent_at
-            .is_none_or(|at| now.saturating_sub(at) >= self.min_interval)
+    /// Whether another frame may be emitted at `now`.
+    ///
+    /// # Errors
+    /// Returns `InvalidValue` when time moves backwards.
+    pub fn due(&self, now: Duration) -> Result<bool, FrameError> {
+        if self.sent_at.is_some_and(|at| now < at) {
+            return Err(FrameError::InvalidValue);
+        }
+        Ok(self
+            .sent_at
+            .is_none_or(|at| now.saturating_sub(at) >= self.min_interval))
     }
 
     /// Build the next full or row-diff frame; unchanged and throttled states emit nothing.
@@ -192,10 +199,7 @@ impl GridEncoder {
         output_sequence: u64,
         force_full: bool,
     ) -> Result<Option<GridFrame>, FrameError> {
-        if self.sent_at.is_some_and(|at| now < at) {
-            return Err(FrameError::InvalidValue);
-        }
-        if !self.due(now) {
+        if !self.due(now)? {
             return Ok(None);
         }
         let full = force_full
@@ -406,7 +410,7 @@ mod tests {
         let at = Duration::from_secs(1);
         let first = screen(&["a"], Cursor::default());
         encoder.poll(at, first, Modes::default(), 0, false).unwrap();
-        assert!(!encoder.due(at + Duration::from_millis(499)));
+        assert_eq!(encoder.due(at + Duration::from_millis(499)), Ok(false));
         assert_eq!(
             encoder
                 .poll(

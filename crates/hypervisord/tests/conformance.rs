@@ -9,8 +9,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hypervisor_core::channel::{
-    Capabilities, Control, ControlResult, Encoding, Event, Frame, Mode, OpenRefusal, OpenRequest,
-    OpenTarget, WireSignal, WireSize,
+    Capabilities, Control, ControlResult, Encoding, Event, Frame, FrameError, Mode, OpenRefusal,
+    OpenRequest, OpenTarget, WireSignal, WireSize,
 };
 use hypervisor_core::emulator::{Cursor, Modes, Size};
 use hypervisor_core::grid_channel::GridFrame;
@@ -348,6 +348,12 @@ fn terminal_grid_full_diff_cap_and_resync() {
         assert!(
             matches!(channel.poll_grid(Duration::from_millis(500)).unwrap(),
             Some(Frame::Grid(GridFrame::Diff { frame: 2, base_frame: 1, rows, .. })) if !rows.is_empty())
+        );
+        assert_eq!(
+            channel.poll_grid(Duration::ZERO),
+            Err(hypervisor_session::channel::ChannelError::Grid(
+                FrameError::InvalidValue
+            ))
         );
         assert_eq!(channel.poll_grid(Duration::from_millis(999)), Ok(None));
         channel.receive(Frame::Input(b"two\n".to_vec())).unwrap();

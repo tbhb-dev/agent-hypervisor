@@ -70,7 +70,7 @@ Cells map one to one. Named colors 0 to 15 become palette indexes, and `NamedCol
 | `Modes::grapheme_clustering` | Tracked, but alacritty sizes each codepoint alone, so mode 2027 doesn't change any width |
 | DECRQM for 1016 and 2027 | Answered as not recognized (`0`), where ghostty-vt answers reset (`2`) |
 
-The golden tests clear exactly these fields from ghostty-vt's side before comparing.
+The golden tests normalize these on ghostty-vt's side before comparing.
 
 ## Golden tests
 

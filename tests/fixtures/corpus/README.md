@@ -42,6 +42,6 @@ Run 8 recorded three shell sessions with run 3's `capture.py` (`r3-harness-captu
 
 ## Size and content
 
-The largest recording is 25,133 bytes, and the 20 recordings total 264,785 bytes. The harness sessions used fake API keys and disposable homes, and runs 3, 5, and 7 didn't find a user name, home path, or secret in them. Run 8 searched every recording for the operator's user name, home path, host name, email, and account names without a match, so it didn't redact anything. `gitleaks detect --no-git` 8.30.1 reported 0 leaks. The recordings still contain disposable paths under `/private/tmp/rfc36-capture-*`, random Claude Code session IDs, and the build's crate versions and timings.
+The largest recording is 25,133 bytes, and the 20 recordings total 263,921 bytes. The harness sessions used fake API keys and disposable homes, and runs 3, 5, and 7 didn't find a user name, home path, or secret in them. Run 8 searched every recording for the operator's user name, home path, host name, email, and account names without a match, so it didn't redact anything. `gitleaks detect --no-git` 8.30.1 reported 0 leaks. The recordings still contain disposable paths under `/private/tmp/rfc36-capture-*`, random Claude Code session IDs, and the build's crate versions and timings.
 
 The recordings are marked `binary` in `.gitattributes`, and `prek.toml` excludes them from the whitespace hooks, so no tool rewrites their bytes.

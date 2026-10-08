@@ -33,12 +33,12 @@ Persistent sessions don't end when viewers leave. In an ephemeral session, the h
 | --- | --- | --- |
 | `Starting` | the holder is created | the PTY and child are spawned |
 | `Running` | the spawn succeeded | the child has exited and its output has closed, or the exit drain passed |
-| `Exited { exit, reap_at }` | the child exited | `reap_at`, the exit time plus `retain_exited` |
+| `Exited { exit, reap_at }` | the child exited and its output closed, or the exit drain passed first | `reap_at`, which is `retain_exited` after entering `Exited` |
 | `Reaped` | the retention passed | never; the emulator and PTY are dropped |
 
 `Exit` keeps the exit code, the number of a killing signal, and the raw wait status. The holder waits up to `exit_drain` (100 ms) after the child exits for the PTY's output to close. The final screen then holds the child's last bytes. The actor answers snapshot requests through `Exited` and answers `None` once `Reaped`.
 
-Closing is a hangup to the leader's process group, then a kill of the group after `kill_grace` (2 s). Both are deadlines in the holder, and no backend call blocks for a grace. The group kill is also delivered to background jobs that hold the terminal open after the leader exits.
+Closing is a hangup to the leader's process group, then a kill of the group after `kill_grace` (2 s). Both are deadlines in the holder, and no backend call blocks for a grace. A close's kill deadline is kept after the leader's exit and after the end of output. On macOS the kernel revokes the terminal when the session leader exits, and the master then reads its end even though a group member that ignored the hangup is still running (observed with `trap '' HUP` in the actor test). Closed output is not evidence of an empty group. The kill deadline sends `SIGKILL` to that member (verified by a core test and by the actor test). A reap kills the group first when the output is open or a close's kill is pending, which covers a `retain_exited` shorter than `kill_grace`. On Linux the output doesn't close while a member has the slave open, and that kill lets the actor's reader thread read the end and exit. A process that left the group with `setsid` and still has the slave open is not reached, and its reader thread and the master leak (untested).
 
 Every timeout is a monotonic `Duration` that the actor reads with `Instant` and passes in. Wall time never enters: a resumed guest's clock stepped back by 35.3 s ([RFC-38 run 10, line 16](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/485c37e54cd69d186a4b5eb0909f5bdee822fe1b/wiki/proposals/2026-10-07T2052Z-RFC-38-command-and-control-spikes/findings/r10-pause-and-clocks.md#L16)). The defaults for retention, drain, and kill grace (60 s, 100 ms, and 2 s) are placeholders until Phase 4 sets the resume window.
 
@@ -78,7 +78,9 @@ The emulator runs in the daemon's process. A ghostty-vt crash takes every sessio
 | `backend_queries` | none | DA1, and CPR after a resize |
 | `resize_repaints` | false | true, conhost repaints its buffer |
 
-The tests run on macOS locally and on Linux in CI.
+On Linux `openpt` sets `O_CLOEXEC` atomically. macOS `posix_openpt` has no such flag. There the backend sets `FD_CLOEXEC` right after it and serializes its own spawns with a process-wide lock. A fork from code outside the backend can still inherit the master in that window.
+
+The tests run on macOS locally and on Linux in CI. A panic on the actor thread, such as the `unreachable!` for an effect it doesn't know, ends the session with no event: subscribers see only the event channel disconnect, and run 12's logs should record it.
 
 ### Run 9 evidence
 

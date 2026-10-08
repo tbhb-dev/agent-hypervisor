@@ -210,3 +210,50 @@ fn repeated_resizes_on_the_alternate_screen_do_not_crash() {
     }
     assert!(session.snapshot().is_some());
 }
+
+fn alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// A group member that ignores the hangup still holds the terminal after the leader exits.
+#[test]
+fn close_kills_a_group_member_that_ignores_the_hangup() {
+    let mut config = persistent();
+    config.kill_grace = Duration::from_millis(300);
+    config.retain_exited = Duration::from_millis(1000);
+    let session = start(
+        r#"(trap '' HUP; exec sleep 30) & echo "pid=$!"; wait"#,
+        config,
+    );
+    let text = wait_for_output(&session, "\r\n");
+    let pid = text
+        .split("pid=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the child printed its background PID")
+        .to_owned();
+    assert!(alive(&pid));
+    session.send(Command::Close);
+    let events = events_until(&session, exited);
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::Exited(Exit {
+            signal: Some(1),
+            ..
+        }))
+    ));
+    let start = Instant::now();
+    while alive(&pid) {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{pid} outlived the kill grace"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    events_until(&session, |e| *e == SessionEvent::Reaped);
+    session.join();
+}

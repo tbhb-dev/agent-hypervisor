@@ -331,13 +331,15 @@ fn an_ephemeral_session_ends_when_its_viewers_leave() {
         .unwrap();
     session.detach(VIEWER).unwrap();
     let events = events_until(&session, exited);
-    assert!(matches!(
+    // #31 tracks the environment-dependent hangup signal failure; keep this assertion strict.
+    assert_eq!(
         events.last(),
-        Some(SessionEvent::Exited(Exit {
-            signal: Some(1 | 9),
-            ..
+        Some(&SessionEvent::Exited(Exit {
+            code: None,
+            signal: Some(1),
+            raw: Some(1)
         }))
-    ));
+    );
     events_until(&session, |e| *e == SessionEvent::Reaped);
     session.join();
 }
@@ -409,10 +411,11 @@ fn close_kills_a_group_member_that_ignores_the_hangup() {
     assert!(alive(&pid));
     session.send(Command::Close);
     let events = events_until(&session, exited);
+    // #31 tracks the environment-dependent hangup signal failure; keep this assertion strict.
     assert!(matches!(
         events.last(),
         Some(SessionEvent::Exited(Exit {
-            signal: Some(1 | 9),
+            signal: Some(1),
             ..
         }))
     ));

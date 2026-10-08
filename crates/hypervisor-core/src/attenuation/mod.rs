@@ -4,10 +4,12 @@
 //! is [`intersect`] of its parent's row and the grant it asked for, so it is never wider than the
 //! parent on any axis: isolation, egress, credentials, and mounts. [`within`] is the containment
 //! test for one request against one grant, and it fails closed. [`check`] runs it over a row and
-//! every ancestor row (chain mode), so a row stored without intersection cannot widen anything.
+//! every ancestor row (chain mode), so a row stored without intersection cannot widen any request
+//! that goes through it. [`broker_grants`] goes through it too.
 //!
 //! Credentials appear only as broker references. No type here has a field for a secret value; a
-//! child receives a [`BrokerGrant`] naming its own identity and a reference its parent holds.
+//! child receives a [`BrokerGrant`] naming its own identity and a reference that its row and every
+//! ancestor row allow.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -514,19 +516,6 @@ pub struct BrokerGrant {
     pub reference: CredentialRef,
 }
 
-/// The broker policy grants for a workload's row, each scoped to that workload's identity.
-#[must_use]
-pub fn broker_grants(holder: &SpiffeId, grant: &Grant) -> Vec<BrokerGrant> {
-    grant
-        .credentials
-        .iter()
-        .map(|reference| BrokerGrant {
-            holder: holder.clone(),
-            reference: reference.clone(),
-        })
-        .collect()
-}
-
 /// A row in `agentd`'s grant table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
@@ -600,8 +589,9 @@ pub fn check(table: &GrantTable, peer: &SpiffeId, request: &Request) -> Verdict 
     }
 }
 
-/// Snapshot mode: only `peer`'s own row is checked. It trusts that the row was intersected at
-/// spawn; use [`check`] unless a cross-host row has no reachable ancestors.
+/// Snapshot mode: only `peer`'s own row is checked. Snapshot mode is weaker. It does not catch a
+/// row stored without intersection, and it neither narrows nor revokes a live child when an
+/// ancestor changes. Use it only for a pushed cross-host row whose ancestors cannot be reached.
 #[must_use]
 pub fn check_snapshot(table: &GrantTable, peer: &SpiffeId, request: &Request) -> Verdict {
     match table.get(peer).map(|row| within(&row.grant, request)) {
@@ -619,5 +609,25 @@ pub fn check_snapshot(table: &GrantTable, peer: &SpiffeId, request: &Request) ->
 
 #[cfg(test)]
 mod table_tests;
+/// The broker policy grants for `holder`: each reference in its row that [`check`] allows, so a
+/// row stored without intersection gets no grant its ancestors deny. Each grant is scoped to
+/// `holder`'s identity. `None` when the table has no row for `holder`.
+#[must_use]
+pub fn broker_grants(table: &GrantTable, holder: &SpiffeId) -> Option<Vec<BrokerGrant>> {
+    let row = table.get(holder)?;
+    let allowed = |reference: &&CredentialRef| {
+        let request = Request::Credential {
+            reference: (*reference).clone(),
+        };
+        check(table, holder, &request) == Verdict::Allow
+    };
+    let grants = row.grant.credentials.iter().filter(allowed);
+    let grants = grants.map(|reference| BrokerGrant {
+        holder: holder.clone(),
+        reference: reference.clone(),
+    });
+    Some(grants.collect())
+}
+
 #[cfg(test)]
 mod tests;

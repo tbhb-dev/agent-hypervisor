@@ -5,8 +5,8 @@ use super::tests::{
     CHILD_ID, PARENT_ID, case, cases, child, cred, grant, id, parent, request, use_cred, widen,
 };
 use super::{
-    Denial, Grant, GrantTable, Isolation, Request, Row, SpiffeId, Verdict, check, check_snapshot,
-    spawn_row, within,
+    BrokerGrant, Denial, Grant, GrantTable, Isolation, Request, Row, SpiffeId, Verdict,
+    broker_grants, check, check_snapshot, spawn_row, within,
 };
 use proptest::prelude::*;
 
@@ -179,6 +179,39 @@ fn a_stored_credential_outside_the_parent_fails_in_chain_mode() {
     );
 }
 
+#[test]
+fn broker_grants_are_scoped_to_the_child_identity() {
+    let grants = broker_grants(&table(), &id(CHILD_ID));
+    let want = BrokerGrant {
+        holder: id(CHILD_ID),
+        reference: cred("broker:github/tbhb-dev/contents-write"),
+    };
+    assert_eq!(grants, Some(vec![want]));
+}
+
+#[test]
+fn a_rogue_row_gets_no_broker_grant_its_parent_denies() {
+    let (t, rogue) = rogue_table();
+    // The rogue row lists broker:aws/admin; the parent does not, so chain mode drops it.
+    assert!(
+        t[&rogue]
+            .grant
+            .credentials
+            .contains(&cred("broker:aws/admin"))
+    );
+    let want = BrokerGrant {
+        holder: rogue.clone(),
+        reference: cred("broker:github/tbhb-dev/contents-write"),
+    };
+    assert_eq!(broker_grants(&t, &rogue), Some(vec![want]));
+}
+
+#[test]
+fn an_unknown_holder_gets_no_broker_grants() {
+    let stranger = id("spiffe://air.local/workspace/ws-0000/session/s1");
+    assert_eq!(broker_grants(&table(), &stranger), None);
+}
+
 /// A chain of rows, root first, with grants that were never intersected.
 fn chain(grants: &[Grant]) -> (GrantTable, Vec<SpiffeId>) {
     let ids: Vec<SpiffeId> = (0..grants.len())
@@ -198,6 +231,33 @@ fn chain(grants: &[Grant]) -> (GrantTable, Vec<SpiffeId>) {
     (table, ids)
 }
 
+/// A chain built by real spawns from random requests, with one row then overwritten by an
+/// arbitrary grant, the shape of the `agentd` bug chain mode exists to catch.
+fn spawned_chain_with_a_rogue_row(
+    root: &Grant,
+    requests: &[Grant],
+    rogue_at: usize,
+    rogue: &Grant,
+) -> (GrantTable, Vec<SpiffeId>) {
+    let mut ids = vec![id("spiffe://t/w0")];
+    let mut table = GrantTable::new();
+    let root_row = Row {
+        parent: None,
+        grant: root.clone(),
+    };
+    table.insert(ids[0].clone(), root_row);
+    for (i, requested) in requests.iter().enumerate() {
+        let parent = ids[i].clone();
+        let (row, _) = spawn_row(&table, &parent, requested).expect("parent row");
+        let child = id(&format!("spiffe://t/w{}", i + 1));
+        table.insert(child.clone(), row);
+        ids.push(child);
+    }
+    let k = &ids[rogue_at % ids.len()];
+    table.get_mut(k).expect("row").grant = rogue.clone();
+    (table, ids)
+}
+
 proptest! {
     #[test]
     fn chain_mode_never_allows_what_any_ancestor_denies(
@@ -207,5 +267,35 @@ proptest! {
         let leaf = ids.last().expect("non-empty chain");
         let all = grants.iter().all(|g| within(g, &req).is_allow());
         prop_assert_eq!(check(&table, leaf, &req) == Verdict::Allow, all);
+    }
+
+    #[test]
+    fn chain_mode_matches_every_row_in_a_spawned_chain_with_a_rogue_row(
+        root in grant(),
+        requests in prop::collection::vec(grant(), 1..5),
+        rogue_at in any::<usize>(),
+        rogue in grant(),
+        req in request(),
+    ) {
+        let (table, ids) = spawned_chain_with_a_rogue_row(&root, &requests, rogue_at, &rogue);
+        let leaf = ids.last().expect("non-empty chain");
+        let all = ids.iter().all(|i| within(&table[i].grant, &req).is_allow());
+        prop_assert_eq!(check(&table, leaf, &req) == Verdict::Allow, all);
+    }
+
+    #[test]
+    fn broker_grants_are_exactly_the_references_every_row_holds(
+        grants in prop::collection::vec(grant(), 1..5),
+    ) {
+        let (table, ids) = chain(&grants);
+        let leaf = ids.last().expect("non-empty chain");
+        let got = broker_grants(&table, leaf).expect("leaf row");
+        let leaf_refs = &table[leaf].grant.credentials;
+        let want: Vec<BrokerGrant> = leaf_refs
+            .iter()
+            .filter(|r| grants.iter().all(|g| g.credentials.contains(r)))
+            .map(|r| BrokerGrant { holder: leaf.clone(), reference: r.clone() })
+            .collect();
+        prop_assert_eq!(got, want);
     }
 }

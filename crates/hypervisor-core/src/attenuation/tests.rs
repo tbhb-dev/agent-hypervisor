@@ -2,8 +2,8 @@
 //! `grant-set.json`; properties cover each attenuation invariant.
 
 use super::{
-    BrokerGrant, CredentialRef, Decision, Denial, Dropped, Egress, Grant, Isolation, Method, Mount,
-    MountMode, Request, SpiffeId, broker_grants, intersect, narrows, within,
+    CredentialRef, Decision, Denial, Dropped, Egress, Grant, Isolation, Method, Mount, MountMode,
+    Request, SpiffeId, intersect, narrows, within,
 };
 use proptest::prelude::*;
 use std::collections::BTreeSet;
@@ -263,19 +263,6 @@ fn credential_outside_the_parent_fails() {
     assert_eq!(
         within(&grant, &request),
         Decision::Deny(Denial::UnknownCredential)
-    );
-}
-
-#[test]
-fn broker_grants_are_scoped_to_the_child_identity() {
-    let (grant, _) = intersect(&parent(), &child());
-    let grants = broker_grants(&id(CHILD_ID), &grant);
-    assert_eq!(
-        grants,
-        vec![BrokerGrant {
-            holder: id(CHILD_ID),
-            reference: cred("broker:github/tbhb-dev/contents-write"),
-        }]
     );
 }
 
@@ -639,18 +626,6 @@ proptest! {
     ) {
         let (_, dropped) = intersect(&p, &r);
         prop_assert_eq!(dropped.is_empty(), narrows(&r, &p));
-    }
-
-    #[test]
-    fn broker_grants_name_only_the_holder_and_parent_held_references(
-        p in grant(), r in grant(),
-    ) {
-        let (c, _) = intersect(&p, &r);
-        let holder = id(CHILD_ID);
-        for g in broker_grants(&holder, &c) {
-            prop_assert_eq!(&g.holder, &holder);
-            prop_assert!(p.credentials.contains(&g.reference));
-        }
     }
 }
 

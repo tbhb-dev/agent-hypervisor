@@ -607,8 +607,6 @@ pub fn check_snapshot(table: &GrantTable, peer: &SpiffeId, request: &Request) ->
     }
 }
 
-#[cfg(test)]
-mod table_tests;
 /// The broker policy grants for `holder`: each reference in its row that [`check`] allows, so a
 /// row stored without intersection gets no grant its ancestors deny. Each grant is scoped to
 /// `holder`'s identity. `None` when the table has no row for `holder`.
@@ -631,3 +629,6 @@ pub fn broker_grants(table: &GrantTable, holder: &SpiffeId) -> Option<Vec<Broker
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod table_tests;

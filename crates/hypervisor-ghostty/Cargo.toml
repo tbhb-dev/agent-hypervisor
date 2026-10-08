@@ -13,7 +13,7 @@ ghostty-vt-sys.workspace = true
 hypervisor-core.workspace = true
 
 [dev-dependencies]
-alacritty_terminal = { version = "=0.26.0", default-features = false }
+hypervisor-alacritty.workspace = true
 serde_json.workspace = true
 
 [lints]

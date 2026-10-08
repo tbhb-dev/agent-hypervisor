@@ -92,3 +92,22 @@ fn a_grapheme_longer_than_sixteen_codepoints_reads_back_whole() {
     redrawn.feed(&vt);
     assert!(diff(&emu.grid(), &redrawn.grid()).is_empty());
 }
+
+#[test]
+fn identity_replies_match_the_alacritty_emulator() {
+    for query in [
+        &b"\x1b[c"[..],
+        b"\x1b[0c",
+        b"\x1b[>c",
+        b"\x1b[=c",
+        b"\x1b[>q",
+        b"\x1b[>0q",
+    ] {
+        let mut alacritty = hypervisor_alacritty::AlacrittyEmulator::new(emulator().size());
+        assert_eq!(
+            String::from_utf8_lossy(&alacritty.feed(query)),
+            reply(query),
+            "{query:?}"
+        );
+    }
+}

@@ -1,5 +1,6 @@
 //! Plain values and decisions shared by runtime drivers.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -81,7 +82,7 @@ pub struct ResourceLimits {
 }
 
 /// Driver-neutral workload request. Paths are canonicalized by the shell before storage.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadSpec {
     pub id: StableId,
     pub runtime: Runtime,
@@ -94,6 +95,27 @@ pub struct WorkloadSpec {
     pub resources: ResourceLimits,
     pub workspace_dir: PathBuf,
     pub cache_dir: PathBuf,
+}
+
+impl fmt::Debug for WorkloadSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkloadSpec")
+            .field("id", &self.id)
+            .field("runtime", &self.runtime)
+            .field("isolation", &self.isolation)
+            .field("image", &self.image)
+            .field("mounts", &self.mounts)
+            .field(
+                "env_names",
+                &self.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            )
+            .field("credential_refs", &self.credential_refs)
+            .field("network", &self.network)
+            .field("resources", &self.resources)
+            .field("workspace_dir", &self.workspace_dir)
+            .field("cache_dir", &self.cache_dir)
+            .finish()
+    }
 }
 
 /// Which persisted workload can be adopted on this host.
@@ -232,6 +254,16 @@ mod tests {
         );
         assert!(env.contains(&("WORKSPACE_DIR".into(), "/work".into())));
         assert!(env.contains(&("X".into(), "1".into())));
+    }
+
+    #[test]
+    fn debug_hides_environment_values() {
+        let mut spec = host();
+        spec.env
+            .push(("API_KEY".into(), "sensitive-test-value".into()));
+        let debug = format!("{spec:?}");
+        assert!(debug.contains("API_KEY"));
+        assert!(!debug.contains("sensitive-test-value"));
     }
 
     proptest! {

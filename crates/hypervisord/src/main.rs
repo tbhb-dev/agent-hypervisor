@@ -11,7 +11,16 @@ use hypervisor_core::state::Harness;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("hook") {
+    let mode = args.next();
+    if mode.as_deref() == Some("adopt") {
+        let args: Vec<String> = args.collect();
+        if let Err(error) = adopt(&args) {
+            eprintln!("hypervisord adopt: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if mode.as_deref() != Some("hook") {
         println!(
             "{}",
             hypervisor_core::version_line(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
@@ -73,6 +82,33 @@ fn main() {
         let _ = done.send(());
     });
     let _ = finished.recv_timeout(Duration::from_millis(150));
+}
+
+/// Start as a daemon would: adopt launchd shims from `<root> <host> <shim> <label-prefix>`
+/// and print each workload's recovery, session count, and shim PID.
+fn adopt(args: &[String]) -> std::io::Result<()> {
+    let [root, host, shim, prefix] = args else {
+        return Err(std::io::Error::other("usage: adopt ROOT HOST SHIM PREFIX"));
+    };
+    let config = hypervisor_core::launchd::JobConfig {
+        prefix: prefix.clone(),
+        uid: rustix::process::geteuid().as_raw(),
+        throttle_seconds: 10,
+    };
+    let driver =
+        hypervisord::driver::HostDriver::open_launchd(root.as_ref(), host, shim.as_ref(), config)?;
+    for (label, workload) in driver.workloads() {
+        let id = &workload.spec.id;
+        let (sessions, pid) = match workload.recovery {
+            hypervisor_core::workload::Recovery::Running
+            | hypervisor_core::workload::Recovery::Restarted => {
+                (driver.stats(id)?, driver.shim_pid(id)?)
+            }
+            _ => (0, 0),
+        };
+        println!("{label} {:?} {sessions} {pid}", workload.recovery);
+    }
+    Ok(())
 }
 
 #[allow(unsafe_code, reason = "clock_gettime reads the host monotonic clock")]

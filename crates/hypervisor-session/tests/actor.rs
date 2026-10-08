@@ -161,6 +161,7 @@ fn an_ephemeral_session_ends_when_its_viewers_leave() {
     session.send(Command::Viewers(1));
     session.send(Command::Viewers(0));
     let events = events_until(&session, exited);
+    // #31 tracks the environment-dependent hangup signal failure; keep this assertion strict.
     assert_eq!(
         events.last(),
         Some(&SessionEvent::Exited(Exit {
@@ -239,6 +240,7 @@ fn close_kills_a_group_member_that_ignores_the_hangup() {
     assert!(alive(&pid));
     session.send(Command::Close);
     let events = events_until(&session, exited);
+    // #31 tracks the environment-dependent hangup signal failure; keep this assertion strict.
     assert!(matches!(
         events.last(),
         Some(SessionEvent::Exited(Exit {

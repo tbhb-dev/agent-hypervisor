@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 54d4e23447ef6d65e5df31d0e3cf105a2353db57d402f8ac6c81200d4852bf61 # shrinks to config = HolderConfig { persistence: Persistent, ring_budget: 16, retain_exited: 0ns, exit_drain: 0ns, kill_grace: 0ns }, steps = [(Spawned, 0), (OutputClosed, 0), (Close, 0), (ChildExited(Exit { code: Some(3), signal: None, raw: Some(768) }), 0)]

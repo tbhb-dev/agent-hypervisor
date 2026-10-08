@@ -21,6 +21,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::emulator::Size;
+use crate::state::{AgentState, HookReport, StateMachine};
 
 /// How a child ended. `code` is set for a normal exit and `signal` for a killing signal; `raw` is
 /// the backend's undecoded status, the `waitpid` status on Unix and the exit code on Windows.
@@ -161,6 +162,8 @@ pub enum Input {
     Close,
     /// A deadline from [`Holder::deadline`] passed.
     Tick,
+    /// A hook report from this session's listener.
+    Hook(HookReport),
 }
 
 /// Something the shell must do, in the order returned.
@@ -211,6 +214,7 @@ pub struct Holder {
     phase: Phase,
     ring: OutputRing,
     size: SizeState,
+    state: StateMachine,
     viewers: usize,
     had_viewer: bool,
     closing: bool,
@@ -230,6 +234,7 @@ impl Holder {
             phase: Phase::Starting,
             ring: OutputRing::new(config.ring_budget),
             size: SizeState::new(size),
+            state: StateMachine::default(),
             viewers: 0,
             had_viewer: false,
             closing: false,
@@ -259,6 +264,12 @@ impl Holder {
         self.size.applied()
     }
 
+    /// The agent's reported state.
+    #[must_use]
+    pub const fn agent_state(&self) -> AgentState {
+        self.state.state()
+    }
+
     /// Whether the emulator's state can still be read: true until the session is reaped.
     #[must_use]
     pub const fn has_screen(&self) -> bool {
@@ -272,10 +283,16 @@ impl Holder {
             Phase::Exited { reap_at, .. } => Some(reap_at),
             _ => None,
         };
-        [self.end_at, self.kill_at, self.drain_until, reap_at]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.end_at,
+            self.kill_at,
+            self.drain_until,
+            reap_at,
+            self.state.deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Applies `input` at monotonic time `now` and returns the effects to carry out, in order.
@@ -337,6 +354,9 @@ impl Holder {
             }
             Input::Close => self.close(now, &mut fx),
             Input::Tick => {}
+            Input::Hook(report) => {
+                self.state.report(report);
+            }
         }
         self.fire_due(now, &mut fx);
         fx
@@ -390,6 +410,7 @@ impl Holder {
     }
 
     fn exited(&mut self, exit: Exit, now: Duration, fx: &mut Vec<Effect>) {
+        self.state.exit();
         self.phase = Phase::Exited {
             exit,
             reap_at: now + self.config.retain_exited,
@@ -406,6 +427,7 @@ impl Holder {
     }
 
     fn fire_due(&mut self, now: Duration, fx: &mut Vec<Effect>) {
+        self.state.tick(now);
         let due = |at: Option<Duration>| at.is_some_and(|at| at <= now);
         if due(self.end_at) {
             self.close(now, fx);

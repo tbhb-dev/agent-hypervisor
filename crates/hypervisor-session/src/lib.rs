@@ -20,6 +20,7 @@ use hypervisor_core::emulator::{Emulator, Size};
 use hypervisor_core::session::{
     Effect, Exit, Holder, HolderConfig, Input, Phase, RingRead, SessionEvent, SpawnSpec,
 };
+use hypervisor_core::state::{Harness, HookKind, HookReport};
 use hypervisor_pty::{Pty, PtyError, Spawn, Wait};
 
 /// The most messages handled before pending size requests settle.
@@ -29,6 +30,12 @@ const BATCH: usize = 64;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Command {
+    /// A normalized event from this session's hook listener.
+    Hook {
+        harness: Harness,
+        kind: HookKind,
+        seq: u64,
+    },
     /// A viewer asked for a size.
     Resize(Size),
     /// The number of attached viewers changed.
@@ -268,6 +275,12 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
             Msg::Exited(exit) => Input::ChildExited(exit),
             Msg::Command(command) => match command {
                 Command::Resize(size) => Input::Resize(size),
+                Command::Hook { harness, kind, seq } => Input::Hook(HookReport {
+                    harness,
+                    kind,
+                    seq,
+                    at: self.now(),
+                }),
                 Command::Viewers(count) => Input::Viewers(count),
                 Command::Write(bytes) => Input::Write(bytes),
                 Command::Interrupt => Input::Interrupt,

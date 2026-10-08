@@ -164,6 +164,8 @@ pub enum Input {
     Tick,
     /// A hook report from this session's listener.
     Hook(HookReport),
+    /// An observation from enabled screen detection.
+    Screen(AgentState),
 }
 
 /// Something the shell must do, in the order returned.
@@ -197,6 +199,14 @@ pub enum Effect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionEvent {
+    /// The child and terminal were created.
+    Created,
+    /// A viewer attached. Run 10 supplies the viewer registry and wires this event.
+    Attached,
+    /// A viewer detached. Run 10 supplies the viewer registry and wires this event.
+    Detached,
+    /// The agent's reported state changed.
+    StateChanged { from: AgentState, to: AgentState },
     /// The child is running.
     Running,
     /// The session took a new size.
@@ -309,6 +319,7 @@ impl Holder {
             Input::Spawned => {
                 if self.phase == Phase::Starting {
                     self.phase = Phase::Running;
+                    fx.push(Effect::Emit(SessionEvent::Created));
                     fx.push(Effect::Emit(SessionEvent::Running));
                 }
             }
@@ -355,7 +366,16 @@ impl Holder {
             Input::Close => self.close(now, &mut fx),
             Input::Tick => {}
             Input::Hook(report) => {
-                self.state.report(report);
+                let from = self.state.state();
+                if let Some(to) = self.state.report(report) {
+                    fx.push(Effect::Emit(SessionEvent::StateChanged { from, to }));
+                }
+            }
+            Input::Screen(state) => {
+                let from = self.state.state();
+                if let Some(to) = self.state.screen(state) {
+                    fx.push(Effect::Emit(SessionEvent::StateChanged { from, to }));
+                }
             }
         }
         self.fire_due(now, &mut fx);
@@ -410,7 +430,10 @@ impl Holder {
     }
 
     fn exited(&mut self, exit: Exit, now: Duration, fx: &mut Vec<Effect>) {
-        self.state.exit();
+        let from = self.state.state();
+        if let Some(to) = self.state.exit() {
+            fx.push(Effect::Emit(SessionEvent::StateChanged { from, to }));
+        }
         self.phase = Phase::Exited {
             exit,
             reap_at: now + self.config.retain_exited,
@@ -427,7 +450,10 @@ impl Holder {
     }
 
     fn fire_due(&mut self, now: Duration, fx: &mut Vec<Effect>) {
-        self.state.tick(now);
+        let from = self.state.state();
+        if let Some(to) = self.state.tick(now) {
+            fx.push(Effect::Emit(SessionEvent::StateChanged { from, to }));
+        }
         let due = |at: Option<Duration>| at.is_some_and(|at| at <= now);
         if due(self.end_at) {
             self.close(now, fx);

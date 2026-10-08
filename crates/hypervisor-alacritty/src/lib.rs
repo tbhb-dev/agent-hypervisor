@@ -50,15 +50,23 @@ const OWN_DEVICE_ATTRIBUTES: [&str; 2] = ["\x1b[?6c", "\x1b[>0;2600;1c"];
 
 /// The terminal's event listener: keeps the replies it writes for the PTY.
 #[derive(Clone, Default)]
-struct Replies(Rc<RefCell<Vec<u8>>>);
+struct Replies {
+    bytes: Rc<RefCell<Vec<u8>>>,
+    title: Rc<RefCell<Option<String>>>,
+}
 
 impl EventListener for Replies {
     fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(text) = event
-            && !OWN_DEVICE_ATTRIBUTES.contains(&text.as_str())
-            && admit_reply(text.as_bytes())
-        {
-            self.0.borrow_mut().extend_from_slice(text.as_bytes());
+        match event {
+            Event::PtyWrite(text)
+                if !OWN_DEVICE_ATTRIBUTES.contains(&text.as_str())
+                    && admit_reply(text.as_bytes()) =>
+            {
+                self.bytes.borrow_mut().extend_from_slice(text.as_bytes());
+            }
+            Event::Title(title) => *self.title.borrow_mut() = Some(title),
+            Event::ResetTitle => *self.title.borrow_mut() = None,
+            _ => {}
         }
     }
 }
@@ -147,7 +155,7 @@ impl AlacrittyEmulator {
 
     fn apply(&mut self, effect: CsiEffect) {
         match effect {
-            CsiEffect::Reply(bytes) => self.replies.0.borrow_mut().extend_from_slice(&bytes),
+            CsiEffect::Reply(bytes) => self.replies.bytes.borrow_mut().extend_from_slice(&bytes),
             CsiEffect::Mode { mode: 2026, set } => self.synchronized_output = set,
             CsiEffect::Mode { mode: 2027, set } => self.grapheme_clustering = set,
             CsiEffect::Mode { .. } => {}
@@ -170,7 +178,7 @@ impl Emulator for AlacrittyEmulator {
             }
             rest = &rest[n..];
         }
-        std::mem::take(&mut *self.replies.0.borrow_mut())
+        std::mem::take(&mut *self.replies.bytes.borrow_mut())
     }
 
     fn size(&self) -> Size {
@@ -195,6 +203,10 @@ impl Emulator for AlacrittyEmulator {
             col: u16::try_from(at.column.0).unwrap_or(0),
         };
         Grid::new(self.size, cells, cursor).unwrap_or_else(|e| unreachable!("alacritty grid: {e}"))
+    }
+
+    fn title(&self) -> Option<String> {
+        self.replies.title.borrow().clone()
     }
 
     fn modes(&self) -> Modes {

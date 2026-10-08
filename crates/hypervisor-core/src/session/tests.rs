@@ -2,6 +2,7 @@ use super::{
     Effect, Exit, Holder, HolderConfig, Input, Persistence, Phase, SessionEvent, Signal, Target,
 };
 use crate::emulator::Size;
+use crate::state::{AgentState, BlockReason, Harness, HookKind, HookReport};
 use proptest::prelude::*;
 use std::time::Duration;
 
@@ -23,10 +24,59 @@ fn running(config: HolderConfig) -> Holder {
     let mut h = Holder::new(config, size(80, 24));
     assert_eq!(
         h.step(Input::Spawned, ms(0)),
-        vec![Effect::Emit(SessionEvent::Running)]
+        vec![
+            Effect::Emit(SessionEvent::Created),
+            Effect::Emit(SessionEvent::Running)
+        ]
     );
     h
 }
+
+#[test]
+fn hook_screen_and_exit_emit_ordered_state_changes() {
+    let mut h = running(HolderConfig::new(Persistence::Persistent));
+    let hook = HookReport {
+        harness: Harness::Codex,
+        kind: HookKind::UserPromptSubmit,
+        seq: 1,
+        at: ms(1),
+    };
+    assert_eq!(
+        h.step(Input::Hook(hook), ms(1)),
+        vec![Effect::Emit(SessionEvent::StateChanged {
+            from: AgentState::Unknown,
+            to: AgentState::Working
+        })]
+    );
+    let blocked = AgentState::Blocked {
+        reason: BlockReason::Approval,
+    };
+    assert_eq!(
+        h.step(Input::Screen(blocked), ms(2)),
+        vec![Effect::Emit(SessionEvent::StateChanged {
+            from: AgentState::Working,
+            to: blocked
+        })]
+    );
+    h.step(Input::OutputClosed, ms(3));
+    assert_eq!(
+        h.step(Input::ChildExited(EXIT), ms(4)),
+        vec![
+            Effect::Emit(SessionEvent::StateChanged {
+                from: blocked,
+                to: AgentState::Exited
+            }),
+            Effect::Emit(SessionEvent::Exited(EXIT))
+        ]
+    );
+    assert!(h.step(Input::Screen(AgentState::Idle), ms(5)).is_empty());
+    assert_eq!(h.agent_state(), AgentState::Exited);
+}
+
+const STATE_EXIT: Effect = Effect::Emit(SessionEvent::StateChanged {
+    from: AgentState::Unknown,
+    to: AgentState::Exited,
+});
 
 const HANGUP: Effect = Effect::Signal {
     signal: Signal::Hangup,
@@ -86,7 +136,7 @@ fn exit_waits_for_output_to_close_then_keeps_the_screen_until_reaped() {
     );
     assert_eq!(
         h.step(Input::OutputClosed, ms(12)),
-        vec![Effect::Emit(SessionEvent::Exited(EXIT))]
+        vec![STATE_EXIT, Effect::Emit(SessionEvent::Exited(EXIT))]
     );
     assert_eq!(
         h.phase(),
@@ -112,7 +162,7 @@ fn exit_without_output_closing_ends_after_the_drain() {
     assert_eq!(h.step(Input::Write(b"x".to_vec()), ms(20)), vec![]);
     assert_eq!(
         h.step(Input::Tick, ms(110)),
-        vec![Effect::Emit(SessionEvent::Exited(EXIT))]
+        vec![STATE_EXIT, Effect::Emit(SessionEvent::Exited(EXIT))]
     );
 }
 
@@ -168,7 +218,7 @@ fn close_kills_the_group_after_the_leader_exits() {
     assert_eq!(h.step(Input::ChildExited(EXIT), ms(10)), vec![]);
     assert_eq!(
         h.step(Input::Tick, ms(110)),
-        vec![Effect::Emit(SessionEvent::Exited(EXIT))]
+        vec![STATE_EXIT, Effect::Emit(SessionEvent::Exited(EXIT))]
     );
     assert_eq!(h.deadline(), Some(ms(2000)));
     assert_eq!(h.step(Input::Tick, ms(1999)), vec![]);
@@ -201,7 +251,7 @@ fn a_close_kills_the_group_even_after_output_closes() {
     h.step(Input::ChildExited(EXIT), ms(10));
     assert_eq!(
         h.step(Input::OutputClosed, ms(20)),
-        vec![Effect::Emit(SessionEvent::Exited(EXIT))]
+        vec![STATE_EXIT, Effect::Emit(SessionEvent::Exited(EXIT))]
     );
     assert_eq!(h.deadline(), Some(ms(2000)));
     assert_eq!(h.step(Input::Tick, ms(2000)), vec![KILL]);

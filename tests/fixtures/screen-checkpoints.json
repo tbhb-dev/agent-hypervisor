@@ -1,0 +1,77 @@
+[
+  {
+    "cell": "claude-default-answered",
+    "idle_bytes": 5853,
+    "approval_bytes": 13774
+  },
+  {
+    "cell": "claude-default-ignored",
+    "idle_bytes": 5463,
+    "approval_bytes": 12505
+  },
+  {
+    "cell": "claude-fullscreen-answered",
+    "idle_bytes": 3952,
+    "approval_bytes": 10962
+  },
+  {
+    "cell": "claude-fullscreen-ignored",
+    "idle_bytes": 3621,
+    "approval_bytes": 9534
+  },
+  {
+    "cell": "claude-fullscreen-noalt-answered",
+    "idle_bytes": 5619,
+    "approval_bytes": 13536
+  },
+  {
+    "cell": "codex-auto-answered",
+    "idle_bytes": 9121,
+    "approval_bytes": 20411
+  },
+  {
+    "cell": "codex-auto-ignored",
+    "idle_bytes": 8862,
+    "approval_bytes": 19045
+  },
+  {
+    "cell": "codex-noalt-answered",
+    "idle_bytes": 10713,
+    "approval_bytes": 21544
+  },
+  {
+    "cell": "codex-noalt-ignored",
+    "idle_bytes": 10013,
+    "approval_bytes": 20110
+  },
+  {
+    "cell": "agy-alt-answered",
+    "idle_bytes": 4636,
+    "approval_bytes": 8451
+  },
+  {
+    "cell": "agy-alt-ignored",
+    "idle_bytes": 4392,
+    "approval_bytes": 7397
+  },
+  {
+    "cell": "agy-default-answered",
+    "idle_bytes": 5750,
+    "approval_bytes": 10151
+  },
+  {
+    "cell": "agy-inline-answered",
+    "idle_bytes": 5528,
+    "approval_bytes": 9789
+  },
+  {
+    "cell": "agy-inline-ignored",
+    "idle_bytes": 5377,
+    "approval_bytes": 9509
+  },
+  {
+    "cell": "agy-reviewdefault-nopretool-answered",
+    "idle_bytes": 5903,
+    "approval_bytes": 9911
+  }
+]

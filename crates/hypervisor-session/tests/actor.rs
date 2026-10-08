@@ -59,8 +59,8 @@ fn events_until(
             .events()
             .recv_timeout(WAIT)
             .unwrap_or_else(|e| panic!("{e} after {seen:?}"));
-        seen.push(event);
-        if stop(&event) {
+        seen.push(event.event);
+        if stop(&event.event) {
             return seen;
         }
     }
@@ -68,6 +68,92 @@ fn events_until(
 
 fn exited(event: &SessionEvent) -> bool {
     matches!(event, SessionEvent::Exited(_))
+}
+
+#[test]
+fn subscribers_receive_ordered_state_and_exit_events() {
+    use hypervisor_core::state::{AgentState, Harness, HookKind};
+
+    let session = start("sleep 0.2; exit 0", persistent());
+    let second = session.subscribe();
+    session.send(Command::Hook {
+        harness: Harness::Claude,
+        kind: HookKind::UserPromptSubmit,
+        seq: 1,
+    });
+    let mut primary = Vec::new();
+    loop {
+        let event = session.events().recv_timeout(WAIT).unwrap();
+        primary.push(event);
+        if matches!(event.event, SessionEvent::Exited(_)) {
+            break;
+        }
+    }
+    assert!(primary.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+    assert!(
+        primary
+            .iter()
+            .any(|event| event.event == SessionEvent::Created)
+    );
+    assert!(primary.iter().any(|event| event.event
+        == SessionEvent::StateChanged {
+            from: AgentState::Unknown,
+            to: AgentState::Working
+        }));
+    assert!(primary.iter().any(|event| event.event
+        == SessionEvent::StateChanged {
+            from: AgentState::Working,
+            to: AgentState::Exited
+        }));
+    let mut secondary = Vec::new();
+    loop {
+        let event = second.recv_timeout(WAIT).unwrap();
+        secondary.push(event);
+        if matches!(event.event, SessionEvent::Exited(_)) {
+            break;
+        }
+    }
+    assert!(secondary.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+    assert!(secondary.iter().all(|event| primary.contains(event)));
+    assert!(secondary.iter().any(|event| event.event
+        == SessionEvent::StateChanged {
+            from: AgentState::Unknown,
+            to: AgentState::Working
+        }));
+    assert!(
+        secondary
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::Exited(_)))
+    );
+}
+
+#[test]
+fn screen_detection_stays_off_until_enabled() {
+    use hypervisor_core::state::{AgentState, BlockReason, Harness};
+
+    let session = start(
+        "printf '\\033]0;[ ! ] Action Required | ws\\007'; echo ready; sleep 3",
+        persistent(),
+    );
+    wait_for_output(&session, "ready");
+    assert!(session.events().try_iter().all(|event| !matches!(
+        event.event,
+        SessionEvent::StateChanged {
+            to: AgentState::Blocked { .. },
+            ..
+        }
+    )));
+    session.send(Command::DetectScreen(Some(Harness::Codex)));
+    events_until(&session, |event| {
+        *event
+            == SessionEvent::StateChanged {
+                from: AgentState::Unknown,
+                to: AgentState::Blocked {
+                    reason: BlockReason::Approval,
+                },
+            }
+    });
+    session.send(Command::Close);
 }
 
 #[test]
@@ -110,7 +196,7 @@ fn a_same_size_resize_sends_a_redraw_hint_and_no_resize() {
         session
             .events()
             .try_iter()
-            .all(|e| e == SessionEvent::Running),
+            .all(|e| matches!(e.event, SessionEvent::Created | SessionEvent::Running)),
         "a same-size request emitted a resize"
     );
 }

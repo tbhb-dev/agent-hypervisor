@@ -62,7 +62,7 @@ description = "Run the Rust tests, including the conformance harness; launchd ne
 run = "bash tests/check-fixtures.sh"
 
 [tasks."check:host"]
-description = "Run the launchd integration tests on an unsandboxed macOS host before merge"
+description = "Run the launchd and seatbelt integration tests on an unsandboxed macOS host before merge"
 run = "bash tests/check-fixtures.sh host"
 
 [tasks."check:boundary"]

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use hypervisor_core::channel::{WireSize, WireSpawnSpec};
 use hypervisor_core::emulator::Size;
 use hypervisor_core::launchd::{self, JobConfig, StartPlan};
+use hypervisor_core::seatbelt;
 use hypervisor_core::session::{HolderConfig, Persistence, SessionKind, SpawnSpec};
 use hypervisor_core::workload::{
     self, HostDecision, HostRequest as Request, HostResponse as Response, Recovery, StableId,
@@ -42,7 +43,7 @@ pub struct Workload {
     pub recovery: Recovery,
 }
 
-/// The daemon-side unsandboxed driver; dropping it leaves shims running.
+/// The daemon-side driver for host and Seatbelt workloads; dropping it leaves shims running.
 pub struct HostDriver {
     root: PathBuf,
     host: String,
@@ -109,7 +110,7 @@ impl HostDriver {
                 continue;
             }
             let spec: WorkloadSpec = serde_json::from_reader(File::open(entry.path())?)?;
-            workload::validate_host(&spec).map_err(invalid)?;
+            workload::validate_workload(&spec).map_err(invalid)?;
             if entry.path() != driver.metadata(&spec.id) {
                 return Err(invalid("workload metadata filename does not match its ID"));
             }
@@ -149,6 +150,11 @@ impl HostDriver {
         workload::admit_host_workload(&self.host, &spec).map_err(invalid)?;
         spec.workspace_dir = fs::canonicalize(&spec.workspace_dir)?;
         spec.cache_dir = fs::canonicalize(&spec.cache_dir)?;
+        // Seatbelt matches physical paths, so a mount names its canonical path.
+        for mount in &mut spec.mounts {
+            mount.source = fs::canonicalize(&mount.source)?;
+            mount.target = fs::canonicalize(&mount.target)?;
+        }
         workload::admit_host_workload(&self.host, &spec).map_err(invalid)?;
         let path = self.metadata(&spec.id);
         let mut file = OpenOptions::new()
@@ -430,7 +436,7 @@ struct ShimState {
 /// Invalid metadata or control I/O.
 pub fn serve(metadata: &Path, root: &Path) -> io::Result<()> {
     let spec: WorkloadSpec = serde_json::from_reader(File::open(metadata)?)?;
-    workload::validate_host(&spec).map_err(invalid)?;
+    workload::validate_workload(&spec).map_err(invalid)?;
     let socket = root.join(format!("{}.sock", label_hash(&spec.id)));
     // A stale socket from a dead shim is removed only after connection fails.
     let stale_socket = socket.exists();
@@ -586,9 +592,11 @@ fn start_session(
         hypervisor_core::channel::SessionKind::Agent => SessionKind::Agent,
         hypervisor_core::channel::SessionKind::Shell => SessionKind::Shell,
     };
-    let mut spec = SpawnSpec::new(wire.command, size, kind);
-    spec.args = wire.args;
-    spec.env = workload::session_env(workload, &wire.env);
+    let home = std::env::home_dir().ok_or_else(|| invalid("no home directory"))?;
+    let (command, args) = seatbelt::session_command(workload, &home, root, wire.command, wire.args);
+    let mut spec = SpawnSpec::new(command, size, kind);
+    spec.args = args;
+    spec.env = seatbelt::session_env(workload, workload::session_env(workload, &wire.env));
     spec.cwd = Some(
         wire.cwd
             .map_or_else(|| workload.workspace_dir.clone(), PathBuf::from),
@@ -625,6 +633,17 @@ fn start_session(
         handle.join();
     });
     Ok((id, HostedSession { path, stop, thread }))
+}
+
+/// The profile a workload's sessions run under, for running harness probes by hand.
+///
+/// # Errors
+/// Invalid metadata or no home directory.
+pub fn seatbelt_profile(metadata: &Path, root: &Path) -> io::Result<String> {
+    let spec: WorkloadSpec = serde_json::from_reader(File::open(metadata)?)?;
+    seatbelt::validate(&spec).map_err(invalid)?;
+    let home = std::env::home_dir().ok_or_else(|| invalid("no home directory"))?;
+    Ok(seatbelt::profile(&spec, &home, root))
 }
 
 fn label_hash(id: &StableId) -> String {

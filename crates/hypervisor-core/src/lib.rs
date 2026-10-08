@@ -14,6 +14,7 @@ pub mod channel;
 pub mod channel_policy;
 pub mod emulator;
 pub mod grid_channel;
+pub mod launchd;
 pub mod screen;
 pub mod session;
 pub mod state;

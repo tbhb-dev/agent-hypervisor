@@ -3,6 +3,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::channel::{WireSize, WireSpawnSpec};
 use serde::{Deserialize, Serialize};
 
 /// A stable host-scoped name supplied by the caller, never a process ID.
@@ -134,6 +135,114 @@ pub fn recovery(expected_host: &str, id: &StableId, shim_responded: bool) -> Rec
         Recovery::Running
     } else {
         Recovery::Stopped
+    }
+}
+
+/// Reconcile only an exact identity received from the saved workload's socket.
+#[must_use]
+pub fn recovery_identity(expected_host: &str, id: &StableId, found: Option<&StableId>) -> Recovery {
+    recovery(expected_host, id, found == Some(id))
+}
+
+/// Check a host workload before the shell persists it.
+///
+/// # Errors
+/// Unsupported controls or an ID owned by another host.
+pub fn admit_host_workload(expected_host: &str, spec: &WorkloadSpec) -> Result<(), &'static str> {
+    validate_host(spec)?;
+    if spec.id.host != expected_host {
+        return Err("foreign host ID");
+    }
+    Ok(())
+}
+
+/// Decide whether a stopped workload can start a new shim.
+///
+/// # Errors
+/// A live shim or a workload already recorded as running.
+pub fn admit_start(recovery: Recovery, socket_answers: bool) -> Result<(), &'static str> {
+    match recovery {
+        Recovery::Running => return Err("workload already running"),
+        Recovery::Foreign => return Err("foreign host workload"),
+        Recovery::Stopped => {}
+    }
+    if socket_answers {
+        return Err("a shim already answers this workload socket");
+    }
+    Ok(())
+}
+
+/// Check a session ID against the workload and its existing sessions.
+///
+/// # Errors
+/// Invalid, foreign, or duplicate ID.
+pub fn admit_session(
+    workload: &StableId,
+    id: &StableId,
+    duplicate: bool,
+) -> Result<(), &'static str> {
+    id.validate()?;
+    if id.host != workload.host || duplicate {
+        return Err("foreign or duplicate session ID");
+    }
+    Ok(())
+}
+
+/// A request on the private shim control socket.
+#[derive(Serialize, Deserialize)]
+pub enum HostRequest {
+    Ping,
+    Spawn {
+        id: StableId,
+        spec: WireSpawnSpec,
+        size: WireSize,
+    },
+    List,
+    Stats,
+    Events,
+    Stop,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum HostResponse {
+    Identity(StableId),
+    SessionSocket(PathBuf),
+    Sessions(Vec<StableId>),
+    Stats { sessions: usize, pid: u32 },
+    Events(Vec<String>),
+    Stopped,
+    Error(String),
+}
+
+/// The shell executes the two actions that have side effects.
+pub enum HostDecision {
+    Reply(HostResponse),
+    Spawn {
+        id: StableId,
+        spec: WireSpawnSpec,
+        size: WireSize,
+    },
+    Stop,
+}
+
+#[must_use]
+pub fn control_decision(
+    request: HostRequest,
+    workload: &StableId,
+    sessions: &[StableId],
+    pid: u32,
+    events: &[String],
+) -> HostDecision {
+    match request {
+        HostRequest::Ping => HostDecision::Reply(HostResponse::Identity(workload.clone())),
+        HostRequest::List => HostDecision::Reply(HostResponse::Sessions(sessions.to_vec())),
+        HostRequest::Stats => HostDecision::Reply(HostResponse::Stats {
+            sessions: sessions.len(),
+            pid,
+        }),
+        HostRequest::Events => HostDecision::Reply(HostResponse::Events(events.to_vec())),
+        HostRequest::Spawn { id, spec, size } => HostDecision::Spawn { id, spec, size },
+        HostRequest::Stop => HostDecision::Stop,
     }
 }
 
@@ -327,6 +436,126 @@ mod tests {
     }
 
     #[test]
+    fn host_admission_rejects_foreign_spec() {
+        assert_eq!(admit_host_workload("h1", &host()), Ok(()));
+        assert_eq!(
+            admit_host_workload("other", &host()),
+            Err("foreign host ID")
+        );
+    }
+
+    #[test]
+    fn start_refuses_running_or_answering_shim() {
+        assert_eq!(admit_start(Recovery::Stopped, false), Ok(()));
+        assert!(admit_start(Recovery::Running, false).is_err());
+        assert!(admit_start(Recovery::Foreign, false).is_err());
+        assert!(admit_start(Recovery::Stopped, true).is_err());
+    }
+
+    #[test]
+    fn session_admission_rejects_duplicate_foreign_and_invalid_ids() {
+        let workload = host().id;
+        let id = StableId {
+            host: "h1".into(),
+            local: "session".into(),
+        };
+        assert_eq!(admit_session(&workload, &id, false), Ok(()));
+        assert!(admit_session(&workload, &id, true).is_err());
+        assert!(
+            admit_session(
+                &workload,
+                &StableId {
+                    host: "other".into(),
+                    ..id.clone()
+                },
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            admit_session(
+                &workload,
+                &StableId {
+                    local: "bad/id".into(),
+                    ..id
+                },
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_requires_exact_identity() {
+        let id = host().id;
+        assert_eq!(recovery_identity("h1", &id, Some(&id)), Recovery::Running);
+        assert_eq!(recovery_identity("h1", &id, None), Recovery::Stopped);
+        assert_eq!(
+            recovery_identity(
+                "h1",
+                &id,
+                Some(&StableId {
+                    local: "other".into(),
+                    ..id.clone()
+                })
+            ),
+            Recovery::Stopped
+        );
+    }
+
+    #[test]
+    fn control_queries_have_plain_value_replies() {
+        let id = host().id;
+        let session = StableId {
+            local: "session".into(),
+            ..id.clone()
+        };
+        let sessions = vec![session.clone()];
+        let events = vec!["started".into()];
+        assert!(
+            matches!(control_decision(HostRequest::Ping, &id, &sessions, 42, &events), HostDecision::Reply(HostResponse::Identity(found)) if found == id)
+        );
+        assert!(
+            matches!(control_decision(HostRequest::List, &id, &sessions, 42, &events), HostDecision::Reply(HostResponse::Sessions(found)) if found == sessions)
+        );
+        assert!(matches!(
+            control_decision(HostRequest::Stats, &id, &sessions, 42, &events),
+            HostDecision::Reply(HostResponse::Stats {
+                sessions: 1,
+                pid: 42
+            })
+        ));
+        assert!(
+            matches!(control_decision(HostRequest::Events, &id, &sessions, 42, &events), HostDecision::Reply(HostResponse::Events(found)) if found == events)
+        );
+        assert!(matches!(
+            control_decision(HostRequest::Stop, &id, &sessions, 42, &events),
+            HostDecision::Stop
+        ));
+        assert!(matches!(
+            control_decision(
+                HostRequest::Spawn {
+                    id: session,
+                    spec: WireSpawnSpec {
+                        command: "x".into(),
+                        args: vec![],
+                        env: vec![],
+                        cwd: None,
+                        user: None,
+                        kind: crate::channel::SessionKind::Shell
+                    },
+                    size: WireSize { cols: 80, rows: 24 }
+                },
+                &id,
+                &sessions,
+                42,
+                &events
+            ),
+            HostDecision::Spawn { .. }
+        ));
+    }
+
+    #[test]
     fn path_variables_override_caller_values() {
         let env = session_env(
             &host(),
@@ -356,6 +585,42 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn start_requires_stopped_state_and_no_answer(state in 0u8..3, answers in any::<bool>()) {
+            let state = match state { 0 => Recovery::Stopped, 1 => Recovery::Running, _ => Recovery::Foreign };
+            prop_assert_eq!(admit_start(state, answers).is_ok(), state == Recovery::Stopped && !answers);
+        }
+
+        #[test]
+        fn control_list_preserves_supplied_ids(locals in prop::collection::vec("[a-z]{1,8}", 0..12)) {
+            let workload = host().id;
+            let sessions: Vec<_> = locals.into_iter().map(|local| StableId { host: workload.host.clone(), local }).collect();
+            let HostDecision::Reply(HostResponse::Sessions(found)) = control_decision(HostRequest::List, &workload, &sessions, 42, &[]) else {
+                prop_assert!(false, "list did not return sessions");
+                return Ok(());
+            };
+            prop_assert_eq!(found, sessions);
+        }
+
+        #[test]
+        fn host_admission_matches_host_component(other in "[a-z]{1,8}") {
+            let spec = host();
+            prop_assert_eq!(admit_host_workload(&other, &spec).is_ok(), other == spec.id.host);
+        }
+
+        #[test]
+        fn session_admission_requires_same_host_and_unique_id(other in "[a-z]{1,8}", duplicate in any::<bool>()) {
+            let workload = host().id;
+            let id = StableId { host: other, local: "session".into() };
+            prop_assert_eq!(admit_session(&workload, &id, duplicate).is_ok(), id.host == workload.host && !duplicate);
+        }
+
+        #[test]
+        fn identity_is_exact_for_recovery(other in "[a-z]{1,8}") {
+            let id = host().id;
+            let found = StableId { local: other, ..id.clone() };
+            prop_assert_eq!(recovery_identity("h1", &id, Some(&found)) == Recovery::Running, found == id);
+        }
         #[test]
         fn invalid_stable_id_components_are_refused(
             invalid in prop_oneof![

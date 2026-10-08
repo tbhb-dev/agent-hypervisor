@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use crate::emulator::{PROFILE, Size};
+use crate::grid_channel::GridFrame;
+
 /// The sole version implemented by this prototype.
 pub const VERSION: u16 = 1;
 /// Maximum frame length after the four-byte prefix, including the typed header.
@@ -154,6 +156,9 @@ pub struct OpenRequest {
     pub client: Capabilities,
     #[serde(deserialize_with = "required_nullable")]
     pub resume: Option<ResumeToken>,
+    /// Grid output cap. Omitted for existing version-one clients.
+    #[serde(default)]
+    pub max_frames_per_second: Option<u16>,
 }
 
 fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -349,6 +354,7 @@ pub enum Frame {
         sequence: u64,
         bytes: Vec<u8>,
     },
+    Grid(GridFrame),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -394,6 +400,7 @@ impl Frame {
                 bytes,
             } => (VERSION, 9, sequenced(*next_sequence, bytes)),
             Self::Output { sequence, bytes } => (VERSION, 10, sequenced(*sequence, bytes)),
+            Self::Grid(v) => (VERSION, 11, json(v)?),
         };
         let length = HEADER + payload.len();
         if length > MAX_FRAME {
@@ -465,6 +472,7 @@ impl Frame {
                     }
                 }
             }
+            11 => Self::Grid(parse(payload)?),
             _ => return Err(FrameError::UnknownType),
         };
         frame.validate()?;
@@ -507,6 +515,7 @@ impl Frame {
             {
                 return Err(FrameError::InvalidValue);
             }
+            Self::Grid(v) => v.validate()?,
             Self::Event(Event::SessionStateChanged(value))
                 if !matches!(
                     value.as_str(),
@@ -592,6 +601,7 @@ mod tests {
                 flags: 0,
             },
             resume: None,
+            max_frames_per_second: None,
         }
     }
 
@@ -1088,7 +1098,6 @@ mod tests {
         fn arbitrary_malformed_stream_data_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
             let _ = Frame::decode(&bytes);
         }
-
 
     }
 }

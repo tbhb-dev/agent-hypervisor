@@ -178,6 +178,7 @@ fn open_request() -> OpenRequest {
             flags: 0,
         },
         resume: None,
+        max_frames_per_second: None,
     }
 }
 
@@ -297,6 +298,7 @@ fn terminal_channel_open_input_resize_controls_and_events() {
 }
 
 #[test]
+
 fn terminal_channel_detached_refuses_output_and_snapshot() {
     let fixture = Fixture::start("printf 'pid:%s\\nready\\n' \"$$\"; IFS= read -r line");
     let session = fixture.session();
@@ -316,7 +318,7 @@ fn terminal_channel_detached_refuses_output_and_snapshot() {
 }
 
 #[test]
-fn terminal_channel_refuses_unsupported_versions_and_unimplemented_encodings() {
+fn terminal_channel_refuses_unsupported_versions_and_invalid_grid_requests() {
     let fixture = Fixture::start(
         "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; IFS= read -r line",
     );
@@ -329,9 +331,11 @@ fn terminal_channel_refuses_unsupported_versions_and_unimplemented_encodings() {
     );
     request.versions = vec![1];
     request.encoding = Encoding::Grid;
+    request.max_frames_per_second = Some(0);
     assert!(
-        Channel::open(session, ViewerId(90), &request).err().is_some_and(|frame| matches!(*frame, Frame::OpenRefused(refused) if refused.reason == OpenRefusal::UnsupportedEncoding))
+        Channel::open(session, ViewerId(90), &request).err().is_some_and(|frame| matches!(*frame, Frame::OpenRefused(refused) if refused.reason == OpenRefusal::InvalidRequest))
     );
+    request.max_frames_per_second = None;
     request.encoding = Encoding::Bytes;
     request.resume = Some(hypervisor_core::channel::ResumeToken {
         next_sequence: u64::MAX,

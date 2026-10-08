@@ -302,6 +302,7 @@ fn cell(c: &AlacrittyCell) -> Cell {
         attrs,
         underline,
         width,
+        hyperlink: c.hyperlink().map(|link| link.uri().to_owned()),
     }
 }
 

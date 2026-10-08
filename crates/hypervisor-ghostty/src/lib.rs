@@ -258,6 +258,25 @@ impl GhosttyEmulator {
             let mut style: sys::GhosttyStyle = zeroed();
             style.size = size_of::<sys::GhosttyStyle>();
             sys::ghostty_grid_ref_style(&raw const gref, &raw mut style);
+            let mut uri = vec![0u8; 256];
+            let mut uri_len = 0usize;
+            let mut uri_result = sys::ghostty_grid_ref_hyperlink_uri(
+                &raw const gref,
+                uri.as_mut_ptr(),
+                uri.len(),
+                &raw mut uri_len,
+            );
+            if uri_result == sys::GHOSTTY_OUT_OF_SPACE {
+                uri.resize(uri_len, 0);
+                uri_result = sys::ghostty_grid_ref_hyperlink_uri(
+                    &raw const gref,
+                    uri.as_mut_ptr(),
+                    uri.len(),
+                    &raw mut uri_len,
+                );
+            }
+            let hyperlink = (uri_result == sys::GHOSTTY_SUCCESS && uri_len > 0)
+                .then(|| String::from_utf8_lossy(&uri[..uri_len.min(uri.len())]).into_owned());
             let wide: sys::GhosttyCellWide = cell_data(raw, sys::GHOSTTY_CELL_DATA_WIDE, 0);
             let tag: sys::GhosttyCellContentTag =
                 cell_data(raw, sys::GHOSTTY_CELL_DATA_CONTENT_TAG, 0);
@@ -286,6 +305,7 @@ impl GhosttyEmulator {
                     sys::GHOSTTY_CELL_WIDE_SPACER_HEAD => CellWidth::SpacerHead,
                     _ => CellWidth::Narrow,
                 },
+                hyperlink,
             }
         }
     }

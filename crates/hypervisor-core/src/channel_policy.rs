@@ -91,11 +91,13 @@ impl ChannelPolicy {
     /// Returns a version, encoding, or request refusal.
     pub fn open(request: &OpenRequest) -> Result<Self, OpenRefused> {
         negotiate(&request.versions)?;
-        let reason = if request.encoding != Encoding::Bytes {
-            Some(OpenRefusal::UnsupportedEncoding)
-        } else if request.size.cols == 0
+
+        let reason = if request.encoding == Encoding::Grid && request.resume.is_some()
+            || request.size.cols == 0
             || request.size.rows == 0
             || request.client.terminal.is_empty()
+            || request.max_frames_per_second == Some(0)
+            || request.encoding == Encoding::Bytes && request.max_frames_per_second.is_some()
         {
             Some(OpenRefusal::InvalidRequest)
         } else {
@@ -168,6 +170,7 @@ mod tests {
                 flags: 0,
             },
             resume: None,
+            max_frames_per_second: None,
         }
     }
 
@@ -196,13 +199,18 @@ mod tests {
     }
 
     #[test]
-    fn policy_refuses_grid_and_bad_size() {
+
+    fn policy_accepts_grid_and_refuses_resume_and_bad_rate_or_size() {
         let mut open = request();
         open.encoding = Encoding::Grid;
+        open.max_frames_per_second = Some(2);
+        assert!(ChannelPolicy::open(&open).is_ok());
+        open.max_frames_per_second = Some(0);
         assert_eq!(
             ChannelPolicy::open(&open).unwrap_err().reason,
-            OpenRefusal::UnsupportedEncoding
+            OpenRefusal::InvalidRequest
         );
+        open.max_frames_per_second = None;
         open.encoding = Encoding::Bytes;
         open.resume = Some(ResumeToken { next_sequence: 0 });
         assert!(ChannelPolicy::open(&open).is_ok());

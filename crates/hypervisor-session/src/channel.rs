@@ -3,15 +3,17 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::Duration;
 
 use hypervisor_core::channel::{
-    Control, ControlResult, Event, Frame, FrameError, OpenRefusal, OpenRefused, OpenRequest,
-    OpenResponse, output_frames,
+    Control, ControlResult, Encoding, Event, Frame, FrameError, OpenRefusal, OpenRefused,
+    OpenRequest, OpenResponse, output_frames,
 };
 use hypervisor_core::channel_policy::{
     ByteStart, ChannelPolicy, ClientAction, ClientError, SnapshotRefusal, byte_start,
     snapshot_frame,
 };
+use hypervisor_core::grid_channel::GridEncoder;
 use hypervisor_core::session::{Refusal, ViewerId, ViewerRead, Writer};
 
 use crate::{SequencedEvent, SessionHandle};
@@ -25,6 +27,7 @@ pub struct Channel<'a> {
     events: Receiver<SequencedEvent>,
     policy: ChannelPolicy,
     initial: VecDeque<Frame>,
+    grid: Option<GridEncoder>,
 }
 
 impl<'a> Channel<'a> {
@@ -39,6 +42,14 @@ impl<'a> Channel<'a> {
     ) -> Result<(Self, Frame), Box<Frame>> {
         let policy = ChannelPolicy::open(request)
             .map_err(|refused| Box::new(Frame::OpenRefused(refused)))?;
+        let grid = if request.encoding == Encoding::Grid {
+            Some(
+                GridEncoder::new(request.max_frames_per_second)
+                    .map_err(|_| refusal(OpenRefusal::InvalidRequest))?,
+            )
+        } else {
+            None
+        };
         let size = request
             .size
             .into_session()
@@ -47,6 +58,24 @@ impl<'a> Channel<'a> {
         let (effective_size, attached_at) = session
             .attach_channel(viewer, request.mode.into_viewer(), size, VIEWER_BUDGET)
             .map_err(|_| refusal(OpenRefusal::SessionRefused))?;
+        if grid.is_some() {
+            let response = Frame::OpenResponse(OpenResponse::from_session(
+                request.mode,
+                effective_size,
+                attached_at,
+            ));
+            return Ok((
+                Self {
+                    session,
+                    viewer,
+                    events,
+                    policy,
+                    initial: VecDeque::new(),
+                    grid,
+                },
+                response,
+            ));
+        }
         let requested = request.resume.map(|token| token.next_sequence);
         let read = requested.and_then(|sequence| session.read_from(sequence));
         let start = byte_start(requested, attached_at, read);
@@ -94,6 +123,7 @@ impl<'a> Channel<'a> {
                 events,
                 policy,
                 initial,
+                grid,
             },
             response,
         ))
@@ -107,6 +137,9 @@ impl<'a> Channel<'a> {
     pub fn next_output(&mut self) -> Result<Option<Frame>, ChannelError> {
         if self.policy.detached() {
             return Err(ChannelError::Client(ClientError::Detached));
+        }
+        if self.grid.is_some() {
+            return Err(ChannelError::Client(ClientError::UnexpectedFrame));
         }
         if let Some(frame) = self.initial.pop_front() {
             return Ok(Some(frame));
@@ -132,6 +165,9 @@ impl<'a> Channel<'a> {
         if self.policy.detached() {
             return Err(ChannelError::Client(ClientError::Detached));
         }
+        if self.grid.is_some() {
+            return Err(ChannelError::Client(ClientError::UnexpectedFrame));
+        }
         let (next_sequence, bytes) = self
             .session
             .viewer_snapshot(self.viewer)
@@ -144,6 +180,33 @@ impl<'a> Channel<'a> {
                 Err(error)
             }
         }
+    }
+
+    /// Poll the active grid using caller supplied monotonic time. The first result is full.
+    ///
+    /// # Errors
+    /// If the channel is not grid encoded, the viewer is gone, or a frame cannot be encoded.
+    pub fn poll_grid(&mut self, now: Duration) -> Result<Option<Frame>, ChannelError> {
+        let grid = self
+            .grid
+            .as_mut()
+            .ok_or(ChannelError::Client(ClientError::UnexpectedFrame))?;
+        if self.policy.detached() {
+            return Err(ChannelError::Client(ClientError::Detached));
+        }
+        if !grid.due(now).map_err(ChannelError::Grid)? {
+            return Ok(None);
+        }
+        let Some((screen, modes, sequence, lost)) = self
+            .session
+            .viewer_grid(self.viewer)
+            .map_err(ChannelError::Refused)?
+        else {
+            return Ok(None);
+        };
+        grid.poll(now, screen, modes, sequence, lost)
+            .map(|frame| frame.map(Frame::Grid))
+            .map_err(ChannelError::Grid)
     }
 
     /// Apply a client frame. Input is dropped when this channel is read-only or lacks the lock.
@@ -212,6 +275,7 @@ pub enum ChannelError {
     Client(ClientError),
     Refused(Refusal),
     Frame(FrameError),
+    Grid(FrameError),
     Unavailable,
 }
 

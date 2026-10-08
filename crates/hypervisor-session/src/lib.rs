@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use hypervisor_core::emulator::{Cursor, Emulator, PROFILE, QueryScanner, Size};
+use hypervisor_core::emulator::{Cursor, Emulator, Grid, Modes, PROFILE, QueryScanner, Size};
 use hypervisor_core::screen::{RuleDetector, ScreenDetector};
 use hypervisor_core::session::{
     Effect, Exit, Holder, HolderConfig, Input, Phase, Refusal, RingRead, SessionEvent, Signal,
@@ -31,6 +31,7 @@ pub mod channel;
 
 /// The most messages handled before pending size requests settle.
 const BATCH: usize = 64;
+type GridSnapshot = (Grid, Modes, u64, bool);
 
 /// A request to a running session.
 #[derive(Debug)]
@@ -76,6 +77,8 @@ pub enum Command {
     ReadViewer(ViewerId, Sender<Result<ViewerRead, Refusal>>),
     /// Return a grid snapshot and the next output sequence, then resume live output.
     ViewerSnapshot(ViewerId, Sender<Result<(u64, Vec<u8>), Refusal>>),
+    /// Capture the active grid, modes, and byte offset in one actor turn.
+    ViewerGrid(ViewerId, Sender<Result<Option<GridSnapshot>, Refusal>>),
     /// Interrupt from the lock holder.
     Interrupt(Writer, Sender<Result<(), Refusal>>),
     /// Signal the foreground group from the write-lock holder.
@@ -91,6 +94,10 @@ pub enum Command {
 #[cfg(test)]
 mod log_tests {
     use super::*;
+    use hypervisor_core::channel::{
+        Capabilities, Encoding, Mode, OpenRequest, OpenTarget, WireSize,
+    };
+    use hypervisor_core::channel_policy::ClientError;
     use hypervisor_core::session::{Persistence, Signal, Target, ViewerRead};
     use hypervisor_ghostty::GhosttyEmulator;
     use hypervisor_pty::{Caps, Resize, Support};
@@ -151,6 +158,57 @@ mod log_tests {
                 resize_repaints: false,
             }
         }
+    }
+
+    #[test]
+    fn grid_open_skips_byte_snapshot_and_byte_methods_are_refused() {
+        let (tx, rx) = mpsc::channel();
+        let (_events_tx, events) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            while let Ok(Msg::Command(command)) = rx.recv() {
+                match command {
+                    Command::Subscribe(_) => {}
+                    Command::AttachChannel(_, _, size, _, reply) => {
+                        let _ = reply.send(Ok((size, 0)));
+                    }
+                    Command::Detach(_, reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::Close => break,
+                    other => panic!("unexpected byte command on grid channel: {other:?}"),
+                }
+            }
+        });
+        let session = SessionHandle {
+            tx,
+            events,
+            thread: Some(thread),
+        };
+        let request = OpenRequest {
+            versions: vec![1],
+            target: OpenTarget::Session("test".into()),
+            mode: Mode::ReadOnly,
+            encoding: Encoding::Grid,
+            size: WireSize { cols: 1, rows: 1 },
+            client: Capabilities {
+                terminal: "test".into(),
+                flags: 0,
+            },
+            resume: None,
+            max_frames_per_second: None,
+        };
+        let (mut channel, _) = channel::Channel::open(&session, ViewerId(42), &request).unwrap();
+        assert_eq!(
+            channel.next_output(),
+            Err(channel::ChannelError::Client(ClientError::UnexpectedFrame))
+        );
+        assert_eq!(
+            channel.snapshot(),
+            Err(channel::ChannelError::Client(ClientError::UnexpectedFrame))
+        );
+        drop(channel);
+        session.send(Command::Close);
+        session.join();
     }
 
     #[test]
@@ -511,6 +569,15 @@ impl SessionHandle {
         self.send(Command::ViewerSnapshot(id, reply));
         answer.recv().unwrap_or(Err(Refusal::UnknownViewer))
     }
+    /// Return a grid snapshot and clear this grid viewer's byte queue.
+    ///
+    /// # Errors
+    /// If the viewer is not attached or the actor has ended.
+    pub fn viewer_grid(&self, id: ViewerId) -> Result<Option<GridSnapshot>, Refusal> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Command::ViewerGrid(id, reply));
+        answer.recv().unwrap_or(Err(Refusal::UnknownViewer))
+    }
     /// Sends a command. A command sent after the session thread has ended is dropped; the
     /// event channel's disconnection reports that end.
     pub fn send(&self, command: Command) {
@@ -802,6 +869,10 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                     let _ = reply.send(self.holder.resynced(id).map(|()| (next, snapshot)));
                     return;
                 }
+                Command::ViewerGrid(id, reply) => {
+                    let _ = reply.send(self.viewer_grid(id));
+                    return;
+                }
                 Command::Interrupt(who, reply) => {
                     let _ = reply.send(self.step(Input::Interrupt(who)));
                     return;
@@ -836,6 +907,23 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
             }
         }
         result
+    }
+
+    fn viewer_grid(&mut self, id: ViewerId) -> Result<Option<GridSnapshot>, Refusal> {
+        let lost = matches!(self.holder.read_viewer(id)?, ViewerRead::Resync { .. });
+        let screen = self.emulator.as_ref().filter(|_| self.holder.has_screen());
+        let value = screen.map(|emulator| {
+            (
+                emulator.grid(),
+                emulator.modes(),
+                self.holder.ring().next(),
+                lost,
+            )
+        });
+        if value.is_some() {
+            self.holder.resynced(id)?;
+        }
+        Ok(value)
     }
 
     fn observe_screen(&mut self) {

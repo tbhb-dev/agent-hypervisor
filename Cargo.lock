@@ -164,8 +164,8 @@ dependencies = [
 name = "hypervisor-ghostty"
 version = "0.1.0"
 dependencies = [
- "alacritty_terminal",
  "ghostty-vt-sys",
+ "hypervisor-alacritty",
  "hypervisor-core",
  "serde_json",
 ]

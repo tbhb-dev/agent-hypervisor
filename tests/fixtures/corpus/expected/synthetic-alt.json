@@ -1,16 +1,28 @@
 {
  "name": "synthetic-alt",
- "source": "r2-emulator/fixtures/alt.vt",
- "run": "RFC-36 run 2",
- "sha256": "410ad8a438bcf484b3f7aa8da3e0b69adf09b131143c779bb56e807d6a9325dd",
+ "file": "recordings/synthetic-alt.vt",
  "bytes": 2191,
+ "sha256": "410ad8a438bcf484b3f7aa8da3e0b69adf09b131143c779bb56e807d6a9325dd",
  "cols": 120,
  "rows": 40,
+ "harness": "synthetic",
+ "harness_version": null,
+ "screen_mode": "alternate",
+ "screen": "alternate",
+ "queries_answered": false,
+ "source": {
+  "run": "RFC-36 run 2",
+  "repository": "tbhb-dev/agent-orchestration-poc.internal",
+  "commit": "75f46d5edb48711a9453f711d340d2d9dd6a6885",
+  "path": "wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/findings/r2-emulator/fixtures/alt.vt"
+ },
+ "redactions": [],
+ "alacritty_grid_diffs": 30,
+ "difference_cause": "regional-indicator width",
  "cursor": [
   20,
   19
  ],
- "alacritty_grid_diffs": 30,
  "text": [
   "╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
   "│ ✻ Welcome to the spike                                                                                               │",

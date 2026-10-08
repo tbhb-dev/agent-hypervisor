@@ -1,4 +1,4 @@
 # bindgen output, regenerated with `mise run ghostty:bindings`.
 crates/ghostty-vt-sys/src/bindings.rs linguist-generated
 # Recorded PTY output: replay it byte for byte, never normalize line endings or whitespace.
-crates/hypervisor-ghostty/tests/fixtures/recordings/*.vt binary
+tests/fixtures/corpus/recordings/*.vt binary

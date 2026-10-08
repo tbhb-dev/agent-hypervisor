@@ -191,7 +191,7 @@ pub fn banned_paths(config: &str) -> Vec<&str> {
 }
 
 /// Returns the lints named in every `#![forbid(...)]` attribute of a crate root, ignoring
-/// line and nested block comments.
+/// line and nested block comments, and string and char literals.
 #[must_use]
 pub fn forbidden_lints(lib_root: &str) -> Vec<String> {
     let uncommented = strip_comments(lib_root);
@@ -217,7 +217,7 @@ fn strip_comments(source: &str) -> String {
                 code.push(ch);
             }
         } else if block_depth > 0 {
-            match (ch, chars.peek()) {
+            match (ch, chars.peek().copied()) {
                 ('/', Some('*')) => {
                     chars.next();
                     block_depth += 1;
@@ -229,7 +229,7 @@ fn strip_comments(source: &str) -> String {
                 _ => {}
             }
         } else {
-            match (ch, chars.peek()) {
+            match (ch, chars.peek().copied()) {
                 ('/', Some('/')) => {
                     chars.next();
                     line_comment = true;
@@ -240,11 +240,82 @@ fn strip_comments(source: &str) -> String {
                     block_depth = 1;
                     code.push(' ');
                 }
+                ('r', _) if skip_raw_string(&mut chars) => code.push(' '),
+                ('"', _) => {
+                    skip_string(&mut chars);
+                    code.push(' ');
+                }
+                ('\'', _) if skip_char(&mut chars) => code.push(' '),
                 _ => code.push(ch),
             }
         }
     }
     code
+}
+
+fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                chars.next();
+            }
+            '"' => break,
+            _ => {}
+        }
+    }
+}
+
+fn skip_raw_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    let mut lookahead = chars.clone();
+    let mut hashes = 0;
+    while lookahead.next_if_eq(&'#').is_some() {
+        hashes += 1;
+    }
+    if lookahead.next_if_eq(&'"').is_none() {
+        return false;
+    }
+    *chars = lookahead;
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            let mut ending = chars.clone();
+            if (0..hashes).all(|_| ending.next_if_eq(&'#').is_some()) {
+                *chars = ending;
+                break;
+            }
+        }
+    }
+    true
+}
+
+fn skip_char(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    let mut lookahead = chars.clone();
+    let Some(first) = lookahead.next() else {
+        return false;
+    };
+    if first == '\\' {
+        let Some(escape) = lookahead.next() else {
+            return false;
+        };
+        match escape {
+            'x' => {
+                lookahead.next();
+                lookahead.next();
+            }
+            'u' if lookahead.next_if_eq(&'{').is_some() => {
+                for ch in lookahead.by_ref() {
+                    if ch == '}' {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if lookahead.next_if_eq(&'\'').is_none() {
+        return false;
+    }
+    *chars = lookahead;
+    true
 }
 
 /// Returns every boundary violation among `packages`, in package order.
@@ -490,6 +561,45 @@ mod tests {
     }
 
     #[test]
+    fn forbid_inside_string_and_char_literals_does_not_count() {
+        let root = format!(
+            "const TEXT: &str = \"#![forbid({})]\";\nconst QUOTE: char = '#';\n",
+            REQUIRED_FORBID.join(", ")
+        );
+        assert_eq!(
+            violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]),
+            REQUIRED_FORBID
+                .iter()
+                .map(|lint| missing_forbid(lint))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn forbid_inside_raw_string_with_embedded_quotes_and_hashes_does_not_count() {
+        let root = format!(
+            "const TEXT: &str = r###\"\"## #![forbid({})] \"#\"###;\n",
+            REQUIRED_FORBID.join(", ")
+        );
+        assert_eq!(
+            violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]),
+            REQUIRED_FORBID
+                .iter()
+                .map(|lint| missing_forbid(lint))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn real_forbid_after_literals_still_counts() {
+        let root = format!(
+            "const TEXT: &str = \"// \\\" /*\";\nconst QUOTE: char = '\"';\nconst APOSTROPHE: char = '\\'';\nconst RAW: &str = r##\"\"# /*\"##;\n#![forbid({})]\n",
+            REQUIRED_FORBID.join(", ")
+        );
+        assert!(violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]).is_empty());
+    }
+
+    #[test]
     fn missing_lib_root_is_a_violation() {
         assert_eq!(
             violations(&[core(Some(CLIPPY), None, vec![])], &[]),
@@ -571,6 +681,20 @@ mod tests {
                 "/*".repeat(depth),
                 REQUIRED_FORBID.join(", "),
                 "*/".repeat(depth)
+            );
+            prop_assert_eq!(
+                violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]),
+                REQUIRED_FORBID.iter().map(|lint| missing_forbid(lint)).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn raw_string_delimiter_requires_every_hash(hashes in 1..6usize) {
+            let delimiter = "#".repeat(hashes);
+            let shorter = "#".repeat(hashes - 1);
+            let root = format!(
+                "const TEXT: &str = r{delimiter}\"\"{shorter} #![forbid({})] \"{delimiter};",
+                REQUIRED_FORBID.join(", ")
             );
             prop_assert_eq!(
                 violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]),

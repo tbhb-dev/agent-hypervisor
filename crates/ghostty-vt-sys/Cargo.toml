@@ -1,0 +1,14 @@
+[package]
+name = "ghostty-vt-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Raw FFI to libghostty-vt, built statically from a pinned Ghostty commit"
+repository.workspace = true
+license.workspace = true
+build = "build.rs"
+links = "ghostty-vt"
+publish.workspace = true
+
+[lints]
+workspace = true

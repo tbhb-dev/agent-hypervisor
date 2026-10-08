@@ -2,6 +2,8 @@
 # Move a pin deliberately and record the new version in the PR that moves it.
 # The pins match tbhb-dev/agent-orchestration-poc at 88584e3. mise owns the Rust pin; there is no rust-toolchain.toml.
 [tools]
+# Ghostty a60e9e2a5 sets minimum_zig_version = "0.16.0" in build.zig.zon; ghostty-vt-sys builds with it.
+zig = "0.16.0"
 rust = { version = "1.98.1", profile = "default" }
 go = "1.27.1"
 python = "3.14.6"
@@ -100,3 +102,25 @@ run = "gitleaks git --redact --no-banner ."
 [tasks."check:actions"]
 description = "Lint the GitHub Actions workflows with actionlint"
 run = "actionlint"
+
+# Ghostty
+[tasks."ghostty:bindings"]
+description = "Regenerate the committed ghostty-vt-sys bindings from the pinned Ghostty headers"
+usage = 'arg "[source]" help="A local Ghostty clone that contains the pinned commit; fetched from GitHub when omitted"'
+run = '''
+set -euo pipefail
+pin="$(cat crates/ghostty-vt-sys/ghostty.pin)"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+if [ -n "${usage_source:-}" ]; then
+  git -C "$usage_source" archive "$pin" include | tar -x -C "$tmp"
+else
+  git -C "$tmp" init -q
+  git -C "$tmp" fetch -q --depth 1 https://github.com/ghostty-org/ghostty.git "$pin"
+  git -C "$tmp" checkout -q FETCH_HEAD -- include
+fi
+mise exec cargo:bindgen-cli@0.73.2 -- bindgen "$tmp/include/ghostty/vt.h" \
+  --allowlist-type 'Ghostty.*' --allowlist-function 'ghostty_.*' --allowlist-var 'GHOSTTY_.*' \
+  --no-prepend-enum-name --with-derive-default --use-core --merge-extern-blocks --no-doc-comments \
+  --rust-target 1.85 --rust-edition 2024 --output crates/ghostty-vt-sys/src/bindings.rs -- "-I$tmp/include"
+'''

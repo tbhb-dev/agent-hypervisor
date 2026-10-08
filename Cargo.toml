@@ -11,6 +11,7 @@ license = "UNLICENSED"
 publish = false
 
 [workspace.dependencies]
+ghostty-vt-sys = { path = "crates/ghostty-vt-sys" }
 hypervisor-core = { path = "crates/hypervisor-core" }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 serde_json = "1.0.151"

@@ -58,7 +58,7 @@ Run 14 checked the same source at `tbhb-dev/agent-orchestration-poc.internal` co
 - Client rendering of byte snapshots in xterm.js and native terminals remains unverified ([#44](https://github.com/tbhb-dev/agent-hypervisor/issues/44)). The omitted serializer state has an explicit disposition and test tracker ([#66](https://github.com/tbhb-dev/agent-hypervisor/issues/66)).
 - Client wheel and page-key handling remains untested ([#64](https://github.com/tbhb-dev/agent-hypervisor/issues/64)).
 - Spawn targets require caller-side resolution until the runtime driver is connected in run 17 ([#52](https://github.com/tbhb-dev/agent-hypervisor/issues/52)).
-- Frame behavior on Unix sockets, WebSockets, and multiplexed streams is untested until transports exist ([#53](https://github.com/tbhb-dev/agent-hypervisor/issues/53)).
+- Unix socket framing is exercised by run 16 conformance cases. WebSocket and multiplexed stream transport remain untested ([#53](https://github.com/tbhb-dev/agent-hypervisor/issues/53)).
 - Client capability flags are advertised but only encoding is selected. Other negotiation behavior is undefined ([#54](https://github.com/tbhb-dev/agent-hypervisor/issues/54)).
 - The merged holder promotes a read-only viewer on `take`. Caller authorization is untested and required before exposed clients use it ([#45](https://github.com/tbhb-dev/agent-hypervisor/issues/45)).
 
@@ -90,6 +90,25 @@ The source at `tbhb-dev/agent-orchestration-poc.internal` commit `df89ef4af4a0ee
 | Run 14 provides byte snapshots and replay. | Keep grid resume tokens refused and use byte encoding for scrollback. |
 
 The core tests cover full and diff frames, cursor and mode-only diffs, rate coalescing, bounded hyperlink ids, adjacent diff bases, forced full resync and malformed shapes. They also show that oversized frames leave encoder state unchanged. The Ghostty and Alacritty cases cover short and long OSC 8 URIs. The Unix PTY conformance cases test grid request negotiation, full and diff emission, rate caps, overflow resync, wrong-direction frame refusal, and polling after the actor ends through the process-group guarded fixture. Session tests cover a poll with no screen and retention of a pending resync flag. These tests establish server-side framing and holder behavior. Client rendering remains untested. Wheel and page-key routing awaits [#64](https://github.com/tbhb-dev/agent-hypervisor/issues/64).
+
+## Run 16 local transport
+
+`TerminalSocket::bind(root, workspace_id, session_id, allowed_uid)` binds `root/r/<first 12 SHA-256 hex characters of workspace ID>/<first 12 SHA-256 hex characters of session ID>.c`. The workspace directory has mode `0700`, the socket has mode `0600`, and a path longer than 103 bytes is rejected before bind. The caller supplies a private runtime root and the session selected by this listener. Concurrent Unix stream clients are accepted. Each connection supplies a UID and GID through `getpeereid` on macOS or `SO_PEERCRED` on Linux. The server logs those fields and closes a peer whose UID differs from `allowed_uid` before reading a frame. The listener path selects the session. An open request for another session or a spawn target receives `unknown_target`. Each accepted connection gets a viewer ID, which is detached when the connection closes.
+
+The server uses the existing length-prefixed frame format. A client must open first. Accepted input, resize, and control frames go to the merged channel adapter. Its responses, events, byte output, and grid frames go back over the socket. After `resync_required`, a byte viewer gets a fresh snapshot. A grid viewer gets a full frame at its next eligible poll, while malformed frames close the connection. The server closes a client when its bounded write queue fills. The holder's separate 64 KiB viewer queue determines resync behavior. Client polling occurs every 10 ms without a latency or throughput guarantee.
+
+`terminal-debug SOCKET SESSION [RAW-INPUT-FILE]` opens a byte channel and prints each decoded frame. When given a file, it requests read-write mode and takes the lock before replaying raw file bytes in `Input` frames. The file is input to the PTY, not an output recording. The tool stops at EOF from the server or an operator interruption. It does not render VT or interpret grid diffs.
+
+Run 16 read the RFC-36 source at `tbhb-dev/agent-orchestration-poc.internal` commit `bf09bebe0086b0c66ee63af5bca17d042b72ac1f`, `wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/source.md`, lines 123 to 158 and 339, and its run table at `proposal.md`, lines 98 to 105. These are the source-to-merged-code differences and the run 16 choices:
+
+| Source target | Run 16 choice |
+| --- | --- |
+| The source places the Unix socket server in a proxy and uses peer credentials for local identity. | The merged Phase 1 and 2 code has only the daemon shell. The transport is a `hypervisord` module over a caller-supplied session. The proposal's later run 16 finding makes the listener path authoritative for session selection and treats peer credentials as connection audit fields. This prototype also checks an allowed UID. RFC-45 may change which local client uses the socket and where this module runs. |
+| A channel open specifies a session or spawn spec. | The merged adapter needs a resolved `SessionHandle`, and run 17 defines the common runtime driver. This listener binds one existing session and refuses other targets, including spawn, as `unknown_target`. |
+| A slow viewer is dropped and told to resync. | The merged holder pauses and retains the viewer. This transport sends its resync event, then a byte snapshot or a full grid frame on the next eligible poll. It closes only when its own bounded write queue cannot drain. |
+| The source describes peer credentials as local identity. | macOS credentials report the socket's last user and Linux credentials report the connector. Neither attributes each byte. The listener path chooses the session, and the configured UID limits connections. These credentials cannot separate same-UID clients that know another listener path. Phase 4 authorization remains required. |
+
+The local-client assumption is one daemon-owned private runtime root and clients running as its allowed local UID. A separate UID cannot traverse the current `0700` workspace directory, even if the socket's allowed UID matches it. Cross-UID workspace principals and network clients need a later proxy or filesystem ownership design. Peer credentials do not identify the writer of each byte. The run 16 conformance cases verify UID policy against actual peer credentials, a byte snapshot and input replay, simultaneous byte and grid viewers, and target and version refusals. The refused-peer case sets an allowed UID different from the test process. It does not launch a second operating-system user. Client rendering, a proxy split, and remote transport remain untested.
 
 ## Inputs
 

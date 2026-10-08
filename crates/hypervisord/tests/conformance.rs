@@ -3,7 +3,11 @@
 //! The Unix PTY is the only Phase 1 driver. Every fixture joins its actor after
 //! closing, which signals the child's process group even on assertion failure.
 
+use std::io::{Read, Write};
 use std::num::NonZeroUsize;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,6 +28,7 @@ use hypervisor_ghostty::GhosttyEmulator;
 use hypervisor_pty::{PtyError, Spawn, UnixPty, UnixSpawner};
 use hypervisor_session::channel::{Channel, ChannelError};
 use hypervisor_session::{Command, LogContext, SessionHandle, spawn};
+use hypervisord::terminal_socket::TerminalSocket;
 
 #[path = "../../../tests/support/process_group.rs"]
 mod process_group;
@@ -181,6 +186,157 @@ fn open_request() -> OpenRequest {
         resume: None,
         max_frames_per_second: None,
     }
+}
+
+struct ServerRun {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<std::io::Result<()>>>,
+}
+
+impl ServerRun {
+    fn finish(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread.take().unwrap().join().unwrap().unwrap();
+    }
+}
+
+impl Drop for ServerRun {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn serve_fixture(
+    fixture: &mut Fixture,
+    root: &Path,
+    allowed_uid: u32,
+) -> (ServerRun, std::path::PathBuf) {
+    let socket =
+        TerminalSocket::bind(root, "workspace", "conformance-session", allowed_uid).unwrap();
+    let path = socket.path().to_owned();
+    let session = fixture.session.take().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let running = Arc::clone(&stop);
+    let thread = thread::spawn(move || {
+        let result = socket.serve_until(&session, &running);
+        session.send(Command::Close);
+        session.join();
+        result
+    });
+    (
+        ServerRun {
+            stop,
+            thread: Some(thread),
+        },
+        path,
+    )
+}
+
+fn wire_frame(stream: &mut UnixStream) -> Frame {
+    let mut prefix = [0; 4];
+    stream.read_exact(&mut prefix).unwrap();
+    let length = u32::from_be_bytes(prefix) as usize;
+    assert!((3..=hypervisor_core::channel::MAX_FRAME).contains(&length));
+    let mut bytes = Vec::with_capacity(4 + length);
+    bytes.extend_from_slice(&prefix);
+    bytes.resize(4 + length, 0);
+    stream.read_exact(&mut bytes[4..]).unwrap();
+    Frame::decode(&bytes).unwrap().unwrap().0
+}
+
+fn wire_send(stream: &mut UnixStream, frame: &Frame) {
+    stream.write_all(&frame.encode().unwrap()).unwrap();
+}
+
+#[test]
+fn terminal_socket_accepts_local_peer_and_serves_byte_and_grid_viewers() {
+    let mut fixture = Fixture::start(
+        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+    );
+    let pgid = fixture_pgid(&wait_for_output(fixture.session(), "ready"));
+    let root = std::path::PathBuf::from(format!("/tmp/hv16a-{}", std::process::id()));
+    let uid = rustix::process::geteuid().as_raw();
+    let (server, path) = serve_fixture(&mut fixture, &root, uid);
+    let mut wrong = UnixStream::connect(&path).unwrap();
+    wrong.set_read_timeout(Some(WAIT)).unwrap();
+    let mut request = open_request();
+    request.target = OpenTarget::Session("another-session".into());
+    wire_send(&mut wrong, &Frame::OpenRequest(request));
+    assert!(
+        matches!(wire_frame(&mut wrong), Frame::OpenRefused(refused) if refused.reason == OpenRefusal::UnknownTarget)
+    );
+    let mut version = UnixStream::connect(&path).unwrap();
+    version.set_read_timeout(Some(WAIT)).unwrap();
+    let mut request = open_request();
+    request.versions = vec![2];
+    wire_send(&mut version, &Frame::OpenRequest(request));
+    assert!(
+        matches!(wire_frame(&mut version), Frame::OpenRefused(refused) if refused.reason == OpenRefusal::UnsupportedVersion)
+    );
+    let mut byte = UnixStream::connect(&path).unwrap();
+    byte.set_read_timeout(Some(WAIT)).unwrap();
+    wire_send(&mut byte, &Frame::OpenRequest(open_request()));
+    assert!(matches!(wire_frame(&mut byte), Frame::OpenResponse(_)));
+    assert!(matches!(wire_frame(&mut byte), Frame::Snapshot { .. }));
+    let mut grid = UnixStream::connect(&path).unwrap();
+    grid.set_read_timeout(Some(WAIT)).unwrap();
+    let mut request = open_request();
+    request.encoding = Encoding::Grid;
+    wire_send(&mut grid, &Frame::OpenRequest(request));
+    assert!(matches!(wire_frame(&mut grid), Frame::OpenResponse(_)));
+    assert!(matches!(
+        wire_frame(&mut grid),
+        Frame::Grid(GridFrame::Full { frame: 1, .. })
+    ));
+    wire_send(&mut byte, &Frame::Input(b"blocked\n".to_vec()));
+    wire_send(&mut byte, &Frame::Control(Control::Take));
+    wire_send(&mut byte, &Frame::Input(b"wire\n".to_vec()));
+    let mut saw_control = false;
+    let mut saw_output = false;
+    let mut output = Vec::new();
+    for _ in 0..20 {
+        match wire_frame(&mut byte) {
+            Frame::ControlResult(ControlResult::Accepted) => saw_control = true,
+            Frame::Output { bytes, .. } => {
+                output.extend(bytes);
+                if String::from_utf8_lossy(&output).contains("got:wire") {
+                    saw_output = true;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_control && saw_output);
+    assert!(!String::from_utf8_lossy(&output).contains("got:blocked"));
+    wire_send(&mut byte, &Frame::Control(Control::Detach));
+    for _ in 0..20 {
+        if wire_frame(&mut byte) == Frame::ControlResult(ControlResult::Accepted) {
+            break;
+        }
+    }
+    server.finish();
+    fixture.finish(pgid);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn terminal_socket_refuses_peer_with_unlisted_uid() {
+    let mut fixture = Fixture::start("printf 'pid:%s\\nready\\n' \"$$\"; IFS= read -r line");
+    let pgid = fixture_pgid(&wait_for_output(fixture.session(), "ready"));
+    let root = std::path::PathBuf::from(format!("/tmp/hv16r-{}", std::process::id()));
+    let uid = rustix::process::geteuid().as_raw();
+    let (server, path) = serve_fixture(&mut fixture, &root, uid.wrapping_add(1));
+    let mut stream = UnixStream::connect(path).unwrap();
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    let mut byte = [0];
+    assert_eq!(stream.read(&mut byte).unwrap(), 0);
+    server.finish();
+    fixture.finish(pgid);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn channel_event(channel: &Channel<'_>, wanted: impl Fn(&Event) -> bool) -> Event {

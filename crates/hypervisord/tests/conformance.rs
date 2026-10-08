@@ -628,7 +628,7 @@ fn terminal_channel_replays_retained_bytes_and_snapshots_evicted_bytes() {
     session
         .submit(Writer::Program(9), b"away\n".to_vec())
         .unwrap();
-    wait_for_output(session, "got:away");
+    wait_for_output(session, "got:away\r\n");
     let mut request = open_request();
     request.resume = Some(hypervisor_core::channel::ResumeToken {
         next_sequence: resume_at,
@@ -640,27 +640,27 @@ fn terminal_channel_replays_retained_bytes_and_snapshots_evicted_bytes() {
     session
         .submit(Writer::Program(9), b"live\n".to_vec())
         .unwrap();
-    wait_for_output(session, "got:live");
+    wait_for_output(session, "got:live\r\n");
     let Frame::Output { sequence, bytes } = replay.next_output().unwrap().unwrap() else {
         panic!("missing replay")
     };
     assert_eq!(sequence, resume_at);
     assert_eq!(response.starting_sequence, resume_at + bytes.len() as u64);
     assert!(String::from_utf8_lossy(&bytes).contains("got:away"));
-    let Frame::Output {
-        sequence,
-        bytes: live,
-    } = replay.next_output().unwrap().unwrap()
-    else {
-        panic!("missing live output after replay")
-    };
-    assert_eq!(sequence, response.starting_sequence);
-    assert!(String::from_utf8_lossy(&live).contains("got:live"));
+    let mut next_sequence = response.starting_sequence;
+    let mut live = Vec::new();
+    while live.len() < b"got:live\r\n".len() {
+        let Frame::Output { sequence, bytes } = replay.next_output().unwrap().unwrap() else {
+            panic!("missing live output after replay")
+        };
+        assert_eq!(sequence, next_sequence);
+        next_sequence += bytes.len() as u64;
+        live.extend(bytes);
+    }
+    assert_eq!(live, b"got:live\r\n");
     assert_eq!(replay.next_output(), Ok(None));
     drop(replay);
-    request.resume = Some(hypervisor_core::channel::ResumeToken {
-        next_sequence: sequence + live.len() as u64,
-    });
+    request.resume = Some(hypervisor_core::channel::ResumeToken { next_sequence });
     let (mut current, _) = Channel::open(session, ViewerId(88), &request).unwrap();
     assert_eq!(current.next_output(), Ok(None));
     drop(current);

@@ -7,11 +7,14 @@ use std::fmt;
 
 use crate::emulator::{PROFILE, Size};
 use crate::grid_channel::GridFrame;
+
 /// The sole version implemented by this prototype.
 pub const VERSION: u16 = 1;
 /// Maximum frame length after the four-byte prefix, including the typed header.
 pub const MAX_FRAME: usize = 1024 * 1024;
 const HEADER: usize = 3;
+/// Largest byte payload in a sequenced frame after its eight-byte offset.
+pub const MAX_SEQUENCED_BYTES: usize = MAX_FRAME - HEADER - 8;
 
 /// A size in terminal cells, checked before it reaches the session holder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,7 +138,7 @@ pub enum Encoding {
     Grid,
 }
 
-/// A byte offset to resume from. Replay and snapshots are run 14 work.
+/// The next byte the client needs, counted from zero across the session's output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResumeToken {
@@ -341,6 +344,16 @@ pub enum Frame {
     Control(Control),
     ControlResult(ControlResult),
     Event(Event),
+    /// VT screen and mode state at the next output byte offset.
+    Snapshot {
+        next_sequence: u64,
+        bytes: Vec<u8>,
+    },
+    /// Raw PTY bytes beginning at `sequence`.
+    Output {
+        sequence: u64,
+        bytes: Vec<u8>,
+    },
     Grid(GridFrame),
 }
 
@@ -382,6 +395,11 @@ impl Frame {
             Self::Control(v) => (VERSION, 6, json(v)?),
             Self::ControlResult(v) => (VERSION, 7, json(v)?),
             Self::Event(v) => (VERSION, 8, json(v)?),
+            Self::Snapshot {
+                next_sequence,
+                bytes,
+            } => (VERSION, 9, sequenced(*next_sequence, bytes)),
+            Self::Output { sequence, bytes } => (VERSION, 10, sequenced(*sequence, bytes)),
             Self::Grid(v) => (VERSION, 11, json(v)?),
         };
         let length = HEADER + payload.len();
@@ -433,6 +451,27 @@ impl Frame {
             6 => Self::Control(parse(payload)?),
             7 => Self::ControlResult(parse(payload)?),
             8 => Self::Event(parse(payload)?),
+            9 | 10 => {
+                let Some(prefix) = payload.get(..8) else {
+                    return Err(FrameError::MalformedPayload);
+                };
+                let sequence = u64::from_be_bytes(
+                    prefix
+                        .try_into()
+                        .map_err(|_| FrameError::MalformedPayload)?,
+                );
+                if kind == 9 {
+                    Self::Snapshot {
+                        next_sequence: sequence,
+                        bytes: payload[8..].to_vec(),
+                    }
+                } else {
+                    Self::Output {
+                        sequence,
+                        bytes: payload[8..].to_vec(),
+                    }
+                }
+            }
             11 => Self::Grid(parse(payload)?),
             _ => return Err(FrameError::UnknownType),
         };
@@ -468,6 +507,14 @@ impl Frame {
                 return Err(FrameError::InvalidValue);
             }
             Self::Resize(v) if v.cols == 0 || v.rows == 0 => return Err(FrameError::InvalidValue),
+            Self::Snapshot { bytes, .. } if bytes.is_empty() => {
+                return Err(FrameError::InvalidValue);
+            }
+            Self::Output { sequence, bytes }
+                if bytes.is_empty() || sequence.checked_add(bytes.len() as u64).is_none() =>
+            {
+                return Err(FrameError::InvalidValue);
+            }
             Self::Grid(v) => v.validate()?,
             Self::Event(Event::SessionStateChanged(value))
                 if !matches!(
@@ -487,6 +534,32 @@ impl Frame {
         }
         Ok(())
     }
+}
+
+fn sequenced(sequence: u64, bytes: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8 + bytes.len());
+    payload.extend_from_slice(&sequence.to_be_bytes());
+    payload.extend_from_slice(bytes);
+    payload
+}
+
+/// Divide contiguous raw output into frames that each fit the wire limit.
+///
+/// # Errors
+/// The supplied span would overflow the session's byte offset.
+pub fn output_frames(sequence: u64, bytes: &[u8]) -> Result<Vec<Frame>, FrameError> {
+    let length = u64::try_from(bytes.len()).map_err(|_| FrameError::TooLarge)?;
+    sequence
+        .checked_add(length)
+        .ok_or(FrameError::InvalidValue)?;
+    Ok(bytes
+        .chunks(MAX_SEQUENCED_BYTES)
+        .enumerate()
+        .map(|(index, chunk)| Frame::Output {
+            sequence: sequence + (index * MAX_SEQUENCED_BYTES) as u64,
+            bytes: chunk.to_vec(),
+        })
+        .collect())
 }
 
 fn json<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameError> {
@@ -829,6 +902,14 @@ mod tests {
                 signal: None,
             }),
             Frame::Event(Event::ResyncRequired { oldest: 10 }),
+            Frame::Snapshot {
+                next_sequence: 23,
+                bytes: b"\x1b[H\x1b[2J".to_vec(),
+            },
+            Frame::Output {
+                sequence: 23,
+                bytes: vec![0, 255, 3],
+            },
         ];
         for frame in frames {
             let encoded = frame.encode().unwrap();
@@ -893,6 +974,86 @@ mod tests {
     }
 
     #[test]
+    fn sequenced_frames_reject_short_empty_overflow_and_oversize_payloads() {
+        for kind in [9, 10] {
+            let mut short = vec![0, 0, 0, 10, 0, 1, kind];
+            short.extend_from_slice(&[0; 7]);
+            assert_eq!(Frame::decode(&short), Err(FrameError::MalformedPayload));
+            let mut empty = vec![0, 0, 0, 11, 0, 1, kind];
+            empty.extend_from_slice(&[0; 8]);
+            assert_eq!(Frame::decode(&empty), Err(FrameError::InvalidValue));
+        }
+        assert_eq!(
+            Frame::Snapshot {
+                next_sequence: 0,
+                bytes: vec![]
+            }
+            .encode(),
+            Err(FrameError::InvalidValue)
+        );
+        assert_eq!(
+            Frame::Output {
+                sequence: 0,
+                bytes: vec![]
+            }
+            .encode(),
+            Err(FrameError::InvalidValue)
+        );
+        assert_eq!(
+            Frame::Output {
+                sequence: u64::MAX,
+                bytes: vec![1]
+            }
+            .encode(),
+            Err(FrameError::InvalidValue)
+        );
+        let mut overflow = vec![0, 0, 0, 12, 0, 1, 10];
+        overflow.extend_from_slice(&u64::MAX.to_be_bytes());
+        overflow.push(1);
+        assert_eq!(Frame::decode(&overflow), Err(FrameError::InvalidValue));
+        assert_eq!(
+            Frame::Snapshot {
+                next_sequence: 0,
+                bytes: vec![0; MAX_FRAME]
+            }
+            .encode(),
+            Err(FrameError::TooLarge)
+        );
+        assert_eq!(
+            Frame::Output {
+                sequence: 0,
+                bytes: vec![0; MAX_FRAME]
+            }
+            .encode(),
+            Err(FrameError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn replay_chunks_fit_and_keep_contiguous_byte_offsets() {
+        let bytes = vec![0x80; MAX_SEQUENCED_BYTES + 5];
+        let frames = output_frames(17, &bytes).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frames[0],
+            Frame::Output {
+                sequence: 17,
+                bytes: vec![0x80; MAX_SEQUENCED_BYTES]
+            }
+        );
+        assert_eq!(
+            frames[1],
+            Frame::Output {
+                sequence: 17 + MAX_SEQUENCED_BYTES as u64,
+                bytes: vec![0x80; 5]
+            }
+        );
+        assert!(frames.into_iter().all(|frame| frame.encode().is_ok()));
+        assert_eq!(output_frames(u64::MAX, &[1]), Err(FrameError::InvalidValue));
+        assert_eq!(output_frames(0, &[]), Ok(vec![]));
+    }
+
+    #[test]
     fn spawn_debug_hides_environment_values() {
         let spec = WireSpawnSpec {
             command: "/bin/sh".into(),
@@ -926,10 +1087,17 @@ mod tests {
         }
 
         #[test]
+        fn arbitrary_sequenced_bytes_round_trip(seq in 0u64..u64::MAX - 4096, bytes in proptest::collection::vec(any::<u8>(), 1..4096)) {
+            for frame in [Frame::Snapshot { next_sequence: seq, bytes: bytes.clone() }, Frame::Output { sequence: seq, bytes: bytes.clone() }] {
+                let encoded = frame.encode().unwrap();
+                prop_assert_eq!(Frame::decode(&encoded), Ok(Some((frame, encoded.len()))));
+            }
+        }
+
+        #[test]
         fn arbitrary_malformed_stream_data_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
             let _ = Frame::decode(&bytes);
         }
-
 
     }
 }

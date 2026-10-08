@@ -219,9 +219,13 @@ impl Decision {
 }
 
 /// Splits an absolute path into segments, ignoring one trailing slash. `None` for a path that is
-/// not absolute or has an empty, `.`, or `..` segment, so traversal fails closed.
+/// not absolute, has an empty, `.`, or `..` segment, or contains `%`, so traversal fails closed.
+/// Callers pass decoded paths; a percent escape is refused rather than decoded here.
 fn segments(path: &str) -> Option<Vec<&str>> {
     let rest = path.strip_prefix('/')?;
+    if rest.starts_with('/') || rest.contains('%') {
+        return None;
+    }
     let rest = rest.strip_suffix('/').unwrap_or(rest);
     if rest.is_empty() {
         return Some(Vec::new());
@@ -269,7 +273,7 @@ fn mount_covers(outer: &Mount, inner: &Mount) -> bool {
 }
 
 /// `resource_within_scope`: whether `grant` covers `request`. Unknown hosts, mounts, and
-/// references, and malformed paths, are denied.
+/// references, malformed paths, and a mount subpath outside its mount point are denied.
 #[must_use]
 pub fn within(grant: &Grant, request: &Request) -> Decision {
     let covered = |known: bool, covered: bool, unknown: Denial| match (known, covered) {
@@ -307,7 +311,8 @@ pub fn within(grant: &Grant, request: &Request) -> Decision {
             let entries = || grant.mounts.iter().filter(|m| same_path(&m.path, path));
             covered(
                 entries().next().is_some(),
-                entries().any(|m| *mode <= m.mode && under(subpath, &m.scope)),
+                under(subpath, path)
+                    && entries().any(|m| *mode <= m.mode && under(subpath, &m.scope)),
                 Denial::UnknownMount,
             )
         }

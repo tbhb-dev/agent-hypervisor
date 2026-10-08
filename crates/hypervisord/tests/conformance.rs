@@ -4,6 +4,7 @@
 //! closing, which signals the child's process group even on assertion failure.
 
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,12 +15,30 @@ use hypervisor_core::session::{
 };
 use hypervisor_core::state::{AgentState, BlockReason, Harness, HookKind};
 use hypervisor_ghostty::GhosttyEmulator;
-use hypervisor_pty::UnixSpawner;
+use hypervisor_pty::{PtyError, Spawn, UnixPty, UnixSpawner};
 use hypervisor_session::{Command, LogContext, SessionHandle, spawn};
+
+#[path = "../../../tests/support/process_group.rs"]
+mod process_group;
 
 const WAIT: Duration = Duration::from_secs(5);
 
-struct Fixture(Option<SessionHandle>);
+struct FixtureSpawner(Arc<Mutex<Option<process_group::ProcessGroup>>>);
+
+impl Spawn for FixtureSpawner {
+    type Pty = UnixPty;
+
+    fn spawn(&self, spec: &SpawnSpec) -> Result<UnixPty, PtyError> {
+        let pty = UnixSpawner.spawn(spec)?;
+        *self.0.lock().unwrap() = Some(process_group::ProcessGroup::new(pty.pid()));
+        Ok(pty)
+    }
+}
+
+struct Fixture {
+    session: Option<SessionHandle>,
+    _group: process_group::ProcessGroup,
+}
 
 impl Fixture {
     fn start(script: &str) -> Self {
@@ -30,23 +49,26 @@ impl Fixture {
         let mut config = HolderConfig::new(Persistence::Persistent);
         config.retain_exited = Duration::ZERO;
         config.kill_grace = Duration::from_millis(100);
-        Self(Some(
-            spawn(
-                UnixSpawner,
-                spec,
-                config,
-                LogContext {
-                    workload_id: "conformance-workload".into(),
-                    session_id: "conformance-session".into(),
-                },
-                GhosttyEmulator::new,
-            )
-            .unwrap(),
-        ))
+        let group = Arc::new(Mutex::new(None));
+        let session = spawn(
+            FixtureSpawner(Arc::clone(&group)),
+            spec,
+            config,
+            LogContext {
+                workload_id: "conformance-workload".into(),
+                session_id: "conformance-session".into(),
+            },
+            GhosttyEmulator::new,
+        );
+        let guard = group.lock().unwrap().take();
+        Self {
+            session: Some(session.unwrap()),
+            _group: guard.expect("the session spawned a fixture group"),
+        }
     }
 
     fn session(&self) -> &SessionHandle {
-        self.0.as_ref().unwrap()
+        self.session.as_ref().unwrap()
     }
 
     #[allow(
@@ -67,7 +89,7 @@ impl Fixture {
     }
 
     fn close(&mut self) {
-        if let Some(session) = self.0.take() {
+        if let Some(session) = self.session.take() {
             session.send(Command::Close);
             session.join();
         }

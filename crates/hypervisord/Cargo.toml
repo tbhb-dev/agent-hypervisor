@@ -18,6 +18,7 @@ sha2.workspace = true
 [dev-dependencies]
 hypervisor-ghostty.workspace = true
 hypervisor-pty.workspace = true
+rustix.workspace = true
 
 [lints]
 workspace = true

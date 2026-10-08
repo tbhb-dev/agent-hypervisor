@@ -2,13 +2,46 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use hypervisor_core::state::{
     AgentState, BlockReason, Harness, HookKind, HookReport, StateMachine,
 };
 use hypervisord::{HookSocket, trimmed_event};
+
+struct HookChild(Option<Child>);
+
+impl HookChild {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn stdin(&mut self) -> &mut Option<std::process::ChildStdin> {
+        &mut self.0.as_mut().unwrap().stdin
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        let result = self.0.as_mut().unwrap().wait();
+        if result.is_ok() {
+            self.0.take();
+        }
+        result
+    }
+
+    fn wait_with_output(mut self) -> std::io::Result<Output> {
+        self.0.take().unwrap().wait_with_output()
+    }
+}
+
+impl Drop for HookChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 fn expected(name: &str) -> AgentState {
     match name {
@@ -84,12 +117,14 @@ fn hook_client_delivers_and_fails_open() {
     let input =
         br#"{"hook_event_name":"PermissionRequest","session_id":"claimed","prompt":"private"}"#;
     let start = Instant::now();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hypervisord"))
-        .args(["hook", "claude", socket.path().to_str().unwrap()])
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(input).unwrap();
+    let mut child = HookChild::new(
+        Command::new(env!("CARGO_BIN_EXE_hypervisord"))
+            .args(["hook", "claude", socket.path().to_str().unwrap()])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    child.stdin().take().unwrap().write_all(input).unwrap();
     let received = socket.receive_one().unwrap();
     assert!(child.wait().unwrap().success());
     assert_eq!(received.kind, HookKind::PermissionRequest);
@@ -98,13 +133,15 @@ fn hook_client_delivers_and_fails_open() {
     println!("live listener: {:?}", start.elapsed());
     let missing = root.join("missing.s");
     let start = Instant::now();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hypervisord"))
-        .args(["hook", "agy", missing.to_str().unwrap(), "PreToolUse"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(input).unwrap();
+    let mut child = HookChild::new(
+        Command::new(env!("CARGO_BIN_EXE_hypervisord"))
+            .args(["hook", "agy", missing.to_str().unwrap(), "PreToolUse"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    child.stdin().take().unwrap().write_all(input).unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"{\"decision\":\"ask\"}\n");
@@ -113,18 +150,37 @@ fn hook_client_delivers_and_fails_open() {
 
     let stalled = HookSocket::bind(&root, "workspace", "stalled").unwrap();
     let start = Instant::now();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hypervisord"))
-        .args(["hook", "claude", stalled.path().to_str().unwrap()])
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(input).unwrap();
+    let mut child = HookChild::new(
+        Command::new(env!("CARGO_BIN_EXE_hypervisord"))
+            .args(["hook", "claude", stalled.path().to_str().unwrap()])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    child.stdin().take().unwrap().write_all(input).unwrap();
     assert!(child.wait().unwrap().success());
     assert!(start.elapsed() < Duration::from_secs(1));
     println!("stalled listener: {:?}", start.elapsed());
     drop(stalled);
     drop(socket);
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_panicking_hook_test_kills_and_reaps_its_child() {
+    let mut pid = None;
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = HookChild::new(Command::new("sleep").arg("30").spawn().unwrap());
+        pid = Some(child.0.as_ref().unwrap().id());
+        panic!("hook test panic");
+    }));
+    assert!(panic.is_err());
+    let status = Command::new("kill")
+        .args(["-0", &pid.unwrap().to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success());
 }
 
 #[test]

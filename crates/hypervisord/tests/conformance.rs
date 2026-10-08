@@ -12,6 +12,7 @@ use hypervisor_core::channel::{
     Capabilities, Control, ControlResult, Encoding, Event, Frame, Mode, OpenRefusal, OpenRequest,
     OpenTarget, WireSignal, WireSize,
 };
+use hypervisor_core::channel_policy::ClientError;
 use hypervisor_core::emulator::Size;
 use hypervisor_core::session::{
     HolderConfig, Persistence, Refusal, RingRead, SessionEvent, SessionKind, SpawnSpec, ViewerId,
@@ -20,7 +21,7 @@ use hypervisor_core::session::{
 use hypervisor_core::state::{AgentState, BlockReason, Harness, HookKind};
 use hypervisor_ghostty::GhosttyEmulator;
 use hypervisor_pty::{PtyError, Spawn, UnixPty, UnixSpawner};
-use hypervisor_session::channel::Channel;
+use hypervisor_session::channel::{Channel, ChannelError};
 use hypervisor_session::{Command, LogContext, SessionHandle, spawn};
 
 #[path = "../../../tests/support/process_group.rs"]
@@ -47,11 +48,16 @@ struct Fixture {
 
 impl Fixture {
     fn start(script: &str) -> Self {
+        Self::start_with_budget(script, HolderConfig::DEFAULT_RING_BUDGET)
+    }
+
+    fn start_with_budget(script: &str, ring_budget: NonZeroUsize) -> Self {
         let size = Size::new(80, 24).unwrap();
         let mut spec = SpawnSpec::new("/bin/sh", size, SessionKind::Shell);
         spec.args = vec!["-c".into(), script.into()];
         spec.env = vec![("PATH".into(), "/bin:/usr/bin".into())];
         let mut config = HolderConfig::new(Persistence::Persistent);
+        config.ring_budget = ring_budget;
         config.retain_exited = Duration::ZERO;
         config.kill_grace = Duration::from_millis(100);
         let group = Arc::new(Mutex::new(None));
@@ -280,6 +286,25 @@ fn terminal_channel_open_input_resize_controls_and_events() {
 }
 
 #[test]
+fn terminal_channel_detached_refuses_output_and_snapshot() {
+    let fixture = Fixture::start("printf 'pid:%s\\nready\\n' \"$$\"; IFS= read -r line");
+    let session = fixture.session();
+    let pgid = fixture_pgid(&wait_for_output(session, "ready"));
+    let (mut channel, _) = Channel::open(session, ViewerId(89), &open_request()).unwrap();
+    channel.receive(Frame::Control(Control::Detach)).unwrap();
+    assert_eq!(
+        channel.next_output(),
+        Err(ChannelError::Client(ClientError::Detached))
+    );
+    assert_eq!(
+        channel.snapshot(),
+        Err(ChannelError::Client(ClientError::Detached))
+    );
+    drop(channel);
+    fixture.finish(pgid);
+}
+
+#[test]
 fn terminal_channel_refuses_unsupported_versions_and_unimplemented_encodings() {
     let fixture = Fixture::start(
         "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; IFS= read -r line",
@@ -297,7 +322,9 @@ fn terminal_channel_refuses_unsupported_versions_and_unimplemented_encodings() {
         Channel::open(session, ViewerId(90), &request).err().is_some_and(|frame| matches!(*frame, Frame::OpenRefused(refused) if refused.reason == OpenRefusal::UnsupportedEncoding))
     );
     request.encoding = Encoding::Bytes;
-    request.resume = Some(hypervisor_core::channel::ResumeToken { next_sequence: 0 });
+    request.resume = Some(hypervisor_core::channel::ResumeToken {
+        next_sequence: u64::MAX,
+    });
     assert!(
         Channel::open(session, ViewerId(90), &request).err().is_some_and(|frame| matches!(*frame, Frame::OpenRefused(refused) if refused.reason == OpenRefusal::InvalidRequest))
     );
@@ -317,6 +344,10 @@ fn terminal_channel_reports_resync_after_viewer_overflow() {
         let Frame::OpenResponse(response) = response else {
             panic!("wrong open response")
         };
+        assert!(matches!(
+            channel.next_output(),
+            Ok(Some(Frame::Snapshot { .. }))
+        ));
         channel.receive(Frame::Control(Control::Take)).unwrap();
         channel.receive(Frame::Input(b"go\n".to_vec())).unwrap();
         let Event::ResyncRequired { oldest } =
@@ -330,11 +361,136 @@ fn terminal_channel_reports_resync_after_viewer_overflow() {
             other => panic!("unexpected ring read: {other:?}"),
         };
         assert_eq!(oldest, retained_oldest);
+        assert_eq!(channel.next_output(), Ok(None));
+        assert!(matches!(channel.snapshot(), Ok(Frame::Snapshot { .. })));
         assert!(matches!(
             session.read_from(response.starting_sequence),
             Some(RingRead::Bytes(bytes)) if !bytes.is_empty()
         ));
     }
+    fixture.finish(pgid);
+}
+
+#[test]
+fn terminal_channel_snapshots_modes_and_streams_sequenced_output() {
+    let fixture = Fixture::start(
+        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf '\\033[?1049h\\033[?25lmode-ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+    );
+    let session = fixture.session();
+    let pgid = fixture_pgid(&wait_for_output(session, "mode-ready"));
+    {
+        let (mut channel, response) =
+            Channel::open(session, ViewerId(84), &open_request()).unwrap();
+        let Frame::OpenResponse(response) = response else {
+            panic!("wrong open response")
+        };
+        let Frame::Snapshot {
+            next_sequence,
+            bytes,
+        } = channel.next_output().unwrap().unwrap()
+        else {
+            panic!("missing snapshot")
+        };
+        assert_eq!(next_sequence, response.starting_sequence);
+        assert!(bytes.windows(8).any(|part| part == b"\x1b[?1049h"));
+        assert!(bytes.windows(6).any(|part| part == b"\x1b[?25l"));
+        assert!(String::from_utf8_lossy(&bytes).contains("mode-ready"));
+        assert_eq!(channel.next_output(), Ok(None));
+        channel.receive(Frame::Control(Control::Take)).unwrap();
+        channel.receive(Frame::Input(b"live\n".to_vec())).unwrap();
+        wait_for_output(session, "got:live");
+        let Frame::Output { sequence, bytes } = channel.next_output().unwrap().unwrap() else {
+            panic!("missing output")
+        };
+        assert_eq!(sequence, next_sequence);
+        assert!(String::from_utf8_lossy(&bytes).contains("got:live"));
+        let encoded = Frame::Output {
+            sequence,
+            bytes: bytes.clone(),
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            Frame::decode(&encoded),
+            Ok(Some((Frame::Output { sequence, bytes }, encoded.len())))
+        );
+    }
+    fixture.finish(pgid);
+}
+
+#[test]
+fn terminal_channel_replays_retained_bytes_and_snapshots_evicted_bytes() {
+    let fixture = Fixture::start_with_budget(
+        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+        NonZeroUsize::new(64).unwrap(),
+    );
+    let session = fixture.session();
+    let pgid = fixture_pgid(&wait_for_output(session, "ready"));
+    session.take(Writer::Program(9)).unwrap();
+    let (mut first, _) = Channel::open(session, ViewerId(85), &open_request()).unwrap();
+    let Frame::Snapshot {
+        next_sequence: resume_at,
+        ..
+    } = first.next_output().unwrap().unwrap()
+    else {
+        panic!("missing snapshot")
+    };
+    drop(first);
+    session
+        .submit(Writer::Program(9), b"away\n".to_vec())
+        .unwrap();
+    wait_for_output(session, "got:away");
+    let mut request = open_request();
+    request.resume = Some(hypervisor_core::channel::ResumeToken {
+        next_sequence: resume_at,
+    });
+    let (mut replay, response) = Channel::open(session, ViewerId(86), &request).unwrap();
+    let Frame::OpenResponse(response) = response else {
+        panic!("wrong open response")
+    };
+    let Frame::Output { sequence, bytes } = replay.next_output().unwrap().unwrap() else {
+        panic!("missing replay")
+    };
+    assert_eq!(sequence, resume_at);
+    assert_eq!(response.starting_sequence, resume_at + bytes.len() as u64);
+    assert!(String::from_utf8_lossy(&bytes).contains("got:away"));
+    assert_eq!(replay.next_output(), Ok(None));
+    drop(replay);
+    request.resume = Some(hypervisor_core::channel::ResumeToken {
+        next_sequence: response.starting_sequence,
+    });
+    let (mut current, _) = Channel::open(session, ViewerId(88), &request).unwrap();
+    assert_eq!(current.next_output(), Ok(None));
+    drop(current);
+    let mut long = vec![b'x'; 100];
+    long.push(b'\n');
+    session.submit(Writer::Program(9), long).unwrap();
+    let start = Instant::now();
+    while !session
+        .snapshot()
+        .is_some_and(|screen| String::from_utf8_lossy(&screen).contains("xxxxxxxxxx"))
+    {
+        assert!(
+            start.elapsed() < WAIT,
+            "long output did not reach the screen"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    request.resume = Some(hypervisor_core::channel::ResumeToken { next_sequence: 0 });
+    let (mut snapshot, response) = Channel::open(session, ViewerId(87), &request).unwrap();
+    let Frame::OpenResponse(response) = response else {
+        panic!("wrong open response")
+    };
+    let Frame::Snapshot {
+        next_sequence,
+        bytes,
+    } = snapshot.next_output().unwrap().unwrap()
+    else {
+        panic!("missing replacement snapshot")
+    };
+    assert_eq!(response.starting_sequence, next_sequence);
+    assert!(String::from_utf8_lossy(&bytes).contains("xxxxxxxxxx"));
+    drop(snapshot);
     fixture.finish(pgid);
 }
 

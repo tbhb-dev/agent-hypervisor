@@ -4,6 +4,40 @@ use crate::channel::{
     Control, Encoding, Frame, Mode, OpenRefusal, OpenRefused, OpenRequest, VERSION, WireSize,
     negotiate,
 };
+use crate::session::RingRead;
+
+/// The first byte frame after an accepted open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ByteStart {
+    Replay(Vec<u8>),
+    Snapshot,
+    Ahead,
+}
+
+/// Choose replay only when every requested byte through the attachment point is retained.
+#[must_use]
+pub fn byte_start(requested: Option<u64>, attached_at: u64, read: Option<RingRead>) -> ByteStart {
+    let Some(sequence) = requested else {
+        return ByteStart::Snapshot;
+    };
+    if sequence > attached_at {
+        return ByteStart::Ahead;
+    }
+    match read {
+        Some(RingRead::Bytes(mut bytes)) => {
+            if let Ok(required) = usize::try_from(attached_at - sequence)
+                && bytes.len() >= required
+            {
+                bytes.truncate(required);
+                ByteStart::Replay(bytes)
+            } else {
+                ByteStart::Snapshot
+            }
+        }
+        Some(RingRead::Gone { .. }) | None => ByteStart::Snapshot,
+        Some(RingRead::Ahead { .. }) => ByteStart::Ahead,
+    }
+}
 
 /// Pure channel admission and client-frame decisions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,8 +70,7 @@ impl ChannelPolicy {
         negotiate(&request.versions)?;
         let reason = if request.encoding != Encoding::Bytes {
             Some(OpenRefusal::UnsupportedEncoding)
-        } else if request.resume.is_some()
-            || request.size.cols == 0
+        } else if request.size.cols == 0
             || request.size.rows == 0
             || request.client.terminal.is_empty()
         {
@@ -140,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_refuses_grid_resume_and_bad_size() {
+    fn policy_refuses_grid_and_bad_size() {
         let mut open = request();
         open.encoding = Encoding::Grid;
         assert_eq!(
@@ -149,10 +182,7 @@ mod tests {
         );
         open.encoding = Encoding::Bytes;
         open.resume = Some(ResumeToken { next_sequence: 0 });
-        assert_eq!(
-            ChannelPolicy::open(&open).unwrap_err().reason,
-            OpenRefusal::InvalidRequest
-        );
+        assert!(ChannelPolicy::open(&open).is_ok());
         open.resume = None;
         open.size.cols = 0;
         assert_eq!(
@@ -161,7 +191,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn byte_start_handles_replay_snapshot_and_future() {
+        assert_eq!(byte_start(None, 5, None), ByteStart::Snapshot);
+        assert_eq!(
+            byte_start(Some(2), 5, Some(RingRead::Bytes(b"cdef".to_vec()))),
+            ByteStart::Replay(b"cde".to_vec())
+        );
+        assert_eq!(
+            byte_start(Some(2), 5, Some(RingRead::Gone { oldest: 3 })),
+            ByteStart::Snapshot
+        );
+        assert_eq!(
+            byte_start(Some(2), 5, Some(RingRead::Bytes(b"cd".to_vec()))),
+            ByteStart::Snapshot
+        );
+        assert_eq!(byte_start(Some(6), 5, None), ByteStart::Ahead);
+    }
+
     proptest! {
+        #[test]
+        fn replay_ends_at_attachment_even_when_read_includes_later_output(
+            sequence in 0u64..1_000_000,
+            before in proptest::collection::vec(any::<u8>(), 0..1000),
+            after in proptest::collection::vec(any::<u8>(), 0..1000),
+        ) {
+            let attached_at = sequence + before.len() as u64;
+            let mut read = before.clone();
+            read.extend_from_slice(&after);
+            prop_assert_eq!(byte_start(Some(sequence), attached_at, Some(RingRead::Bytes(read))), ByteStart::Replay(before));
+        }
+
         #[test]
         fn read_only_policy_never_forwards_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
             let policy = ChannelPolicy::open(&request()).unwrap();

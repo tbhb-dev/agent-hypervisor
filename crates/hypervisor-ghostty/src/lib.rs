@@ -229,18 +229,32 @@ impl GhosttyEmulator {
             }
             let mut raw: sys::GhosttyCell = zeroed();
             sys::ghostty_grid_ref_cell(&raw const gref, &raw mut raw);
-            let mut cps = [0u32; 16];
+            let mut cps = vec![0u32; 16];
             let mut n = 0usize;
-            sys::ghostty_grid_ref_graphemes(
+            let mut rc = sys::ghostty_grid_ref_graphemes(
                 &raw const gref,
                 cps.as_mut_ptr(),
                 cps.len(),
                 &raw mut n,
             );
-            let text: String = cps[..n.min(cps.len())]
-                .iter()
-                .filter_map(|&u| char::from_u32(u))
-                .collect();
+            // A longer grapheme reports its length in `n` and leaves the buffer untouched.
+            if rc == sys::GHOSTTY_OUT_OF_SPACE {
+                cps = vec![0u32; n];
+                rc = sys::ghostty_grid_ref_graphemes(
+                    &raw const gref,
+                    cps.as_mut_ptr(),
+                    cps.len(),
+                    &raw mut n,
+                );
+            }
+            let text: String = if rc == sys::GHOSTTY_SUCCESS {
+                cps[..n.min(cps.len())]
+                    .iter()
+                    .filter_map(|&u| char::from_u32(u))
+                    .collect()
+            } else {
+                String::new()
+            };
             let mut style: sys::GhosttyStyle = zeroed();
             style.size = size_of::<sys::GhosttyStyle>();
             sys::ghostty_grid_ref_style(&raw const gref, &raw mut style);

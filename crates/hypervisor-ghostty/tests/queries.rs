@@ -1,7 +1,7 @@
 //! Query replies, modes, and sizes on small hand-written inputs.
 
 use hypervisor_core::emulator::{
-    Emulator, MouseFormat, MouseTracking, Screen, Size, XTVERSION_NAME,
+    Emulator, MouseFormat, MouseTracking, Screen, Size, XTVERSION_NAME, diff,
 };
 use hypervisor_ghostty::GhosttyEmulator;
 
@@ -78,4 +78,17 @@ fn resize_changes_the_size() {
     emu.resize(size).expect("resize");
     assert_eq!(emu.size(), size);
     assert_eq!(emu.grid().size(), size);
+}
+
+#[test]
+fn a_grapheme_longer_than_sixteen_codepoints_reads_back_whole() {
+    let long = format!("e{}", "\u{301}".repeat(20));
+    let mut emu = GhosttyEmulator::new(Size::new(10, 2).expect("size")).expect("terminal");
+    emu.feed(long.as_bytes());
+    assert_eq!(emu.grid().row(0)[0].text, long);
+    let vt = emu.serialize_vt();
+    assert!(!vt.contains(&0), "serialize_vt sent a NUL byte");
+    let mut redrawn = GhosttyEmulator::new(emu.size()).expect("terminal");
+    redrawn.feed(&vt);
+    assert!(diff(&emu.grid(), &redrawn.grid()).is_empty());
 }

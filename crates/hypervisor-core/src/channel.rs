@@ -867,12 +867,20 @@ mod tests {
             Frame::Resize(WireSize { cols: 0, rows: 24 }).encode(),
             Err(FrameError::InvalidValue)
         );
+        assert_eq!(
+            Frame::Resize(WireSize { cols: 80, rows: 0 }).encode(),
+            Err(FrameError::InvalidValue)
+        );
         let mut bytes = Frame::Resize(WireSize { cols: 80, rows: 24 })
             .encode()
             .unwrap();
         let index = bytes.windows(2).position(|v| v == b"80").unwrap();
         bytes[index..index + 2].copy_from_slice(b" 0");
         assert_eq!(Frame::decode(&bytes), Err(FrameError::InvalidValue));
+        assert_eq!(
+            Frame::decode(&raw_frame(VERSION, 5, r#"{"cols":80,"rows":0}"#)),
+            Err(FrameError::InvalidValue)
+        );
     }
 
     #[test]

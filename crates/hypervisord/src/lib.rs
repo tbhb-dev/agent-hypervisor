@@ -183,7 +183,8 @@ fn peer_ids(stream: &UnixStream) -> io::Result<(u32, u32)> {
         uid: 0,
         gid: 0,
     };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+        .expect("ucred size fits socklen_t");
     // SAFETY: getsockopt writes at most len bytes into the initialized ucred.
     let result = unsafe {
         libc::getsockopt(

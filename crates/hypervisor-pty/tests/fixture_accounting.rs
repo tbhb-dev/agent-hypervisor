@@ -85,7 +85,7 @@ fn concurrent_fixture_records_cannot_hide_a_leak_or_corruption() {
 }
 
 #[test]
-fn a_reaped_leader_is_not_signaled_by_its_guard() {
+fn a_reaped_empty_group_is_not_signaled_by_its_guard() {
     let path = std::env::temp_dir().join(format!("hypervisor-reaped-group-{}", std::process::id()));
     OpenOptions::new()
         .write(true)
@@ -99,5 +99,36 @@ fn a_reaped_leader_is_not_signaled_by_its_guard() {
     assert_eq!(pty.take_waiter().unwrap().wait().unwrap().code, Some(0));
     assert!(!group.kill());
     assert!(!group.kill());
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_reaped_leader_with_a_live_member_is_killed_by_its_guard() {
+    let path = std::env::temp_dir().join(format!("hypervisor-live-member-{}", std::process::id()));
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let mut spec = SpawnSpec::new("/bin/sh", Size::new(80, 24).unwrap(), SessionKind::Shell);
+    spec.args = vec![
+        "-c".into(),
+        "(trap '' HUP; exec sleep 10) & sleep 0.1; kill -KILL $$".into(),
+    ];
+    spec.env = vec![("PATH".into(), "/bin:/usr/bin".into())];
+    let mut pty = UnixSpawner.spawn(&spec).unwrap();
+    let mut group = process_group::ProcessGroup::new_in(pty.pid(), &path);
+    assert_eq!(pty.take_waiter().unwrap().wait().unwrap().signal, Some(9));
+    let result = check(&path);
+    assert!(
+        !result.status.success(),
+        "the live member escaped accounting"
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("still alive"));
+    assert!(group.kill(), "the reaped leader's group was not signaled");
+    assert!(
+        check(&path).status.success(),
+        "the member survived group cleanup"
+    );
     fs::remove_file(path).unwrap();
 }

@@ -35,9 +35,8 @@ impl ProcessGroup {
             return false;
         }
         self.armed = false;
-        // A reaped leader no longer pins the group ID. The suite check catches
-        // any surviving descendants without signaling a potentially reused ID.
-        if process::getpgid(Some(self.pid)) == Ok(self.pid) {
+        // A surviving member pins the group ID even after the leader is reaped.
+        if process::test_kill_process_group(self.pid).is_ok() {
             let _ = process::kill_process_group(self.pid, Signal::KILL);
             return true;
         }

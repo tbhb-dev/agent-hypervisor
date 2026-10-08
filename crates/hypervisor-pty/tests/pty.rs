@@ -126,7 +126,15 @@ fn a_group_signal_reaches_background_jobs_and_the_signal_number_is_kept() {
     );
     let exit = pty.take_waiter().unwrap().wait().unwrap();
     assert_eq!((exit.code, exit.signal), (None, Some(15)));
-    // The post-suite check detects any group member left after the leader is reaped.
+    let group = rustix::process::Pid::from_raw(pty.pid()).unwrap();
+    let start = Instant::now();
+    while rustix::process::test_kill_process_group(group).is_ok() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the group outlived its leader"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

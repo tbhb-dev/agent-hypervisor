@@ -2,8 +2,10 @@
 set -u
 
 groups="$(mktemp)"
-trap 'rm -f "$groups"' EXIT
+jobs="$(mktemp)"
+trap 'rm -f "$groups" "$jobs"' EXIT
 export HYPERVISOR_TEST_GROUPS="$groups"
+export HYPERVISOR_TEST_LAUNCHD="$jobs"
 
 if cargo test --workspace --locked; then
   test_status=0
@@ -22,4 +24,5 @@ if [ "$test_status" -eq 0 ]; then
 fi
 
 bash tests/check-fixture-groups.sh "$groups" || exit 1
+bash tests/check-launchd-jobs.sh "$jobs" || exit 1
 exit "$test_status"

@@ -75,20 +75,36 @@ fn packages(metadata: &Value) -> Result<Vec<Package>, String> {
             let manifest = package["manifest_path"]
                 .as_str()
                 .ok_or("package without a manifest_path")?;
-            let has_clippy_config = Path::new(manifest)
+            let clippy_config = Path::new(manifest)
                 .parent()
-                .is_some_and(|dir| dir.join("clippy.toml").is_file());
+                .and_then(|dir| read_if_present(&dir.join("clippy.toml")));
+            let lib_root = package["targets"].as_array().and_then(|targets| {
+                targets
+                    .iter()
+                    .find(|t| {
+                        t["kind"]
+                            .as_array()
+                            .is_some_and(|k| k.iter().any(|k| k == "lib"))
+                    })
+                    .and_then(|t| t["src_path"].as_str())
+                    .and_then(|path| read_if_present(Path::new(path)))
+            });
             let dependencies = package["dependencies"]
                 .as_array()
                 .map(|deps| deps.iter().filter_map(dependency).collect())
                 .unwrap_or_default();
             Ok(Package {
                 name: name.to_owned(),
-                has_clippy_config,
+                clippy_config,
+                lib_root,
                 dependencies,
             })
         })
         .collect()
+}
+
+fn read_if_present(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
 }
 
 fn dependency(dep: &Value) -> Option<Dependency> {

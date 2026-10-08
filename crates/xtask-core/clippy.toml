@@ -1,6 +1,7 @@
 # Functional core: no I/O. Clippy reads the clippy.toml beside a crate's Cargo.toml, so this file
-# applies to this crate only. Every `-core` crate carries an identical copy; `check:boundary` fails
-# when one is missing. Pass values in from the shell instead of calling any of these.
+# applies to this crate only. Every `-core` crate carries an identical copy. `check:boundary` fails
+# when a copy is missing or lacks a ban listed in `xtask_core::boundary::REQUIRED_BANS`.
+# Pass values in from the shell instead of calling any of these.
 disallowed-methods = [
   # Files
   { path = "std::fs::read", reason = "file I/O belongs in a shell crate" },
@@ -25,6 +26,11 @@ disallowed-methods = [
   { path = "std::path::Path::metadata", reason = "file I/O belongs in a shell crate" },
   { path = "std::path::Path::read_dir", reason = "file I/O belongs in a shell crate" },
   { path = "std::path::Path::canonicalize", reason = "file I/O belongs in a shell crate" },
+  { path = "std::path::Path::is_file", reason = "file I/O belongs in a shell crate" },
+  { path = "std::path::Path::is_dir", reason = "file I/O belongs in a shell crate" },
+  { path = "std::path::Path::try_exists", reason = "file I/O belongs in a shell crate" },
+  { path = "std::path::Path::symlink_metadata", reason = "file I/O belongs in a shell crate" },
+  { path = "std::path::Path::read_link", reason = "file I/O belongs in a shell crate" },
   # Network
   { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "network I/O belongs in a shell crate" },
   { path = "std::net::TcpStream::connect", reason = "network I/O belongs in a shell crate" },
@@ -51,6 +57,8 @@ disallowed-methods = [
   # Clocks
   { path = "std::time::SystemTime::now", reason = "read the clock in the shell and pass the time in" },
   { path = "std::time::Instant::now", reason = "read the clock in the shell and pass the time in" },
+  { path = "std::time::SystemTime::elapsed", reason = "read the clock in the shell and pass the time in" },
+  { path = "std::time::Instant::elapsed", reason = "read the clock in the shell and pass the time in" },
   # Threads
   { path = "std::thread::spawn", reason = "threads belong in a shell crate" },
   { path = "std::thread::scope", reason = "threads belong in a shell crate" },

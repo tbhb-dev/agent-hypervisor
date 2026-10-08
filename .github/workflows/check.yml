@@ -29,6 +29,8 @@ jobs:
   check:
     name: check
     runs-on: ubuntu-latest
+    # A cold run takes about 80 s; the default timeout is 360 minutes.
+    timeout-minutes: 15
     steps:
       # v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -46,4 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         env:
           CARGO_HOME: /home/runner/.local/share/mise/cargo
+        with:
+          # PRs restore main's cache without saving their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise run check

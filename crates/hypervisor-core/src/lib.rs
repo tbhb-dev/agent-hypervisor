@@ -2,7 +2,12 @@
 //!
 //! Decisions and data transformations live here as pure functions. Shell crates such as
 //! `hypervisord` read the world, call into this crate with plain values, and act on the result.
-#![forbid(unsafe_code)]
+#![forbid(
+    unsafe_code,
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
 
 /// Formats the line a binary prints to report its name and version.
 #[must_use]

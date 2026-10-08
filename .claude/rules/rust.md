@@ -2,7 +2,7 @@
 paths: ["**/*.rs", "**/Cargo.toml", "Cargo.lock"]
 ---
 
-Sources are the Rust 1.97 and 1.98 release notes and the Rust 2024 edition guide, read from the pinned 1.98.1 toolchain's `share/doc/rust/html/releases.md` and `share/doc/rust/html/edition-guide/rust-2024/`. Each rule ends with the version that introduced it.
+Sources are the Rust 1.97 and 1.98 release notes and the Rust 2024 edition guide, read from the pinned 1.98.1 toolchain's `share/doc/rust/html/releases.md` and `share/doc/rust/html/edition-guide/rust-2024/`. Each rule ends with the release that introduced the behavior, or with the pinned version it was checked against when the rule is a repository practice.
 
 ## Toolchain and workspace
 
@@ -10,18 +10,18 @@ Sources are the Rust 1.97 and 1.98 release notes and the Rust 2024 edition guide
 - Keep `edition = "2024"`, `resolver = "3"`, and `rust-version = "1.98"` in `[workspace.package]`. Resolver 3 prefers dependency versions whose `rust-version` the workspace satisfies (Rust 2024).
 - Spell `default-features`, `crate-type`, and `proc-macro` with hyphens. The edition rejects the underscore spellings (Rust 2024).
 - Set `default-features` on the `[workspace.dependencies]` entry. A member that inherits a dependency with `workspace = true` cannot turn default features back off (Rust 2024).
-- Pass `--locked` to every build, test, clippy, and run task so a stale `Cargo.lock` fails instead of changing (Cargo 1.97).
+- Pass `--locked` to every build, test, clippy, and run task so a stale `Cargo.lock` fails instead of changing (Cargo 1.98.1).
 
 ## Formatting and lints
 
 - Format with the 2024 style edition, which sorts imports by version. `cargo fmt --all --check` runs in `check` (Rust 2024).
-- Lint with `cargo clippy --workspace --all-targets --locked -- -D warnings`. The workspace turns on `clippy::all` and `clippy::pedantic` at warn. Silence one finding with `#[expect(clippy::name, reason = "...")]`, never a blanket allow (Rust 1.98.1).
+- Lint with `cargo clippy --workspace --all-targets --locked -- -D warnings`. The workspace turns on `clippy::all` and `clippy::pedantic` at warn. Silence one finding with `#[expect(clippy::name, reason = "...")]`, never a blanket allow (Rust 1.81).
 - Give `#[unsafe(no_mangle)]` and `#[unsafe(export_name)]` the same local allow and reason as an `unsafe` block. The `unsafe_code` lint now fires for every unsafe attribute (Rust 1.98).
 - Import names explicitly rather than through overlapping globs. More ambiguous glob imports are now hard errors (Rust 1.98).
 
 ## Unsafe and FFI
 
-- Start every core crate with `#![forbid(unsafe_code)]`. A shell crate that needs unsafe allows `unsafe_code` on the smallest item and puts a `// SAFETY:` comment on every unsafe block (Rust 2024).
+- Start every core crate with `#![forbid(unsafe_code, clippy::disallowed_methods, clippy::disallowed_types, clippy::disallowed_macros)]`. `check:boundary` fails a core crate root without it. A shell crate that needs unsafe allows `unsafe_code` on the smallest item and puts a `// SAFETY:` comment on every unsafe block (Rust 2024).
 - Declare foreign functions in `unsafe extern "C"` blocks and mark each item `safe` or `unsafe` (Rust 2024).
 - Wrap each unsafe operation inside an `unsafe fn` in its own `unsafe` block. The edition warns on `unsafe_op_in_unsafe_fn`, and the workspace denies it (Rust 2024).
 - Set a child's environment through `Command::env`. `std::env::set_var` and `remove_var` are unsafe now (Rust 2024).

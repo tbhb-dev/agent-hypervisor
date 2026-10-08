@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use hypervisor_core::channel::{WireSize, WireSpawnSpec};
 use hypervisor_core::emulator::Size;
+use hypervisor_core::launchd::{self, JobConfig, StartPlan};
 use hypervisor_core::session::{HolderConfig, Persistence, SessionKind, SpawnSpec};
 use hypervisor_core::workload::{
     self, HostDecision, HostRequest as Request, HostResponse as Response, Recovery, StableId,
@@ -46,6 +47,7 @@ pub struct HostDriver {
     root: PathBuf,
     host: String,
     shim_exe: PathBuf,
+    launchd: Option<JobConfig>,
     workloads: BTreeMap<String, Workload>,
 }
 
@@ -55,6 +57,29 @@ impl HostDriver {
     /// # Errors
     /// Invalid registry, metadata, or I/O.
     pub fn open(root: &Path, host: &str, shim_exe: &Path) -> io::Result<Self> {
+        Self::open_with(root, host, shim_exe, None)
+    }
+
+    /// Like [`HostDriver::open`], but `start` registers each shim as a launchd job.
+    ///
+    /// # Errors
+    /// Invalid configuration, registry, metadata, or I/O.
+    pub fn open_launchd(
+        root: &Path,
+        host: &str,
+        shim_exe: &Path,
+        config: JobConfig,
+    ) -> io::Result<Self> {
+        config.validate().map_err(invalid)?;
+        Self::open_with(root, host, shim_exe, Some(config))
+    }
+
+    fn open_with(
+        root: &Path,
+        host: &str,
+        shim_exe: &Path,
+        launchd: Option<JobConfig>,
+    ) -> io::Result<Self> {
         StableId {
             host: host.into(),
             local: "probe".into(),
@@ -71,6 +96,7 @@ impl HostDriver {
             root,
             host: host.into(),
             shim_exe: shim_exe.into(),
+            launchd,
             workloads: BTreeMap::new(),
         };
         for entry in fs::read_dir(&driver.root)? {
@@ -99,8 +125,12 @@ impl HostDriver {
                 Ok(Response::Identity(found)) => Some(found),
                 _ => None,
             };
+            let mut recovery = workload::recovery_identity(&driver.host, &id, found.as_ref());
+            if recovery == Recovery::Running {
+                recovery = workload::adopted(recovery, &driver.events(&id).unwrap_or_default());
+            }
             if let Some(saved) = driver.workloads.get_mut(&id.label()) {
-                saved.recovery = workload::recovery_identity(&driver.host, &id, found.as_ref());
+                saved.recovery = recovery;
             }
         }
         Ok(driver)
@@ -149,6 +179,14 @@ impl HostDriver {
             .ok_or_else(|| invalid("unknown workload"))?;
         let socket_answers = matches!(self.call(id, &Request::Ping), Ok(Response::Identity(_)));
         workload::admit_start(workload.recovery, socket_answers).map_err(invalid)?;
+        // A shim that finds a stale socket reports an unattended restart; this start is attended.
+        match fs::remove_file(self.socket(id)) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        if let Some(config) = self.launchd.clone() {
+            return self.start_launchd(id, &config, workload.recovery);
+        }
         let mut command = ProcessCommand::new(&self.shim_exe);
         command
             .arg("shim")
@@ -191,6 +229,57 @@ impl HostDriver {
         ))
     }
 
+    fn start_launchd(
+        &mut self,
+        id: &StableId,
+        config: &JobConfig,
+        recovery: Recovery,
+    ) -> io::Result<()> {
+        let service = config.service(id);
+        let plan = launchd::start_plan(recovery, false, job_loaded(&service)?).map_err(invalid)?;
+        if plan == StartPlan::BootoutThenBootstrap {
+            launchctl(&["bootout", &service])?;
+        }
+        let plist = self.root.join(format!("{}.plist", label_hash(id)));
+        let metadata = self.metadata(id);
+        let stderr = self.root.join(format!("{}.log", label_hash(id)));
+        let program = [
+            utf8(&self.shim_exe)?,
+            "shim",
+            utf8(&metadata)?,
+            utf8(&self.root)?,
+        ];
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&plist)?;
+        file.write_all(config.plist(id, &program, utf8(&stderr)?).as_bytes())?;
+        launchctl(&["bootstrap", &config.domain(), utf8(&plist)?])?;
+        let started = Instant::now();
+        while started.elapsed() < START_WAIT {
+            if matches!(self.call(id, &Request::Ping), Ok(Response::Identity(found)) if found == *id)
+            {
+                if let Some(saved) = self.workloads.get_mut(&id.label()) {
+                    saved.recovery = Recovery::Running;
+                }
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = launchctl(&["bootout", &service]);
+        Err(io::Error::other(
+            "shim did not complete its identity handshake",
+        ))
+    }
+
+    /// The launchd service target for a workload, when the driver registers shims.
+    #[must_use]
+    pub fn launchd_service(&self, id: &StableId) -> Option<String> {
+        self.launchd.as_ref().map(|config| config.service(id))
+    }
+
     /// Ask a running shim to close its sessions and exit.
     ///
     /// # Errors
@@ -206,6 +295,7 @@ impl HostDriver {
             }
             thread::sleep(Duration::from_millis(10));
         }
+        self.bootout(id)?;
         self.workloads
             .get_mut(&id.label())
             .ok_or_else(|| invalid("unknown workload"))?
@@ -220,6 +310,11 @@ impl HostDriver {
     pub fn destroy(&mut self, id: &StableId) -> io::Result<()> {
         if matches!(self.call(id, &Request::Ping), Ok(Response::Identity(found)) if found == *id) {
             return Err(invalid("stop the workload before destroy"));
+        }
+        self.bootout(id)?;
+        match fs::remove_file(self.root.join(format!("{}.plist", label_hash(id)))) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
         }
         fs::remove_file(self.metadata(id))?;
         self.workloads.remove(&id.label());
@@ -288,6 +383,14 @@ impl HostDriver {
         }
     }
 
+    /// Unload a launchd job whose shim exited, so launchd neither restarts nor keeps it.
+    fn bootout(&self, id: &StableId) -> io::Result<()> {
+        match self.launchd_service(id) {
+            Some(service) if job_loaded(&service)? => launchctl(&["bootout", &service]),
+            _ => Ok(()),
+        }
+    }
+
     fn metadata(&self, id: &StableId) -> PathBuf {
         self.root.join(format!("{}.json", label_hash(id)))
     }
@@ -323,7 +426,8 @@ pub fn serve(metadata: &Path, root: &Path) -> io::Result<()> {
     workload::validate_host(&spec).map_err(invalid)?;
     let socket = root.join(format!("{}.sock", label_hash(&spec.id)));
     // A stale socket from a dead shim is removed only after connection fails.
-    if socket.exists() {
+    let stale = socket.exists();
+    if stale {
         if UnixStream::connect(&socket).is_ok() {
             return Err(invalid("shim already running"));
         }
@@ -332,7 +436,7 @@ pub fn serve(metadata: &Path, root: &Path) -> io::Result<()> {
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, Permissions::from_mode(0o600))?;
     let mut sessions: BTreeMap<String, (StableId, HostedSession)> = BTreeMap::new();
-    let mut events = vec![format!("workload_started:{}", spec.id.label())];
+    let mut events = workload::start_events(&spec.id, stale);
     loop {
         let (mut stream, _) = match listener.accept() {
             Ok(accepted) => accepted,
@@ -474,6 +578,37 @@ fn label_hash(id: &StableId) -> String {
         write!(result, "{byte:02x}").expect("string write");
     }
     result
+}
+
+/// Exit status of `launchctl print` tells whether a job is loaded; its output is not an API.
+fn job_loaded(service: &str) -> io::Result<bool> {
+    Ok(ProcessCommand::new("launchctl")
+        .args(["print", service])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success())
+}
+
+fn launchctl(args: &[&str]) -> io::Result<()> {
+    let output = ProcessCommand::new("launchctl")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "launchctl {} failed with {}: {}",
+        args.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+fn utf8(path: &Path) -> io::Result<&str> {
+    path.to_str()
+        .ok_or_else(|| invalid("launchd paths must be UTF-8"))
 }
 
 fn invalid(message: impl std::fmt::Display) -> io::Error {

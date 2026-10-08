@@ -306,10 +306,6 @@ impl Holder {
             }
             Input::OutputClosed => {
                 self.output_closed = true;
-                if matches!(self.phase, Phase::Exited { .. }) {
-                    // Nothing holds the terminal any more, so a pending group kill has no target.
-                    self.kill_at = None;
-                }
                 if let Some(exit) = self.pending_exit.take() {
                     self.exited(exit, now, &mut fx);
                 }
@@ -400,10 +396,10 @@ impl Holder {
         };
         self.end_at = None;
         self.drain_until = None;
-        // Open output after the leader exits means a group member still holds the terminal. A
-        // close in progress keeps its kill deadline for it; the group ID can't be reused while
-        // the group has members.
-        if self.output_closed {
+        // A close in progress keeps its kill deadline for group members that ignored the
+        // hangup. Closed output doesn't prove they are gone: macOS revokes the terminal when
+        // the session leader exits, so the master reads its end while they still run.
+        if !self.closing {
             self.kill_at = None;
         }
         fx.push(Effect::Emit(SessionEvent::Exited(exit)));

@@ -193,14 +193,30 @@ fn reaping_with_the_terminal_still_open_kills_the_group_first() {
     );
 }
 
+/// macOS revokes the terminal when the leader exits, so output closes while members still run.
 #[test]
-fn output_closing_after_exit_cancels_the_group_kill() {
+fn a_close_kills_the_group_even_after_output_closes() {
     let mut h = running(HolderConfig::new(Persistence::Persistent));
     h.step(Input::Close, ms(0));
     h.step(Input::ChildExited(EXIT), ms(10));
-    h.step(Input::Tick, ms(110));
-    h.step(Input::OutputClosed, ms(120));
-    assert_eq!(h.deadline(), Some(ms(60_110)));
+    assert_eq!(
+        h.step(Input::OutputClosed, ms(20)),
+        vec![Effect::Emit(SessionEvent::Exited(EXIT))]
+    );
+    assert_eq!(h.deadline(), Some(ms(2000)));
+    assert_eq!(h.step(Input::Tick, ms(2000)), vec![KILL]);
+}
+
+#[test]
+fn an_exit_without_a_close_sends_no_kill_once_output_closes() {
+    let mut h = running(HolderConfig::new(Persistence::Persistent));
+    h.step(Input::ChildExited(EXIT), ms(0));
+    h.step(Input::OutputClosed, ms(5));
+    assert_eq!(h.deadline(), Some(ms(60_005)));
+    assert_eq!(
+        h.step(Input::Tick, ms(60_005)),
+        vec![Effect::Release, Effect::Emit(SessionEvent::Reaped)]
+    );
 }
 
 #[test]
@@ -263,6 +279,7 @@ proptest! {
         let mut exited_at = None;
         let mut released = 0;
         let mut output_closed = false;
+        let mut hung_up = false;
         let mut killed_after_exit = false;
         for (input, advance) in steps {
             now += ms(advance);
@@ -273,10 +290,14 @@ proptest! {
                 match effect {
                     Effect::Release => released += 1,
                     Effect::Emit(SessionEvent::Exited(_)) => exited_at = Some(now),
-                    // Only a group member still holding the terminal is signalled after exit.
+                    // After exit, only a close in progress or an open terminal kills the group.
                     &KILL if exited_at.is_some() => {
-                        prop_assert!(!output_closed, "a kill after the terminal closed");
+                        prop_assert!(hung_up || !output_closed, "a kill with no reason");
                         killed_after_exit = true;
+                    }
+                    &HANGUP => {
+                        prop_assert!(exited_at.is_none(), "a hangup after exit");
+                        hung_up = true;
                     }
                     Effect::WritePty(_) | Effect::Signal { .. } | Effect::Interrupt
                     | Effect::ApplySize(_) | Effect::RedrawHint => {

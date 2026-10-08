@@ -234,6 +234,7 @@ dependencies = [
  "hypervisor-core",
  "hypervisor-ghostty",
  "hypervisor-pty",
+ "serde_json",
 ]
 
 [[package]]
@@ -241,6 +242,8 @@ name = "hypervisord"
 version = "0.1.0"
 dependencies = [
  "hypervisor-core",
+ "hypervisor-ghostty",
+ "hypervisor-pty",
  "hypervisor-session",
  "libc",
  "serde_json",

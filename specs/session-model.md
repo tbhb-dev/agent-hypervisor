@@ -1,8 +1,32 @@
 # Session model
 
-Status: stub. Drafted in Phase 1 and stable after Phase 5 of the RFC-36 run plan.
+Status: draft. Drafted in Phase 1 and stable after Phase 5 of the RFC-36 run plan.
 
 This spec covers session kinds, lifecycle, viewers, the write lock, size ownership, and ephemeral versus persistent sessions.
+
+## Phase 1 contract
+
+`hypervisor_session::spawn` starts one actor for one `SpawnSpec`. Its public handle accepts attach, detach, take, release, resize, input, interrupt, hook, snapshot, ring read, subscription, and close requests. The holder decides lifecycle and authorization. The actor stores the PTY and emulator and carries out the effects. A viewer attaches without acquiring the write lock. Only an explicit take grants input and size ownership, and programmatic input competes for that same lock. A slow viewer gets a `Resync` notice and must request a snapshot before live output resumes. The ring's sequence counts bytes, while the event stream's sequence counts events. The stream is local to the actor and has no durable cursor.
+
+The first server-side conformance cases use the public `SessionHandle` on the Unix PTY backend. They cover spawn, attach, detach, byte-offset resume, read-only refusal, write-lock handoff, state events, and exit. A common runtime-driver contract and channel framing arrive in later phases. These cases apply to the Unix driver only.
+
+The caller supplies `LogContext` with workload and session ids when spawning. Every emitted `SessionEvent` produces one JSON line on standard error with those ids, an event sequence and type, and a `channel_id` field. Failed actor effects produce error lines with the same ids and an operation. Viewer attach and detach use `viewer:<id>` as a local Phase 1 channel label. Session-wide events have `channel_id: null` because the terminal channel protocol and its ids are Phase 2 work. The event detail is a debug string with lifecycle, state, size, exit status, or viewer identity. It contains no PTY output or hook payload. The source's full per-channel logging target remains open until channels exist ([#46](https://github.com/tbhb-dev/agent-hypervisor/issues/46)).
+
+## Source and code differences
+
+The RFC-36 source at `tbhb-dev/agent-orchestration-poc.internal` commit `63ab6a891a2d167dfdf1faf6ec497b38996e93fa`, `wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/source.md`, lines 95 to 120 and 310 to 347, describes the Phase 1 target. The draft follows the merged run 9 to 11 code in these cases:
+
+| Source target | Phase 1 code and decision |
+| --- | --- |
+| A ghostty-vt handle is `!Send + !Sync` and one library serves host and guest. | The code agrees on `!Send + !Sync`: the actor creates `GhosttyEmulator` on its own thread. Guest-agent and runtime-driver reuse have not been built. The thread-safety difference is with the earlier run 2 finding, described below, not the source target. |
+| A slow viewer is dropped and told to resync. | The registry clears its pending output and pauses the viewer until a snapshot. It retains the attachment. This draft specifies that behavior. |
+| An ephemeral session ends when the last viewer leaves. | The holder acts only after at least one viewer attached, then applies its configured grace, which defaults to zero. This prevents an unviewed new session from ending immediately. |
+| A read-only viewer cannot send input. | Read-only input is refused until the viewer explicitly takes the lock. Take promotes its mode to read-write. The draft treats take as the authorization transition, while later authorization work must restrict who may invoke it ([#45](https://github.com/tbhb-dev/agent-hypervisor/issues/45)). |
+| A server-side suite applies to any driver. | The first cases use `UnixSpawner` through `SessionHandle`. There is no common driver test adapter yet. |
+| Logs have workload, session, and channel ids on every line. | Emitted session events have workload and session ids. Attach and detach use a provisional viewer label. Session-wide events have a null channel id until Phase 2 framing exists. |
+| The emulator can serialize its screen to VT for viewers. | The merged ghostty adapter builds viewer VT snapshots from grid reads because the native formatter lost cells in the run 2 recordings. Binary ghostty snapshots remain available for server-side copies. |
+
+The run 2 finding proposed a handle that is `Send` but not `Sync`, while the run 7 emulator and run 9 actor use a handle that is neither. The actor construction on its own thread follows the merged code. That code supersedes the thread-safety claim in the earlier finding.
 
 ## Inputs
 
@@ -38,7 +62,7 @@ Persistent sessions don't end when viewers leave. In an ephemeral session, the h
 
 `Exit` keeps the exit code, the number of a killing signal, and the raw wait status. The holder waits up to `exit_drain` (100 ms) after the child exits for the PTY's output to close. The final screen then holds the child's last bytes. The actor answers snapshot requests through `Exited` and answers `None` once `Reaped`.
 
-Closing is a hangup to the leader's process group, then a kill of the group after `kill_grace` (2 s). Both are deadlines in the holder, and no backend call blocks for a grace. A close's kill deadline is kept after the leader's exit and after the end of output. On macOS the kernel revokes the terminal when the session leader exits, and the master then reads its end even though a group member that ignored the hangup is still running (observed with `trap '' HUP` in the actor test). Closed output is not evidence of an empty group. The kill deadline sends `SIGKILL` to that member (verified by a core test and by the actor test). A reap kills the group first when the output is open or a close's kill is pending, which covers a `retain_exited` shorter than `kill_grace`. On Linux the output doesn't close while a member has the slave open, and that kill lets the actor's reader thread read the end and exit. A process that left the group with `setsid` and still has the slave open is not reached, and its reader thread and the master leak (untested).
+Closing is a hangup to the leader's process group, then a kill of the group after `kill_grace` (2 s). Both are deadlines in the holder, and no backend call blocks for a grace. A close's kill deadline is kept after the leader's exit and after the end of output. On macOS the kernel revokes the terminal when the session leader exits, and the master then reads its end even though a group member that ignored the hangup is still running (observed with `trap '' HUP` in the actor test). Closed output is not evidence of an empty group. The kill deadline sends `SIGKILL` to that member (verified by a core test and by the actor test). A reap kills the group first when the output is open or a close's kill is pending, which covers a `retain_exited` shorter than `kill_grace`. On Linux the output doesn't close while a member has the slave open, and that kill lets the actor's reader thread read the end and exit. A process that left the group with `setsid` and still has the slave open is not reached, and its reader thread and the master leak. This remains untested ([#47](https://github.com/tbhb-dev/agent-hypervisor/issues/47)).
 
 Every timeout is a monotonic `Duration` that the actor reads with `Instant` and passes in. Wall time never enters: a resumed guest's clock stepped back by 35.3 s ([RFC-38 run 10, line 16](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/485c37e54cd69d186a4b5eb0909f5bdee822fe1b/wiki/proposals/2026-10-07T2052Z-RFC-38-command-and-control-spikes/findings/r10-pause-and-clocks.md#L16)). The defaults for retention, drain, and kill grace (60 s, 100 ms, and 2 s) are placeholders until Phase 4 sets the resume window.
 
@@ -90,7 +114,7 @@ The emulator runs in the daemon's process. A ghostty-vt crash takes every sessio
 
 On Linux `openpt` sets `O_CLOEXEC` atomically. macOS `posix_openpt` has no such flag. There the backend sets `FD_CLOEXEC` right after it and serializes its own spawns with a process-wide lock. A fork from code outside the backend can still inherit the master in that window.
 
-The tests run on macOS locally and on Linux in CI. A panic on the actor thread, such as the `unreachable!` for an effect it doesn't know, ends the session with no event: subscribers see only the event channel disconnect, and run 12's logs should record it.
+The tests run on macOS locally and on Linux in CI. A panic on the actor thread, such as the `unreachable!` for an effect it doesn't know, ends the session with no event: subscribers see only the event channel disconnect. The Phase 1 event logger cannot produce a session event for that panic. A structured panic record remains untested ([#42](https://github.com/tbhb-dev/agent-hypervisor/issues/42)).
 
 ### Run 9 evidence
 

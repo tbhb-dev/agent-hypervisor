@@ -12,7 +12,7 @@ use hypervisor_core::session::{
 };
 use hypervisor_ghostty::GhosttyEmulator;
 use hypervisor_pty::UnixSpawner;
-use hypervisor_session::{Command, SessionHandle, spawn};
+use hypervisor_session::{Command, LogContext, SessionHandle, spawn};
 
 const VIEWER: ViewerId = ViewerId(1);
 
@@ -38,7 +38,17 @@ fn start(script: &str, config: HolderConfig) -> SessionHandle {
     let mut spec = SpawnSpec::new("/bin/sh", size(80, 24), SessionKind::Shell);
     spec.args = vec!["-c".into(), script.into()];
     spec.env = vec![("PATH".into(), "/bin:/usr/bin".into())];
-    spawn(UnixSpawner, spec, config, GhosttyEmulator::new).unwrap()
+    spawn(
+        UnixSpawner,
+        spec,
+        config,
+        LogContext {
+            workload_id: "actor-test-workload".into(),
+            session_id: "actor-test-session".into(),
+        },
+        GhosttyEmulator::new,
+    )
+    .unwrap()
 }
 
 fn persistent() -> HolderConfig {

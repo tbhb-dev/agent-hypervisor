@@ -146,6 +146,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hypervisor-alacritty"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "hypervisor-core",
+]
+
+[[package]]
 name = "hypervisor-core"
 version = "0.1.0"
 dependencies = [

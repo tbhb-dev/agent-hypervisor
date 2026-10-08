@@ -1,0 +1,16 @@
+[package]
+name = "hypervisor-alacritty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The hypervisor's fallback terminal emulator on alacritty_terminal"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+hypervisor-core.workspace = true
+
+[lints]
+workspace = true

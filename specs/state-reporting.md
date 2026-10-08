@@ -16,7 +16,7 @@ The recorded event tables guide this state mapping. The stacked replay change te
 
 ## Hook schema
 
-Each accepted report has `harness` (`Claude`, `Codex`, or `Agy`), normalized `kind`, source `seq`, and a monotonic `at` supplied by the session actor. The socket listener allocates `seq` in accept order, so independent hook client invocations cannot reset it. A report whose sequence is not greater than the last accepted one is ignored. The planned listener strips prompt text, tool arguments, transcript paths, and model names. It keeps the payload's `session_id` or `conversationId` only as `claimed_session_id` audit metadata beside the peer UID and GID.
+Each accepted report has `harness` (`Claude`, `Codex`, or `Agy`), normalized `kind`, source `seq`, and a monotonic `at` supplied by the session actor. The source must assign `seq` before transport so the state machine can reject reports that arrive late. A report whose sequence is not greater than the last accepted one is ignored. The planned client strips prompt text, tool arguments, transcript paths, and model names. It keeps the payload's `session_id` or `conversationId` only as `claimed_session_id` audit metadata beside the peer UID and GID.
 
 The state values are `Unknown`, `Idle`, `Working`, `Blocked { reason: Approval | Input | Unknown }`, and `Exited`. The holder's own child exit sets `Exited`, even if a hook is silent. Later hook and screen observations leave that state unchanged.
 
@@ -25,12 +25,12 @@ The state values are `Unknown`, `Idle`, `Working`, `Blocked { reason: Approval |
 | Claude | SessionStart, Stop | Idle |
 | Claude | UserPromptSubmit, MessageDisplay, PreToolUse | Working |
 | Claude | PermissionRequest, Notification with `notification_type: permission_prompt` | Blocked, Approval |
-| Claude | SessionEnd | Exited |
+| Claude | SessionEnd | Unknown; `/clear` and `/resume` can end a harness session while the child continues |
 | Codex | SessionStart | No state change: it arrives at the first prompt, not at launch |
 | Codex | UserPromptSubmit, PreToolUse | Working |
 | Codex | PermissionRequest | Blocked, Approval |
 | Codex | Stop, Interrupt | Idle |
-| Codex | SessionEnd | Exited |
+| Codex | SessionEnd | Unknown until the holder observes child exit |
 | agy | PreInvocation, PostInvocation | Working |
 | agy | PreToolUse | Working, then Blocked, Unknown if no later event arrives within 500 ms |
 | agy | Stop with `fullyIdle: true` | Idle |

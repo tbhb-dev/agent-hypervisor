@@ -33,6 +33,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghostty-vt-sys"
+version = "0.1.0"
+
+[[package]]
 name = "hypervisor-core"
 version = "0.1.0"
 dependencies = [

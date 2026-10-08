@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, PoisonError};
 
 use hypervisor_core::emulator::Size;
-use hypervisor_core::session::{Exit, Signal, SpawnSpec, Target};
+use hypervisor_core::session::{Exit, RESTORED_SIGNALS, RestoredSignal, Signal, SpawnSpec, Target};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 #[cfg(not(target_os = "linux"))]
@@ -68,6 +68,30 @@ const fn signal_number(signal: Signal) -> rp::Signal {
 /// own forks out of that window; forks from outside the backend are not covered.
 static SPAWN: Mutex<()> = Mutex::new(());
 
+#[expect(
+    unsafe_code,
+    reason = "restoring signal dispositions requires sigaction"
+)]
+fn restore_signal_dispositions() -> io::Result<()> {
+    // SAFETY: SIG_DFL is a valid disposition and sigaction is async-signal-safe.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        for signal in RESTORED_SIGNALS.map(|signal| match signal {
+            RestoredSignal::Hangup => libc::SIGHUP,
+            RestoredSignal::Interrupt => libc::SIGINT,
+            RestoredSignal::Quit => libc::SIGQUIT,
+            RestoredSignal::Terminate => libc::SIGTERM,
+            RestoredSignal::Pipe => libc::SIGPIPE,
+        }) {
+            if libc::sigaction(signal, &raw const action, std::ptr::null_mut()) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Opens a PTY master that is closed on exec.
 fn open_master() -> io::Result<OwnedFd> {
     #[cfg(target_os = "linux")]
@@ -115,20 +139,15 @@ impl Spawn for UnixSpawner {
         // set above.
         #[expect(
             unsafe_code,
-            reason = "pre_exec sets the controlling terminal and restores SIGHUP in the child"
+            reason = "pre_exec sets the controlling terminal and restores signal defaults"
         )]
         unsafe {
             cmd.pre_exec(|| {
                 rp::setsid()?;
                 rp::ioctl_tiocsctty(BorrowedFd::borrow_raw(0))?;
-                // An ignored SIGHUP survives exec. Restore its default disposition so a
-                // session spawned by a supervisor that ignores HUP can still be hung up.
-                let mut action: libc::sigaction = std::mem::zeroed();
-                action.sa_sigaction = libc::SIG_DFL;
-                if libc::sigaction(libc::SIGHUP, &raw const action, std::ptr::null_mut()) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
+                // Ignored dispositions survive exec. A session must receive terminal and
+                // lifecycle signals even if its supervisor ignored them.
+                restore_signal_dispositions()
             });
         }
         let child = cmd.spawn()?;
@@ -238,5 +257,48 @@ impl Pty for UnixPty {
             backend_queries: &[],
             resize_repaints: false,
         }
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/support/process_group.rs"]
+mod process_group;
+
+#[cfg(test)]
+mod signal_tests {
+    use super::process_group;
+    use super::restore_signal_dispositions;
+    use std::os::unix::process::CommandExt;
+
+    #[test]
+    #[expect(unsafe_code, reason = "the test queries its own SIGPIPE disposition")]
+    fn restores_ignored_sigpipe() {
+        const TEST: &str = "unix::signal_tests::restores_ignored_sigpipe";
+        if std::env::var_os("HYPERVISOR_TEST_RESTORE_SIGPIPE").is_some() {
+            // Rust's test process ignores SIGPIPE, so exercise the helper directly here.
+            // SAFETY: a null new action only queries this process's disposition.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &raw mut action) },
+                0
+            );
+            assert_eq!(action.sa_sigaction, libc::SIG_IGN);
+            restore_signal_dispositions().unwrap();
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &raw mut action) },
+                0
+            );
+            assert_eq!(action.sa_sigaction, libc::SIG_DFL);
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST])
+            .env("HYPERVISOR_TEST_RESTORE_SIGPIPE", "1")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let _group = process_group::ProcessGroup::new(child.id().cast_signed());
+        assert!(child.wait().unwrap().success());
     }
 }

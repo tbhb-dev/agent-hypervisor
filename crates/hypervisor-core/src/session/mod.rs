@@ -37,6 +37,30 @@ pub struct Exit {
     pub raw: Option<u32>,
 }
 
+/// Signals whose default dispositions a spawned session needs, even if its supervisor ignores them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoredSignal {
+    /// `SIGHUP`.
+    Hangup,
+    /// `SIGINT`.
+    Interrupt,
+    /// `SIGQUIT`.
+    Quit,
+    /// `SIGTERM`.
+    Terminate,
+    /// `SIGPIPE`.
+    Pipe,
+}
+
+/// The dispositions the Unix shell restores in the child before exec.
+pub const RESTORED_SIGNALS: [RestoredSignal; 5] = [
+    RestoredSignal::Hangup,
+    RestoredSignal::Interrupt,
+    RestoredSignal::Quit,
+    RestoredSignal::Terminate,
+    RestoredSignal::Pipe,
+];
+
 /// A signal the holder can send. The backend maps it to the platform's number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Signal {

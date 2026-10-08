@@ -155,6 +155,54 @@ fn a_persistent_session_survives_its_viewers() {
     assert_eq!(h.deadline(), None);
 }
 
+const KILL: Effect = Effect::Signal {
+    signal: Signal::Kill,
+    target: Target::Group,
+};
+
+/// A group member that ignores the hangup keeps the terminal open after the leader exits.
+#[test]
+fn close_kills_the_group_after_the_leader_exits() {
+    let mut h = running(HolderConfig::new(Persistence::Persistent));
+    assert_eq!(h.step(Input::Close, ms(0)), vec![HANGUP]);
+    assert_eq!(h.step(Input::ChildExited(EXIT), ms(10)), vec![]);
+    assert_eq!(
+        h.step(Input::Tick, ms(110)),
+        vec![Effect::Emit(SessionEvent::Exited(EXIT))]
+    );
+    assert_eq!(h.deadline(), Some(ms(2000)));
+    assert_eq!(h.step(Input::Tick, ms(1999)), vec![]);
+    assert_eq!(h.step(Input::Tick, ms(2000)), vec![KILL]);
+    assert_eq!(h.step(Input::OutputClosed, ms(2001)), vec![]);
+    assert_eq!(
+        h.step(Input::Tick, ms(60_110)),
+        vec![Effect::Release, Effect::Emit(SessionEvent::Reaped)]
+    );
+}
+
+#[test]
+fn reaping_with_the_terminal_still_open_kills_the_group_first() {
+    let mut config = HolderConfig::new(Persistence::Persistent);
+    config.retain_exited = ms(50);
+    let mut h = running(config);
+    h.step(Input::ChildExited(EXIT), ms(0));
+    h.step(Input::Tick, ms(100));
+    assert_eq!(
+        h.step(Input::Tick, ms(150)),
+        vec![KILL, Effect::Release, Effect::Emit(SessionEvent::Reaped)]
+    );
+}
+
+#[test]
+fn output_closing_after_exit_cancels_the_group_kill() {
+    let mut h = running(HolderConfig::new(Persistence::Persistent));
+    h.step(Input::Close, ms(0));
+    h.step(Input::ChildExited(EXIT), ms(10));
+    h.step(Input::Tick, ms(110));
+    h.step(Input::OutputClosed, ms(120));
+    assert_eq!(h.deadline(), Some(ms(60_110)));
+}
+
 #[test]
 fn close_hangs_up_once() {
     let mut h = running(HolderConfig::new(Persistence::Persistent));
@@ -214,14 +262,22 @@ proptest! {
         let mut now = Duration::ZERO;
         let mut exited_at = None;
         let mut released = 0;
+        let mut output_closed = false;
+        let mut killed_after_exit = false;
         for (input, advance) in steps {
             now += ms(advance);
+            output_closed |= input == Input::OutputClosed;
             let fx = h.step(input, now);
             prop_assert!(h.deadline().is_none_or(|d| d > now));
             for effect in &fx {
                 match effect {
                     Effect::Release => released += 1,
                     Effect::Emit(SessionEvent::Exited(_)) => exited_at = Some(now),
+                    // Only a group member still holding the terminal is signalled after exit.
+                    &KILL if exited_at.is_some() => {
+                        prop_assert!(!output_closed, "a kill after the terminal closed");
+                        killed_after_exit = true;
+                    }
                     Effect::WritePty(_) | Effect::Signal { .. } | Effect::Interrupt
                     | Effect::ApplySize(_) | Effect::RedrawHint => {
                         prop_assert!(exited_at.is_none(), "{effect:?} after exit");
@@ -234,6 +290,7 @@ proptest! {
                 prop_assert_eq!(fx.last(), Some(&Effect::Emit(SessionEvent::Reaped)));
                 let at = exited_at.unwrap();
                 prop_assert!(now >= at + config.retain_exited);
+                prop_assert!(output_closed || killed_after_exit, "released with the group alive");
                 prop_assert!(h.step(Input::Output(b"x".to_vec()), now).is_empty());
                 break;
             }

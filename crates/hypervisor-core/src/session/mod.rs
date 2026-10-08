@@ -177,6 +177,8 @@ pub enum Input {
     Submit(Writer, Vec<u8>),
     /// Interrupt from the lock holder.
     Interrupt(Writer),
+    /// Signal the foreground group from the lock holder.
+    SendSignal(Writer, Signal),
     /// End the session: hang up, then kill the group after the grace.
     Close,
     /// A deadline from [`Holder::deadline`] passed.
@@ -250,6 +252,12 @@ pub enum SessionEvent {
     Running,
     /// The session took a new size.
     Resized(Size),
+    /// A viewer was promoted to write mode.
+    ModeChanged { viewer: ViewerId, mode: ViewerMode },
+    /// The write lock changed hands or was released.
+    WriterChanged(Option<Writer>),
+    /// A viewer's bounded output queue overflowed.
+    ResyncRequired { viewer: ViewerId, oldest: u64 },
     /// The child exited.
     Exited(Exit),
     /// The session is gone.
@@ -438,21 +446,13 @@ impl Holder {
                 }
                 Err(reason) => fx.push(Effect::Refused(reason)),
             },
-            Input::Detach(viewer) => match self.registry.detach(viewer) {
-                Ok(()) => {
-                    self.viewers_changed(self.registry.len(), now);
-                    fx.push(Effect::ViewerDetached(viewer));
-                }
-                Err(reason) => fx.push(Effect::Refused(reason)),
-            },
-            Input::Take(who) => match self.registry.take(who) {
-                Ok(Some(size)) if running => self.size.request(size),
-                Ok(_) => {}
-                Err(reason) => fx.push(Effect::Refused(reason)),
-            },
+            Input::Detach(viewer) => self.detach_viewer(viewer, now, &mut fx),
+            Input::Take(who) => self.take_writer(who, running, &mut fx),
             Input::ReleaseWriter(who) => {
                 if let Err(reason) = self.registry.release(who) {
                     fx.push(Effect::Refused(reason));
+                } else {
+                    fx.push(Effect::Emit(SessionEvent::WriterChanged(None)));
                 }
             }
             Input::ViewerResize(viewer, size) => match self.registry.resize(viewer, size) {
@@ -463,6 +463,14 @@ impl Holder {
             Input::Submit(who, bytes) => self.submit(who, &bytes, accepts_input, now, &mut fx),
             Input::Interrupt(who) => match self.registry.check_input(who) {
                 Ok(()) if accepts_input => fx.push(Effect::Interrupt),
+                Ok(()) => {}
+                Err(reason) => fx.push(Effect::Refused(reason)),
+            },
+            Input::SendSignal(who, signal) => match self.registry.check_input(who) {
+                Ok(()) if accepts_input => fx.push(Effect::Signal {
+                    signal,
+                    target: Target::Foreground,
+                }),
                 Ok(()) => {}
                 Err(reason) => fx.push(Effect::Refused(reason)),
             },
@@ -477,6 +485,47 @@ impl Holder {
         }
         self.fire_due(now, &mut fx);
         fx
+    }
+
+    fn detach_viewer(&mut self, viewer: ViewerId, now: Duration, fx: &mut Vec<Effect>) {
+        let was_writer = self.registry.writer() == Some(Writer::Viewer(viewer));
+        match self.registry.detach(viewer) {
+            Ok(()) => {
+                self.viewers_changed(self.registry.len(), now);
+                fx.push(Effect::ViewerDetached(viewer));
+                if was_writer {
+                    fx.push(Effect::Emit(SessionEvent::WriterChanged(None)));
+                }
+            }
+            Err(reason) => fx.push(Effect::Refused(reason)),
+        }
+    }
+
+    fn take_writer(&mut self, who: Writer, running: bool, fx: &mut Vec<Effect>) {
+        let prior = self.registry.writer();
+        let old_mode = match who {
+            Writer::Viewer(id) => self.registry.mode(id),
+            Writer::Program(_) => None,
+        };
+        match self.registry.take(who) {
+            Ok(size) => {
+                if running && let Some(size) = size {
+                    self.size.request(size);
+                }
+                if let Writer::Viewer(id) = who
+                    && old_mode == Some(ViewerMode::ReadOnly)
+                {
+                    fx.push(Effect::Emit(SessionEvent::ModeChanged {
+                        viewer: id,
+                        mode: ViewerMode::ReadWrite,
+                    }));
+                }
+                if prior != Some(who) {
+                    fx.push(Effect::Emit(SessionEvent::WriterChanged(Some(who))));
+                }
+            }
+            Err(reason) => fx.push(Effect::Refused(reason)),
+        }
     }
 
     fn state_effect(fx: &mut Vec<Effect>, from: AgentState, to: Option<AgentState>) {

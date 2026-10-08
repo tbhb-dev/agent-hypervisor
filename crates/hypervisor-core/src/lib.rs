@@ -10,6 +10,7 @@
 )]
 
 pub mod attenuation;
+pub mod channel;
 pub mod emulator;
 pub mod screen;
 pub mod session;

@@ -179,7 +179,15 @@ fn a_same_size_take_requests_a_redraw_hint() {
     );
     assert_eq!(
         h.step(Input::Take(Writer::Viewer(ViewerId(1))), ms(1)),
-        vec![]
+        vec![
+            Effect::Emit(SessionEvent::ModeChanged {
+                viewer: ViewerId(1),
+                mode: ViewerMode::ReadWrite
+            }),
+            Effect::Emit(SessionEvent::WriterChanged(Some(Writer::Viewer(ViewerId(
+                1
+            ))))),
+        ]
     );
     assert_eq!(h.step(Input::Settle, ms(1)), vec![Effect::RedrawHint]);
 }

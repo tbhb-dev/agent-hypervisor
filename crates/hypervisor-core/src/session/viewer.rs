@@ -88,6 +88,12 @@ impl ViewerRegistry {
         self.writer
     }
 
+    /// An attached viewer's current mode.
+    #[must_use]
+    pub fn mode(&self, id: ViewerId) -> Option<ViewerMode> {
+        self.viewers.get(&id).map(|viewer| viewer.mode)
+    }
+
     /// Attach one viewer without taking the lock.
     ///
     /// # Errors

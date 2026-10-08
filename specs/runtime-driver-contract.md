@@ -32,6 +32,8 @@ Test labels start with `dev.tbhb.hypervisor.test.owner-<pid>-`, which records th
 
 Three more macOS-only tests cover survival. A separate daemon process adopts a launchd shim and its session. A daemon binary swapped by rename adopts the same shim PID, whose job still names its pinned program. A shim killed with `SIGKILL` is restarted by launchd and reported as restarted with no sessions.
 
+The launchd integration tests require `launchctl bootstrap`, which returns status 5 inside the Codex worker sandbox. `mise run check` keeps them in the test binary as visibly ignored cases and prints a notice that they did not run. `mise run check:host` runs all cases, including the child-run cleanup cases, on an unsandboxed macOS host and checks for surviving fixture groups and jobs. Before merge, the reviewer records a passing host run at the PR's current head SHA and names the host. The Linux CI `check` cannot establish launchd behavior. An unavailable or failing host run blocks merge ([#107](https://github.com/tbhb-dev/agent-hypervisor/issues/107)).
+
 ## Source and merged-code differences
 
 The source is `tbhb-dev/agent-orchestration-poc.internal` commit `27a69f821634b71243ac76e837ca322f34ef68cb`, `wiki/proposals/2026-10-07T1944Z-RFC-36-agent-hypervisor-attach/source.md`, lines 29 to 34, 95 to 120, 157 to 173, and 343. The run table in the proposal at that commit assigns launchd registration to run 18. Run 18 reads source line 172 and proposal line 115 at commit `817c486df13414cd4b223f3aaa49251b1abd0837`, under operator decision ADR-221.

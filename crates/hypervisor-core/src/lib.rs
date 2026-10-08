@@ -17,6 +17,7 @@ pub mod grid_channel;
 pub mod screen;
 pub mod session;
 pub mod state;
+pub mod terminal_transport;
 
 /// Formats the line a binary prints to report its name and version.
 #[must_use]

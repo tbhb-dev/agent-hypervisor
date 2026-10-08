@@ -10,17 +10,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hypervisor_core::channel::{
-    Encoding, Event, Frame, MAX_FRAME, OpenRefusal, OpenRefused, OpenTarget, VERSION,
-};
+use hypervisor_core::channel::{Encoding, Frame, MAX_FRAME, OpenRefusal, OpenRefused, VERSION};
 use hypervisor_core::session::ViewerId;
+use hypervisor_core::terminal_transport::{self, AfterEvent};
 use hypervisor_session::SessionHandle;
 use hypervisor_session::channel::Channel;
 
 use crate::{MAX_SOCKET_PATH, peer_ids, short_hash};
 
 const TICK: Duration = Duration::from_millis(10);
-const MAX_PENDING: usize = 2 * (MAX_FRAME + 4);
 
 /// A listener whose path selects one session. `allowed_uid` is the local principal
 /// allowed to connect; peer IDs are connection audit fields, not byte attribution.
@@ -72,7 +70,7 @@ impl TerminalSocket {
     /// session lifetime and supplies the local principal permitted at this path.
     ///
     /// # Errors
-    /// If accepting or reading a peer credential fails.
+    /// If accepting a connection fails.
     pub fn serve_until(&self, session: &SessionHandle, stop: &AtomicBool) -> io::Result<()> {
         let start = Instant::now();
         let mut clients = Vec::new();
@@ -81,16 +79,22 @@ impl TerminalSocket {
             loop {
                 match self.listener.accept() {
                     Ok((stream, _)) => {
-                        let (uid, gid) = peer_ids(&stream)?;
+                        let (uid, gid) = match peer_ids(&stream) {
+                            Ok(ids) => ids,
+                            Err(error) => {
+                                eprintln!("terminal peer credential lookup failed: {error}");
+                                continue;
+                            }
+                        };
                         eprintln!(
                             "terminal peer session={} viewer={} uid={} gid={} accepted={}",
                             self.session_id,
                             next_viewer,
                             uid,
                             gid,
-                            uid == self.allowed_uid
+                            terminal_transport::admit_peer(uid, self.allowed_uid)
                         );
-                        if uid != self.allowed_uid {
+                        if !terminal_transport::admit_peer(uid, self.allowed_uid) {
                             continue;
                         }
                         stream.set_nonblocking(true)?;
@@ -180,11 +184,17 @@ impl<'a> Client<'a> {
             && !self.close_after_flush
         {
             if let Some(frame) = channel.next_event() {
-                let resync = matches!(frame, Frame::Event(Event::ResyncRequired { .. }));
+                let action = match &frame {
+                    Frame::Event(event) => terminal_transport::after_event(
+                        event,
+                        self.encoding.expect("an open channel has an encoding"),
+                    ),
+                    _ => AfterEvent::Continue,
+                };
                 if !self.queue(&frame) {
                     return false;
                 }
-                if resync && self.encoding == Some(Encoding::Bytes) {
+                if action == AfterEvent::ByteSnapshot {
                     let Some(channel) = self.channel.as_mut() else {
                         return false;
                     };
@@ -246,7 +256,7 @@ impl<'a> Client<'a> {
                 Err(_) => false,
             }
         } else if let Frame::OpenRequest(request) = frame {
-            if !matches!(&request.target, OpenTarget::Session(id) if id == session_id) {
+            if !terminal_transport::targets_session(&request.target, session_id) {
                 self.close_after_flush = true;
                 return self.queue(&refusal(OpenRefusal::UnknownTarget));
             }
@@ -274,7 +284,7 @@ impl<'a> Client<'a> {
             self.outgoing.drain(..self.written);
             self.written = 0;
         }
-        if self.outgoing.len() - self.written + bytes.len() > MAX_PENDING {
+        if !terminal_transport::queue_admits(self.outgoing.len(), bytes.len()) {
             return false;
         }
         self.outgoing.extend(bytes);

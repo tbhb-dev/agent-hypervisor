@@ -6,7 +6,9 @@
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -193,6 +195,23 @@ struct ServerRun {
     thread: Option<thread::JoinHandle<std::io::Result<()>>>,
 }
 
+struct SocketRoot(std::path::PathBuf);
+
+impl SocketRoot {
+    fn new(tag: &str) -> Self {
+        Self(std::path::PathBuf::from(format!(
+            "/tmp/hv16{tag}-{}",
+            std::process::id()
+        )))
+    }
+}
+
+impl Drop for SocketRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 impl ServerRun {
     fn finish(mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -257,9 +276,9 @@ fn terminal_socket_accepts_local_peer_and_serves_byte_and_grid_viewers() {
         "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
     );
     let pgid = fixture_pgid(&wait_for_output(fixture.session(), "ready"));
-    let root = std::path::PathBuf::from(format!("/tmp/hv16a-{}", std::process::id()));
+    let root = SocketRoot::new("a");
     let uid = rustix::process::geteuid().as_raw();
-    let (server, path) = serve_fixture(&mut fixture, &root, uid);
+    let (server, path) = serve_fixture(&mut fixture, &root.0, uid);
     let mut wrong = UnixStream::connect(&path).unwrap();
     wrong.set_read_timeout(Some(WAIT)).unwrap();
     let mut request = open_request();
@@ -320,23 +339,116 @@ fn terminal_socket_accepts_local_peer_and_serves_byte_and_grid_viewers() {
     }
     server.finish();
     fixture.finish(pgid);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn terminal_socket_refuses_peer_with_unlisted_uid() {
     let mut fixture = Fixture::start("printf 'pid:%s\\nready\\n' \"$$\"; IFS= read -r line");
     let pgid = fixture_pgid(&wait_for_output(fixture.session(), "ready"));
-    let root = std::path::PathBuf::from(format!("/tmp/hv16r-{}", std::process::id()));
+    let root = SocketRoot::new("r");
     let uid = rustix::process::geteuid().as_raw();
-    let (server, path) = serve_fixture(&mut fixture, &root, uid.wrapping_add(1));
+    let (server, path) = serve_fixture(&mut fixture, &root.0, uid.wrapping_add(1));
     let mut stream = UnixStream::connect(path).unwrap();
     stream.set_read_timeout(Some(WAIT)).unwrap();
     let mut byte = [0];
     assert_eq!(stream.read(&mut byte).unwrap(), 0);
     server.finish();
     fixture.finish(pgid);
-    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn terminal_socket_replaces_byte_snapshot_after_resync() {
+    let mut fixture = Fixture::start(
+        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; IFS= read -r line; i=0; while [ $i -lt 70 ]; do printf '%1024s' x; i=$((i+1)); done; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+    );
+    let pgid = fixture_pgid(&wait_for_output(fixture.session(), "ready"));
+    let root = SocketRoot::new("s");
+    let uid = rustix::process::geteuid().as_raw();
+    let (server, path) = serve_fixture(&mut fixture, &root.0, uid);
+    let mut stream = UnixStream::connect(path).unwrap();
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    wire_send(&mut stream, &Frame::OpenRequest(open_request()));
+    assert!(matches!(wire_frame(&mut stream), Frame::OpenResponse(_)));
+    assert!(matches!(wire_frame(&mut stream), Frame::Snapshot { .. }));
+    wire_send(&mut stream, &Frame::Control(Control::Take));
+    wire_send(&mut stream, &Frame::Input(b"go\n".to_vec()));
+    let mut saw_resync = false;
+    let mut next_sequence = None;
+    for _ in 0..100 {
+        match wire_frame(&mut stream) {
+            Frame::Event(Event::ResyncRequired { .. }) => saw_resync = true,
+            Frame::Snapshot {
+                next_sequence: next,
+                ..
+            } if saw_resync => {
+                next_sequence = Some(next);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let next_sequence = next_sequence.expect("resync notice must be followed by a snapshot");
+    wire_send(&mut stream, &Frame::Input(b"after-resync\n".to_vec()));
+    let mut found = false;
+    for _ in 0..100 {
+        if let Frame::Output { sequence, bytes } = wire_frame(&mut stream) {
+            assert_eq!(sequence, next_sequence);
+            if String::from_utf8_lossy(&bytes).contains("got:after-resync") {
+                found = true;
+                break;
+            }
+        }
+    }
+    assert!(found, "live output must continue at the snapshot sequence");
+    server.finish();
+    fixture.finish(pgid);
+}
+
+#[test]
+fn terminal_debug_prints_frames_and_replays_raw_input() {
+    let mut fixture = Fixture::start(
+        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+    );
+    let pgid = fixture_pgid(&wait_for_output(fixture.session(), "ready"));
+    let root = SocketRoot::new("d");
+    let input = root.0.join("input.raw");
+    std::fs::create_dir_all(&root.0).unwrap();
+    std::fs::write(&input, b"debug-client\n").unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    let (server, path) = serve_fixture(&mut fixture, &root.0, uid);
+    let child = ProcessCommand::new(env!("CARGO_BIN_EXE_terminal-debug"))
+        .arg(&path)
+        .arg("conformance-session")
+        .arg(&input)
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child_group = process_group::ProcessGroup::new(i32::try_from(child.id()).unwrap());
+    let mut observer = UnixStream::connect(&path).unwrap();
+    observer.set_read_timeout(Some(WAIT)).unwrap();
+    wire_send(&mut observer, &Frame::OpenRequest(open_request()));
+    assert!(matches!(wire_frame(&mut observer), Frame::OpenResponse(_)));
+    assert!(matches!(wire_frame(&mut observer), Frame::Snapshot { .. }));
+    let mut saw_replay = false;
+    for _ in 0..30 {
+        if let Frame::Output { bytes, .. } = wire_frame(&mut observer)
+            && String::from_utf8_lossy(&bytes).contains("got:debug-client")
+        {
+            saw_replay = true;
+            break;
+        }
+    }
+    assert!(saw_replay, "debug client must replay its raw file");
+    thread::sleep(Duration::from_millis(30));
+    server.finish();
+    let result = child.wait_with_output().unwrap();
+    assert!(result.status.success());
+    let printed = String::from_utf8(result.stdout).unwrap();
+    assert!(printed.contains("OpenResponse"));
+    assert!(printed.contains("got:debug-client"));
+    let _ = child_group.kill();
+    fixture.finish(pgid);
 }
 
 fn channel_event(channel: &Channel<'_>, wanted: impl Fn(&Event) -> bool) -> Event {

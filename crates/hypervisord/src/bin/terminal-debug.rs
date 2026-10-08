@@ -15,14 +15,14 @@ fn main() -> io::Result<()> {
     let (Some(socket), Some(session)) = (args.next(), args.next()) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: terminal-debug SOCKET SESSION [RAW-INPUT-FILE]",
+            "throwaway debug tool; usage: terminal-debug SOCKET SESSION [RAW-INPUT-FILE]",
         ));
     };
     let recording = args.next();
     if args.next().is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "too many arguments",
+            "throwaway debug tool: too many arguments",
         ));
     }
     let mut stream = UnixStream::connect(socket)?;
@@ -57,10 +57,17 @@ fn main() -> io::Result<()> {
     }
     loop {
         match read_frame(&mut stream) {
-            Ok(frame) => println!("{frame:?}"),
+            Ok(frame) => print_frame(&frame),
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn print_frame(frame: &Frame) {
+    println!("{frame:?}");
+    if let Frame::Output { bytes, .. } = frame {
+        println!("output text: {:?}", String::from_utf8_lossy(bytes));
     }
 }
 

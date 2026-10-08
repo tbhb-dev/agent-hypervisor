@@ -428,10 +428,11 @@ impl Holder {
             && reap_at <= now
         {
             self.phase = Phase::Reaped;
-            self.kill_at = None;
-            if !self.output_closed {
-                // A group member still holds the terminal. Kill the group so the slave closes,
-                // the PTY's reader sees the end, and releasing the PTY frees it.
+            let close_pending = self.kill_at.take().is_some();
+            if !self.output_closed || close_pending {
+                // A group member may still run: one holds the terminal, or a close hasn't sent
+                // its kill yet. Kill the group so the slave closes, the PTY's reader sees the
+                // end, and releasing the PTY frees it.
                 fx.push(Effect::Signal {
                     signal: Signal::Kill,
                     target: Target::Group,

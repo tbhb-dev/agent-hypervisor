@@ -208,6 +208,20 @@ fn a_close_kills_the_group_even_after_output_closes() {
 }
 
 #[test]
+fn a_reap_before_the_kill_grace_still_kills_the_group() {
+    let mut config = HolderConfig::new(Persistence::Persistent);
+    config.retain_exited = ms(100);
+    let mut h = running(config);
+    h.step(Input::Close, ms(0));
+    h.step(Input::ChildExited(EXIT), ms(10));
+    h.step(Input::OutputClosed, ms(20));
+    assert_eq!(
+        h.step(Input::Tick, ms(120)),
+        vec![KILL, Effect::Release, Effect::Emit(SessionEvent::Reaped)]
+    );
+}
+
+#[test]
 fn an_exit_without_a_close_sends_no_kill_once_output_closes() {
     let mut h = running(HolderConfig::new(Persistence::Persistent));
     h.step(Input::ChildExited(EXIT), ms(0));
@@ -280,7 +294,7 @@ proptest! {
         let mut released = 0;
         let mut output_closed = false;
         let mut hung_up = false;
-        let mut killed_after_exit = false;
+        let mut killed = false;
         for (input, advance) in steps {
             now += ms(advance);
             output_closed |= input == Input::OutputClosed;
@@ -293,8 +307,9 @@ proptest! {
                     // After exit, only a close in progress or an open terminal kills the group.
                     &KILL if exited_at.is_some() => {
                         prop_assert!(hung_up || !output_closed, "a kill with no reason");
-                        killed_after_exit = true;
+                        killed = true;
                     }
+                    &KILL => killed = true,
                     &HANGUP => {
                         prop_assert!(exited_at.is_none(), "a hangup after exit");
                         hung_up = true;
@@ -311,7 +326,10 @@ proptest! {
                 prop_assert_eq!(fx.last(), Some(&Effect::Emit(SessionEvent::Reaped)));
                 let at = exited_at.unwrap();
                 prop_assert!(now >= at + config.retain_exited);
-                prop_assert!(output_closed || killed_after_exit, "released with the group alive");
+                prop_assert!(
+                    (output_closed && !hung_up) || killed,
+                    "released with the group possibly alive"
+                );
                 prop_assert!(h.step(Input::Output(b"x".to_vec()), now).is_empty());
                 break;
             }

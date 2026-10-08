@@ -2,6 +2,8 @@
 
 use std::fmt::Write;
 use std::num::NonZeroUsize;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,8 +13,42 @@ use hypervisor_core::session::{
     ViewerId, ViewerMode, ViewerRead, Writer,
 };
 use hypervisor_ghostty::GhosttyEmulator;
-use hypervisor_pty::UnixSpawner;
+use hypervisor_pty::{PtyError, Spawn, UnixPty, UnixSpawner};
 use hypervisor_session::{Command, SessionHandle, spawn};
+
+#[path = "../../../tests/support/process_group.rs"]
+mod process_group;
+
+struct FixtureSpawner(Arc<Mutex<Option<process_group::ProcessGroup>>>);
+
+impl Spawn for FixtureSpawner {
+    type Pty = UnixPty;
+
+    fn spawn(&self, spec: &SpawnSpec) -> Result<UnixPty, PtyError> {
+        let pty = UnixSpawner.spawn(spec)?;
+        *self.0.lock().unwrap() = Some(process_group::ProcessGroup::new(pty.pid()));
+        Ok(pty)
+    }
+}
+
+struct Fixture {
+    _group: process_group::ProcessGroup,
+    session: SessionHandle,
+}
+
+impl Deref for Fixture {
+    type Target = SessionHandle;
+
+    fn deref(&self) -> &SessionHandle {
+        &self.session
+    }
+}
+
+impl Fixture {
+    fn join(self) {
+        self.session.join();
+    }
+}
 
 const VIEWER: ViewerId = ViewerId(1);
 
@@ -34,11 +70,22 @@ fn size(cols: u16, rows: u16) -> Size {
     Size::new(cols, rows).unwrap()
 }
 
-fn start(script: &str, config: HolderConfig) -> SessionHandle {
+fn start(script: &str, config: HolderConfig) -> Fixture {
     let mut spec = SpawnSpec::new("/bin/sh", size(80, 24), SessionKind::Shell);
     spec.args = vec!["-c".into(), script.into()];
     spec.env = vec![("PATH".into(), "/bin:/usr/bin".into())];
-    spawn(UnixSpawner, spec, config, GhosttyEmulator::new).unwrap()
+    let group = Arc::new(Mutex::new(None));
+    let session = spawn(
+        FixtureSpawner(Arc::clone(&group)),
+        spec,
+        config,
+        GhosttyEmulator::new,
+    );
+    let guard = group.lock().unwrap().take();
+    Fixture {
+        _group: guard.expect("the session spawned a fixture group"),
+        session: session.unwrap(),
+    }
 }
 
 fn persistent() -> HolderConfig {

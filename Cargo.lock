@@ -234,6 +234,7 @@ dependencies = [
  "hypervisor-core",
  "hypervisor-ghostty",
  "hypervisor-pty",
+ "rustix",
 ]
 
 [[package]]

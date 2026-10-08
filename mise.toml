@@ -59,7 +59,7 @@ run = "cargo clippy --workspace --all-targets --locked -- -D warnings"
 
 [tasks."check:test"]
 description = "Run the Rust tests, including the conformance harness"
-run = "cargo test --workspace --locked"
+run = "bash tests/check-fixtures.sh"
 
 [tasks."check:boundary"]
 description = "Fail when a -core crate depends outside the allowlist or lacks its clippy.toml"

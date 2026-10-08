@@ -1,6 +1,7 @@
 //! The Unix backend against `/bin/sh` children.
 
 use std::io::Read;
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,6 +9,45 @@ use std::time::{Duration, Instant};
 use hypervisor_core::emulator::Size;
 use hypervisor_core::session::{SessionKind, Signal, SpawnError, SpawnSpec, Target};
 use hypervisor_pty::{Pty, PtyError, Resize, Spawn, Support, UnixPty, UnixSpawner, Wait};
+
+#[path = "../../../tests/support/process_group.rs"]
+mod process_group;
+
+struct Fixture {
+    group: process_group::ProcessGroup,
+    pty: UnixPty,
+}
+
+impl Deref for Fixture {
+    type Target = UnixPty;
+
+    fn deref(&self) -> &UnixPty {
+        &self.pty
+    }
+}
+
+impl DerefMut for Fixture {
+    fn deref_mut(&mut self) -> &mut UnixPty {
+        &mut self.pty
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.group.kill();
+        if let Some(waiter) = self.pty.take_waiter() {
+            let _ = waiter.wait();
+        }
+    }
+}
+
+fn spawn_fixture(script: &str, cols: u16, rows: u16) -> Fixture {
+    let pty = UnixSpawner.spawn(&spec(script, cols, rows)).unwrap();
+    Fixture {
+        group: process_group::ProcessGroup::new(pty.pid()),
+        pty,
+    }
+}
 
 fn spec(script: &str, cols: u16, rows: u16) -> SpawnSpec {
     let mut s = SpawnSpec::new(
@@ -59,9 +99,7 @@ impl Output {
 
 #[test]
 fn the_child_sees_the_spawn_size() {
-    let mut pty = UnixSpawner
-        .spawn(&spec("stty size; echo done", 100, 30))
-        .unwrap();
+    let mut pty = spawn_fixture("stty size; echo done", 100, 30);
     let out = Output::start(&pty);
     let text = out.wait_for("done");
     assert!(text.contains("30 100"), "{text:?}");
@@ -71,7 +109,7 @@ fn the_child_sees_the_spawn_size() {
 
 #[test]
 fn the_exit_code_is_kept() {
-    let mut pty = UnixSpawner.spawn(&spec("exit 7", 80, 24)).unwrap();
+    let mut pty = spawn_fixture("exit 7", 80, 24);
     let exit = pty.take_waiter().unwrap().wait().unwrap();
     assert_eq!((exit.code, exit.signal), (Some(7), None));
     assert!(pty.take_waiter().is_none());
@@ -79,9 +117,7 @@ fn the_exit_code_is_kept() {
 
 #[test]
 fn a_group_signal_reaches_background_jobs_and_the_signal_number_is_kept() {
-    let mut pty = UnixSpawner
-        .spawn(&spec("sleep 30 & echo ready; wait", 80, 24))
-        .unwrap();
+    let mut pty = spawn_fixture("sleep 30 & echo ready; wait", 80, 24);
     let out = Output::start(&pty);
     out.wait_for("ready");
     assert_eq!(
@@ -104,7 +140,7 @@ fn a_group_signal_reaches_background_jobs_and_the_signal_number_is_kept() {
 #[test]
 fn a_same_size_resize_sends_nothing_until_a_redraw_hint() {
     let script = "trap 'echo WINCH; stty size' WINCH; echo ready; while :; do sleep 0.02; done";
-    let mut pty = UnixSpawner.spawn(&spec(script, 80, 24)).unwrap();
+    let mut pty = spawn_fixture(script, 80, 24);
     let out = Output::start(&pty);
     out.wait_for("ready");
     assert_eq!(
@@ -128,7 +164,7 @@ fn a_same_size_resize_sends_nothing_until_a_redraw_hint() {
 #[test]
 fn interrupt_reaches_the_foreground_group() {
     let script = "trap 'echo INT; exit 0' INT; echo ready; while :; do sleep 0.02; done";
-    let mut pty = UnixSpawner.spawn(&spec(script, 80, 24)).unwrap();
+    let mut pty = spawn_fixture(script, 80, 24);
     let out = Output::start(&pty);
     out.wait_for("ready");
     assert!(pty.foreground().is_some_and(|g| g > 0));
@@ -149,4 +185,26 @@ fn another_user_names_the_driver() {
             driver: "container"
         })
     ));
+}
+
+#[test]
+fn a_panicking_fixture_kills_its_process_group() {
+    let pid = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&pid);
+    let panic = std::panic::catch_unwind(move || {
+        let pty = spawn_fixture("echo ready; while :; do sleep 0.02; done", 80, 24);
+        *seen.lock().unwrap() = Some(pty.pid());
+        panic!("fixture panic");
+    });
+    assert!(panic.is_err());
+    let pid = pid.lock().unwrap().unwrap();
+    let group = rustix::process::Pid::from_raw(pid).unwrap();
+    let start = Instant::now();
+    while rustix::process::kill_process_group(group, rustix::process::Signal::KILL).is_ok() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the panicking fixture left its process group alive"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }

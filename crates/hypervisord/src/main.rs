@@ -25,6 +25,8 @@ fn main() {
         _ => return,
     };
     let path = args.next().map(PathBuf::from);
+    // Capture source order before stdin or the socket can delay this invocation.
+    let seq = source_sequence();
     let agy_event = if harness == Harness::Agy {
         args.next()
     } else {
@@ -35,6 +37,9 @@ fn main() {
         println!("{{\"decision\":\"ask\"}}");
     }
     let Some(path) = path else {
+        return;
+    };
+    let Some(seq) = seq else {
         return;
     };
     let mut input = Vec::new();
@@ -52,7 +57,9 @@ fn main() {
     if let Some(name) = agy_event {
         value["event"] = serde_json::Value::String(name);
     }
-    let event = format!("{}\n", hypervisord::trimmed_event(harness, &value));
+    let mut event = hypervisord::trimmed_event(harness, &value);
+    event["seq"] = seq.into();
+    let event = format!("{event}\n");
     let (done, finished) = mpsc::channel();
     thread::spawn(move || {
         use std::io::Write;
@@ -66,4 +73,20 @@ fn main() {
         let _ = done.send(());
     });
     let _ = finished.recv_timeout(Duration::from_millis(150));
+}
+
+#[allow(unsafe_code, reason = "clock_gettime reads the host monotonic clock")]
+fn source_sequence() -> Option<u64> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: now is initialized and points to writable timespec storage.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) } != 0 {
+        return None;
+    }
+    u64::try_from(now.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(now.tv_nsec).ok()?)
 }

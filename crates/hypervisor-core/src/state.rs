@@ -60,6 +60,53 @@ impl HookKind {
     }
 }
 
+/// State-bearing fields decoded from a harness payload. The shell supplies plain values;
+/// this core chooses among the harness-specific names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HookFields<'a> {
+    pub hook_event_name: Option<&'a str>,
+    pub event: Option<&'a str>,
+    pub notification_type: Option<&'a str>,
+    pub enums_notification_type: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub conversation_id: Option<&'a str>,
+    pub fully_idle: Option<bool>,
+    pub fully_idle_snake: Option<bool>,
+    pub enums_fully_idle: Option<bool>,
+}
+
+/// A payload with only the fields needed for state or audit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormalizedHook<'a> {
+    pub name: &'a str,
+    pub kind: HookKind,
+    pub notification_type: Option<&'a str>,
+    pub claimed_session_id: Option<&'a str>,
+    pub fully_idle: Option<bool>,
+}
+
+#[must_use]
+pub fn normalize_hook_fields(harness: Harness, fields: HookFields<'_>) -> NormalizedHook<'_> {
+    let name = fields.hook_event_name.or(fields.event).unwrap_or("");
+    let fully_idle = fields
+        .fully_idle
+        .or(fields.fully_idle_snake)
+        .or(fields.enums_fully_idle);
+    let notification_type = fields.notification_type.or(fields.enums_notification_type);
+    NormalizedHook {
+        name,
+        kind: HookKind::from_fields(
+            harness,
+            name,
+            notification_type,
+            fully_idle.unwrap_or(false),
+        ),
+        notification_type,
+        claimed_session_id: fields.session_id.or(fields.conversation_id),
+        fully_idle,
+    }
+}
+
 /// A report received from one session's socket. The listener, not a payload session ID,
 /// determines which holder gets the report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,9 +191,10 @@ impl StateMachine {
                 HookKind::UserPromptSubmit | HookKind::PreToolUse,
             )
             | (Harness::Claude, HookKind::MessageDisplay)
-            | (Harness::Agy, HookKind::PreInvocation | HookKind::PostInvocation) => {
-                AgentState::Working
-            }
+            | (
+                Harness::Agy,
+                HookKind::PreInvocation | HookKind::PostInvocation | HookKind::PostToolUse,
+            ) => AgentState::Working,
             (Harness::Claude | Harness::Codex, HookKind::PermissionRequest)
             | (Harness::Claude, HookKind::NotificationPermission) => AgentState::Blocked {
                 reason: BlockReason::Approval,
@@ -370,6 +418,43 @@ mod tests {
                 reason: BlockReason::Approval
             }
         );
+    }
+
+    #[test]
+    fn recorded_agy_stop_uses_nested_fully_idle() {
+        let hook = normalize_hook_fields(
+            Harness::Agy,
+            HookFields {
+                event: Some("Stop"),
+                enums_fully_idle: Some(true),
+                conversation_id: Some("audit-only"),
+                ..HookFields::default()
+            },
+        );
+        assert_eq!(hook.kind, HookKind::Stop { fully_idle: true });
+        assert_eq!(hook.claimed_session_id, Some("audit-only"));
+    }
+
+    #[test]
+    fn agy_post_tool_unblocks_after_approval() {
+        let mut s = StateMachine::default();
+        s.report(report(Harness::Agy, HookKind::PreToolUse, 1, 0));
+        s.tick(Duration::from_millis(500));
+        s.report(report(Harness::Agy, HookKind::PostToolUse, 2, 501));
+        assert_eq!(s.state(), AgentState::Working);
+    }
+
+    #[test]
+    fn claude_notification_normalizes_before_permission_request() {
+        let hook = normalize_hook_fields(
+            Harness::Claude,
+            HookFields {
+                hook_event_name: Some("Notification"),
+                notification_type: Some("permission_prompt"),
+                ..HookFields::default()
+            },
+        );
+        assert_eq!(hook.kind, HookKind::NotificationPermission);
     }
 
     #[test]

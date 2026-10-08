@@ -1,5 +1,5 @@
-{"event":"PreInvocation","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":0}
-{"event":"PostInvocation","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":2096}
-{"event":"Stop","notification_type":null,"fully_idle":true,"expected":"Idle","at_ms":2156}
-{"event":"PreInvocation","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":7627}
-{"event":"PreToolUse","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":9717}
+{"t":1791416649.717,"event":"PreInvocation","fields":["artifactDirectoryPath","conversationId","initialNumSteps","invocationNum","modelName","transcriptPath","workspacePaths"],"enums":{"modelName":"gemini-3.1-pro-low","invocationNum":0},"expected":"Working","at_ms":0}
+{"t":1791416651.813,"event":"PostInvocation","fields":["artifactDirectoryPath","conversationId","initialNumSteps","invocationNum","modelName","transcriptPath","workspacePaths"],"enums":{"modelName":"gemini-3.1-pro-low","invocationNum":0},"expected":"Working","at_ms":2096}
+{"t":1791416651.873,"event":"Stop","fields":["artifactDirectoryPath","conversationId","error","executionNum","fullyIdle","modelName","terminationReason","transcriptPath","workspacePaths"],"enums":{"terminationReason":"NO_TOOL_CALL","fullyIdle":true,"modelName":"gemini-3.1-pro-low","executionNum":0},"expected":"Idle","at_ms":2156}
+{"t":1791416657.344,"event":"PreInvocation","fields":["artifactDirectoryPath","conversationId","initialNumSteps","invocationNum","modelName","transcriptPath","workspacePaths"],"enums":{"modelName":"gemini-3.1-pro-low","invocationNum":0},"expected":"Working","at_ms":7627}
+{"t":1791416659.434,"event":"PreToolUse","fields":["artifactDirectoryPath","conversationId","modelName","stepIdx","toolCall","transcriptPath","workspacePaths"],"enums":{"modelName":"gemini-3.1-pro-low","stepIdx":4,"toolCall.name":"run_command"},"tool_call_fields":["args","name"],"tool_call_arg_fields":["CommandLine","Cwd","WaitMsBeforeAsync","toolAction","toolSummary"],"expected":"Working","at_ms":9717}

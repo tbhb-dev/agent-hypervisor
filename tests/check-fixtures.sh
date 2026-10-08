@@ -13,8 +13,8 @@ if [ "$mode" = host ]; then
     printf 'check:host requires an unsandboxed macOS host\n' >&2
     exit 2
   fi
-  printf 'check:host: running every launchd integration test on this host\n'
-  test_command=(cargo test --locked -p hypervisord --test launchd -- --include-ignored)
+  printf 'check:host: running every launchd and seatbelt integration test on this host\n'
+  test_command=(cargo test --locked -p hypervisord --test launchd --test seatbelt_driver -- --include-ignored)
 elif [ "$mode" = check ]; then
   test_command=(cargo test --workspace --locked)
 else
@@ -41,7 +41,7 @@ fi
 bash tests/check-fixture-groups.sh "$groups" || exit 1
 bash tests/check-launchd-jobs.sh "$jobs" || exit 1
 if [ "$mode" = check ]; then
-  printf 'HOST TESTS NOT RUN BY check: launchd integration requires mise run check:host on an unsandboxed macOS host before merge\n' >&2
+  printf 'HOST TESTS NOT RUN BY check: launchd and seatbelt integration require mise run check:host on an unsandboxed macOS host before merge\n' >&2
 elif [ "$test_status" -ne 0 ]; then
   printf 'check:host failed: run on an unsandboxed macOS host and record the result for this head SHA\n' >&2
 fi

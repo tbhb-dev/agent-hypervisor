@@ -596,7 +596,7 @@ fn start_session(
     let (command, args) = seatbelt::session_command(workload, &home, root, wire.command, wire.args);
     let mut spec = SpawnSpec::new(command, size, kind);
     spec.args = args;
-    spec.env = workload::session_env(workload, &wire.env);
+    spec.env = seatbelt::session_env(workload, workload::session_env(workload, &wire.env));
     spec.cwd = Some(
         wire.cwd
             .map_or_else(|| workload.workspace_dir.clone(), PathBuf::from),

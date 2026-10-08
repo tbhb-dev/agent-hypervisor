@@ -19,6 +19,18 @@ pub const SECRET_PATHS: [&str; 7] = [
     "Library/Keychains",
 ];
 
+/// Environment names that point a process at an agent or daemon socket; seatbelt sessions drop them.
+pub const AGENT_ENV: [&str; 5] = [
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_ASKPASS",
+    "GPG_AGENT_INFO",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
+/// The system resolver's socket, which host-network sessions need for name lookups.
+pub const RESOLVER_SOCKET: &str = "/private/var/run/mDNSResponder";
+
 /// Keychain services a session may not look up, so no credential prompt can appear.
 const KEYCHAIN_SERVICES: [&str; 4] = [
     "com.apple.SecurityServer",
@@ -31,6 +43,8 @@ const KEYCHAIN_SERVICES: [&str; 4] = [
 pub enum Access {
     Read,
     Write,
+    /// Connecting to a Unix socket at the path. Rules never mix it with file access.
+    Connect,
 }
 
 impl Access {
@@ -38,6 +52,7 @@ impl Access {
         match self {
             Self::Read => "file-read-data",
             Self::Write => "file-write*",
+            Self::Connect => "network-outbound",
         }
     }
 }
@@ -100,12 +115,19 @@ pub fn path_rules(spec: &WorkloadSpec, home: &Path, root: &Path) -> Vec<PathRule
     let mut secret: Vec<PathBuf> = SECRET_PATHS.iter().map(|path| home.join(path)).collect();
     secret.push(root.to_path_buf());
     let both = [Access::Read, Access::Write];
+    let mut sockets = roots.to_vec();
+    if spec.network == NetworkPolicy::Host {
+        sockets.push(PathBuf::from(RESOLVER_SOCKET));
+    }
     vec![
         rule(false, &[Access::Write], vec![PathBuf::from("/")]),
         rule(true, &[Access::Write], writable),
         rule(false, &[Access::Read], vec![home.to_path_buf()]),
         rule(true, &[Access::Read], readable),
         rule(false, &both, secret),
+        rule(false, &[Access::Connect], vec![PathBuf::from("/")]),
+        rule(true, &[Access::Connect], sockets),
+        rule(false, &[Access::Connect], vec![root.to_path_buf()]),
     ]
 }
 
@@ -134,15 +156,14 @@ pub fn profile(spec: &WorkloadSpec, home: &Path, root: &Path) -> String {
             .collect();
         let _ = write!(text, "({verb} {}", operations.join(" "));
         for path in &rule.paths {
-            let _ = write!(text, " (subpath {})", quote(path));
+            if rule.access.contains(&Access::Connect) {
+                let _ = write!(text, " (remote unix-socket (subpath {}))", quote(path));
+            } else {
+                let _ = write!(text, " (subpath {})", quote(path));
+            }
         }
         text.push_str(")\n");
     }
-    let _ = writeln!(
-        text,
-        "(deny network-outbound (remote unix-socket (subpath {})))",
-        quote(root)
-    );
     if spec.network == NetworkPolicy::Deny {
         text.push_str("(deny network*)\n");
     }
@@ -169,6 +190,17 @@ pub fn session_command(
     let mut wrapped = vec!["-p".into(), profile(spec, home, root), "--".into(), command];
     wrapped.extend(args);
     (SANDBOX_EXEC.into(), wrapped)
+}
+
+/// Drop agent and daemon socket variables from a seatbelt session's environment.
+#[must_use]
+pub fn session_env(spec: &WorkloadSpec, env: Vec<(String, String)>) -> Vec<(String, String)> {
+    if spec.runtime != Runtime::Seatbelt {
+        return env;
+    }
+    env.into_iter()
+        .filter(|(name, _)| !AGENT_ENV.contains(&name.as_str()))
+        .collect()
 }
 
 fn quote(path: &Path) -> String {
@@ -215,6 +247,8 @@ mod tests {
 (deny file-read-data (subpath "/Users/u"))
 (allow file-read-data (subpath "/Users/u/ws") (subpath "/Users/u/cache") (subpath "/opt/tools"))
 (deny file-read-data file-write* (subpath "/Users/u/.ssh") (subpath "/Users/u/.gnupg") (subpath "/Users/u/.aws") (subpath "/Users/u/.netrc") (subpath "/Users/u/.config/gh") (subpath "/Users/u/.codex/auth.json") (subpath "/Users/u/Library/Keychains") (subpath "/r"))
+(deny network-outbound (remote unix-socket (subpath "/")))
+(allow network-outbound (remote unix-socket (subpath "/Users/u/ws")) (remote unix-socket (subpath "/Users/u/cache")))
 (deny network-outbound (remote unix-socket (subpath "/r")))
 (deny network*)
 (deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd.xpc") (global-name "com.apple.security.agent") (global-name "com.apple.security.authhost"))
@@ -234,6 +268,27 @@ mod tests {
         let text = profile(&spec, "/Users/u".as_ref(), "/r".as_ref());
         assert!(!text.contains("(deny network*)"));
         assert!(text.contains("(remote unix-socket (subpath \"/r\"))"));
+        let rules = path_rules(&spec, "/Users/u".as_ref(), "/r".as_ref());
+        assert!(allowed(&rules, Access::Connect, RESOLVER_SOCKET.as_ref()));
+    }
+
+    #[test]
+    fn sockets_connect_only_inside_workspace_and_cache() {
+        let rules = path_rules(&spec(), "/Users/u".as_ref(), "/r".as_ref());
+        let can = |path: &str| allowed(&rules, Access::Connect, path.as_ref());
+        assert!(can("/Users/u/ws/a.sock"));
+        assert!(!can(RESOLVER_SOCKET));
+        assert!(!can("/private/tmp/com.apple.launchd.x/Listeners"));
+    }
+
+    #[test]
+    fn seatbelt_sessions_drop_agent_environment() {
+        let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+        let env = vec![pair("SSH_AUTH_SOCK", "/a"), pair("PATH", "/bin")];
+        assert_eq!(session_env(&spec(), env.clone()), [pair("PATH", "/bin")]);
+        let mut host = spec();
+        host.runtime = Runtime::Host;
+        assert_eq!(session_env(&host, env.clone()), env);
     }
 
     #[test]
@@ -372,6 +427,23 @@ mod tests {
                 || root(&spec.cache_dir)
                 || mounts.iter().any(|mount| mount.mode == MountMode::ReadWrite && root(&mount.source));
             prop_assert_eq!(allowed(&rules, Access::Write, &path), writable && !root("/r".as_ref()));
+        }
+
+        #[test]
+        fn agent_sockets_outside_workspace_and_cache_are_unreachable(
+            mounts in prop::collection::vec(mount_strategy(), 0..6),
+            host_network in any::<bool>(),
+            path in "(/Users/u|/private/tmp|/opt)(/[a-z. ]{1,8}){1,4}",
+        ) {
+            let mut spec = spec();
+            spec.mounts = mounts;
+            if host_network {
+                spec.network = NetworkPolicy::Host;
+            }
+            let rules = path_rules(&spec, "/Users/u".as_ref(), "/r".as_ref());
+            let path = PathBuf::from(path);
+            let inside = path.starts_with(&spec.workspace_dir) || path.starts_with(&spec.cache_dir);
+            prop_assert_eq!(allowed(&rules, Access::Connect, &path), inside);
         }
 
         #[test]

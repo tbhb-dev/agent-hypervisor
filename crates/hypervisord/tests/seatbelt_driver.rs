@@ -4,6 +4,7 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::net::TcpListener;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,7 +26,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(name: &str) -> (Self, HostDriver) {
+    fn new(name: &str, network: NetworkPolicy) -> (Self, HostDriver) {
         let root = PathBuf::from(format!("/private/tmp/hv-r19-{}-{name}", std::process::id()));
         let (ws, cache) = (root.join("ws"), root.join("cache"));
         fs::create_dir_all(&ws).unwrap();
@@ -44,7 +45,7 @@ impl Fixture {
                 mounts: vec![],
                 env: vec![],
                 credential_refs: vec![],
-                network: NetworkPolicy::Deny,
+                network,
                 resources: ResourceLimits {
                     memory_bytes: None,
                     cpu_count: None,
@@ -64,7 +65,7 @@ impl Fixture {
     }
 
     /// Run `script` in a session, wait for it to write `done`, and return the session PID.
-    fn session(&mut self, driver: &HostDriver, script: &str) -> i32 {
+    fn session(&mut self, driver: &HostDriver, script: &str, env: &[(&str, &str)]) -> i32 {
         let ws = self.root.join("ws");
         driver
             .spawn_session(
@@ -79,7 +80,11 @@ impl Fixture {
                         "-c".into(),
                         format!("echo $$ > pid; {script}; echo > done; exec sleep 120"),
                     ],
-                    env: vec![("PATH".into(), "/bin:/usr/bin".into())],
+                    env: [("PATH", "/bin:/usr/bin")]
+                        .iter()
+                        .chain(env)
+                        .map(|(name, value)| ((*name).into(), (*value).into()))
+                        .collect(),
                     cwd: None,
                     user: None,
                     kind: SessionKind::Shell,
@@ -127,8 +132,9 @@ fn shim_exe() -> &'static Path {
 }
 
 #[test]
+#[ignore = "requires check:host on an unsandboxed macOS host"]
 fn session_writes_only_inside_its_roots_and_cannot_reach_the_driver() {
-    let (mut fixture, driver) = Fixture::new("access");
+    let (mut fixture, driver) = Fixture::new("access", NetworkPolicy::Deny);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -141,6 +147,7 @@ fn session_writes_only_inside_its_roots_and_cannot_reach_the_driver() {
              cat {root}/rt/*.json; echo $? > s-root; ls {home}; echo $? > s-home; \
              nc -z -G 1 127.0.0.1 {port}; echo $? > s-net"
         ),
+        &[],
     );
     assert_eq!(fixture.read("inside"), "in\n");
     assert_eq!(fixture.read("s-inside"), "0\n");
@@ -152,9 +159,10 @@ fn session_writes_only_inside_its_roots_and_cannot_reach_the_driver() {
 }
 
 #[test]
+#[ignore = "requires check:host on an unsandboxed macOS host"]
 fn stop_ends_the_sandboxed_group_and_a_new_daemon_adopts_the_shim() {
-    let (mut fixture, driver) = Fixture::new("lifecycle");
-    let pid = fixture.session(&driver, "true");
+    let (mut fixture, driver) = Fixture::new("lifecycle", NetworkPolicy::Deny);
+    let pid = fixture.session(&driver, "true", &[]);
     drop(driver);
     let mut recovered =
         HostDriver::open(&fixture.root.join("rt"), &fixture.id.host, shim_exe()).unwrap();
@@ -172,4 +180,29 @@ fn stop_ends_the_sandboxed_group_and_a_new_daemon_adopts_the_shim() {
         recovered.workloads()[&fixture.id.label()].recovery,
         Recovery::Stopped
     );
+}
+
+#[test]
+#[ignore = "requires check:host on an unsandboxed macOS host"]
+fn host_network_session_cannot_reach_an_agent_socket_or_see_its_variable() {
+    let (mut fixture, driver) = Fixture::new("agent", NetworkPolicy::Host);
+    // A stand-in agent in the fixture's temporary directory, never the operator's real agent.
+    let agent_path = fixture.root.join("agent.sock");
+    let listener = UnixListener::bind(&agent_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let _inside = UnixListener::bind(fixture.root.join("ws/inside.sock")).unwrap();
+    let agent = agent_path.display().to_string();
+    let connect = "perl -MIO::Socket::UNIX -e 'IO::Socket::UNIX->new(Peer => $ARGV[0]) or exit 1'";
+    fixture.session(
+        &driver,
+        &format!(
+            "{connect} {agent}; echo $? > s-agent; {connect} inside.sock; echo $? > s-inside; \
+             echo \"${{SSH_AUTH_SOCK-unset}}\" > s-env"
+        ),
+        &[("SSH_AUTH_SOCK", &agent)],
+    );
+    assert_eq!(fixture.read("s-inside"), "0\n", "inside probe failed");
+    assert_ne!(fixture.read("s-agent"), "0\n", "agent was reachable");
+    assert_eq!(fixture.read("s-env"), "unset\n");
+    assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
 }

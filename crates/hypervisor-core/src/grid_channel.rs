@@ -146,6 +146,7 @@ impl GridFrame {
 /// Per-channel frame number and rate-limit state. The caller supplies monotonic time.
 pub struct GridEncoder {
     frame: u64,
+    ids: BTreeMap<String, u32>,
     previous: Option<Grid>,
     previous_modes: Modes,
     sent_at: Option<Duration>,
@@ -163,6 +164,7 @@ impl GridEncoder {
         }
         Ok(Self {
             frame: 0,
+            ids: BTreeMap::new(),
             previous: None,
             previous_modes: Modes::default(),
             sent_at: None,
@@ -223,7 +225,7 @@ impl GridEncoder {
             return Ok(None);
         }
         let number = self.frame.checked_add(1).ok_or(FrameError::InvalidValue)?;
-        let hyperlinks = links(&grid)?;
+        let (next_ids, hyperlinks) = links(&grid, &self.ids)?;
         let ids: BTreeMap<&str, u32> = hyperlinks
             .iter()
             .map(|link| (link.uri.as_str(), link.id))
@@ -272,6 +274,7 @@ impl GridEncoder {
         };
         Frame::Grid(frame.clone()).encode()?;
         self.frame = number;
+        self.ids = next_ids;
         self.previous = Some(grid);
         self.previous_modes = modes;
         self.sent_at = Some(now);
@@ -279,7 +282,11 @@ impl GridEncoder {
     }
 }
 
-fn links(grid: &Grid) -> Result<Vec<Hyperlink>, FrameError> {
+fn links(
+    grid: &Grid,
+    known: &BTreeMap<String, u32>,
+) -> Result<(BTreeMap<String, u32>, Vec<Hyperlink>), FrameError> {
+    let mut ids = known.clone();
     let mut uris: Vec<&str> = grid
         .cells()
         .iter()
@@ -287,15 +294,22 @@ fn links(grid: &Grid) -> Result<Vec<Hyperlink>, FrameError> {
         .collect();
     uris.sort_unstable();
     uris.dedup();
-    uris.into_iter()
-        .enumerate()
-        .map(|(index, uri)| {
-            Ok(Hyperlink {
-                id: u32::try_from(index + 1).map_err(|_| FrameError::InvalidValue)?,
-                uri: uri.to_owned(),
-            })
-        })
-        .collect()
+    let mut links = Vec::with_capacity(uris.len());
+    for uri in uris {
+        let id = if let Some(id) = ids.get(uri) {
+            *id
+        } else {
+            let id = u32::try_from(ids.len() + 1).map_err(|_| FrameError::InvalidValue)?;
+            ids.insert(uri.to_owned(), id);
+            id
+        };
+        links.push(Hyperlink {
+            id,
+            uri: uri.to_owned(),
+        });
+    }
+    links.sort_unstable_by_key(|link| link.id);
+    Ok((ids, links))
 }
 
 fn wire_cell(cell: &Cell, ids: &BTreeMap<&str, u32>) -> GridCell {
@@ -460,6 +474,36 @@ mod tests {
         assert_eq!(cells[1].width, CellWidth::SpacerTail);
         assert_eq!(cells[0].hyperlink_id, Some(1));
         assert_eq!(hyperlinks[0].uri, "https://example.test/a");
+    }
+
+    #[test]
+    fn adding_a_link_keeps_ids_in_unchanged_rows() {
+        let size = Size::new(1, 2).unwrap();
+        let old = vec![
+            Cell {
+                text: "z".into(),
+                hyperlink: Some("z".into()),
+                ..Cell::blank()
+            },
+            Cell::blank(),
+        ];
+        let first = Grid::new(size, old.clone(), Cursor::default()).unwrap();
+        let mut encoder = GridEncoder::new(None).unwrap();
+        assert!(
+            matches!(encoder.poll(Duration::ZERO, first, Modes::default(), 0, false).unwrap(),
+            Some(GridFrame::Full { cells, .. }) if cells[0].hyperlink_id == Some(1))
+        );
+        let mut next = old;
+        next[1].hyperlink = Some("a".into());
+        let next = Grid::new(size, next, Cursor::default()).unwrap();
+        let diff = encoder
+            .poll(Duration::from_millis(1), next, Modes::default(), 1, false)
+            .unwrap();
+        assert!(
+            matches!(diff, Some(GridFrame::Diff { rows, hyperlinks, .. })
+            if rows.len() == 1 && rows[0].row == 1 && rows[0].cells[0].hyperlink_id == Some(2)
+            && hyperlinks == [Hyperlink { id: 1, uri: "z".into() }, Hyperlink { id: 2, uri: "a".into() }])
+        );
     }
 
     #[test]

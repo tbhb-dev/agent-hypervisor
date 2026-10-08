@@ -94,7 +94,9 @@ impl CapabilityProfile {
                         && final_byte == b'p'
                         && let Ok(mode_number) = mode.parse::<u16>()
                     {
-                        let state = if self.supported_modes.contains(&mode_number) {
+                        let state = if mode_number == 2026 {
+                            1
+                        } else if self.supported_modes.contains(&mode_number) {
                             2
                         } else {
                             0
@@ -214,9 +216,15 @@ impl QueryScanner {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ViewerInputFilter {
     pending: Vec<u8>,
+    cpr_expected: bool,
 }
 
 impl ViewerInputFilter {
+    /// A CPR query was sent to this viewer.
+    pub fn expect_cpr(&mut self) {
+        self.cpr_expected = true;
+    }
+
     /// Forward ordinary input, retaining incomplete escape sequences across chunks.
     pub fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut forwarded = Vec::new();
@@ -239,8 +247,14 @@ impl ViewerInputFilter {
                 None => false,
             };
             if complete || self.pending.len() > 256 {
-                if !is_terminal_reply(&self.pending) {
+                let cpr = is_cpr_reply(&self.pending);
+                if !is_terminal_reply(&self.pending)
+                    || (is_modified_f3(&self.pending) && !self.cpr_expected)
+                {
                     forwarded.extend_from_slice(&self.pending);
+                }
+                if cpr {
+                    self.cpr_expected = false;
                 }
                 self.pending.clear();
             }
@@ -271,11 +285,7 @@ pub fn is_terminal_reply(bytes: &[u8]) -> bool {
             b'c' => {
                 middle.starts_with(b"?") || middle.starts_with(b">") || middle.starts_with(b"=")
             }
-            b'R' => {
-                let coordinates = middle.strip_prefix(b"?").unwrap_or(middle);
-                !coordinates.is_empty()
-                    && coordinates.iter().all(|b| b.is_ascii_digit() || *b == b';')
-            }
+            b'R' => is_cpr_reply(bytes),
             b'y' => middle.ends_with(b"$"),
             b'u' => {
                 middle.starts_with(b"?")
@@ -290,6 +300,30 @@ pub fn is_terminal_reply(bytes: &[u8]) -> bool {
             .any(|prefix| body.starts_with(prefix));
     }
     bytes.starts_with(b"\x1bP!|") || bytes.starts_with(b"\x1bP>|")
+}
+
+fn is_cpr_reply(bytes: &[u8]) -> bool {
+    let Some(middle) = bytes
+        .strip_prefix(b"\x1b[")
+        .and_then(|s| s.strip_suffix(b"R"))
+    else {
+        return false;
+    };
+    let coordinates = middle.strip_prefix(b"?").unwrap_or(middle);
+    !coordinates.is_empty() && coordinates.iter().all(|b| b.is_ascii_digit() || *b == b';')
+}
+
+fn is_modified_f3(bytes: &[u8]) -> bool {
+    matches!(
+        bytes,
+        b"\x1b[1;2R"
+            | b"\x1b[1;3R"
+            | b"\x1b[1;4R"
+            | b"\x1b[1;5R"
+            | b"\x1b[1;6R"
+            | b"\x1b[1;7R"
+            | b"\x1b[1;8R"
+    )
 }
 
 /// Whether one reply the emulator produced may go to the application.
@@ -338,7 +372,8 @@ mod tests {
             (&b"\x1b[c"[..], &b"\x1b[?62;22c"[..]),
             (b"\x1b[>c", b"\x1b[>1;10;0c"),
             (b"\x1b[>q", b"\x1bP>|agent-hypervisor\x1b\\"),
-            (b"\x1b[?2026$p", b"\x1b[?2026;2$y"),
+            (b"\x1b[?2026$p", b"\x1b[?2026;1$y"),
+            (b"\x1b[?2004$p", b"\x1b[?2004;2$y"),
             (b"\x1b[?2027$p", b"\x1b[?2027;0$y"),
             (b"\x1b[6n", b"\x1b[3;5R"),
             (b"\x1b]10;?\x1b\\", b"\x1b]10;rgb:d0d0/d0d0/d0d0\x1b\\"),
@@ -399,6 +434,16 @@ mod tests {
                 .filter(b"\x1bP>|agent-hypervisor\x1b\\\x1b[?0u")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn modified_f3_passes_without_a_cpr_query_and_a_cpr_answer_is_filtered() {
+        let mut filter = ViewerInputFilter::default();
+        assert_eq!(filter.filter(b"\x1b[1;2R\x1b[1;5R"), b"\x1b[1;2R\x1b[1;5R");
+        filter.expect_cpr();
+        assert!(filter.filter(b"\x1b[1;").is_empty());
+        assert!(filter.filter(b"5R").is_empty());
+        assert_eq!(filter.filter(b"\x1b[1;5R"), b"\x1b[1;5R");
     }
 
     #[test]

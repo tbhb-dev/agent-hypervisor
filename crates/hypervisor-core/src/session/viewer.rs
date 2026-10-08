@@ -2,8 +2,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
-use crate::emulator::Size;
+use crate::emulator::{Size, ViewerInputFilter};
 
 /// An opaque identity supplied by the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -57,6 +58,8 @@ struct Viewer {
     queued: usize,
     output: VecDeque<(u64, Vec<u8>)>,
     resync: Option<u64>,
+    input_filter: ViewerInputFilter,
+    input_since: Option<Duration>,
 }
 
 /// Attached viewers and the sole write-lock holder.
@@ -109,6 +112,8 @@ impl ViewerRegistry {
                 queued: 0,
                 output: VecDeque::new(),
                 resync: None,
+                input_filter: ViewerInputFilter::default(),
+                input_since: None,
             },
         );
         Ok(())
@@ -176,6 +181,62 @@ impl ViewerRegistry {
             return Err(Refusal::NotWriter);
         }
         Ok(())
+    }
+
+    /// Strip terminal answers from a viewer's input, including split answers.
+    ///
+    /// # Errors
+    ///
+    /// If the viewer is not attached.
+    pub fn filter_input(
+        &mut self,
+        id: ViewerId,
+        bytes: &[u8],
+        now: Duration,
+    ) -> Result<Vec<u8>, Refusal> {
+        let viewer = self.viewers.get_mut(&id).ok_or(Refusal::UnknownViewer)?;
+        let filtered = viewer.input_filter.filter(bytes);
+        if viewer.input_filter.has_pending() {
+            viewer.input_since.get_or_insert(now);
+        } else {
+            viewer.input_since = None;
+        }
+        Ok(filtered)
+    }
+
+    /// Expect one CPR answer from each viewer receiving live output.
+    pub fn expect_cpr(&mut self) {
+        for viewer in self.viewers.values_mut() {
+            if viewer.resync.is_none() {
+                viewer.input_filter.expect_cpr();
+            }
+        }
+    }
+
+    /// The next deadline for forwarding an ambiguous standalone escape key.
+    #[must_use]
+    pub fn input_deadline(&self) -> Option<Duration> {
+        self.viewers
+            .values()
+            .filter_map(|v| v.input_since.map(|at| at + Duration::from_millis(50)))
+            .min()
+    }
+
+    /// Forward pending input whose 50 ms ambiguity window passed.
+    pub fn flush_due_input(&mut self, now: Duration) -> Vec<(ViewerId, Vec<u8>)> {
+        self.viewers
+            .iter_mut()
+            .filter_map(|(&id, viewer)| {
+                let due = viewer
+                    .input_since
+                    .is_some_and(|at| at + Duration::from_millis(50) <= now);
+                if !due {
+                    return None;
+                }
+                viewer.input_since = None;
+                Some((id, viewer.input_filter.flush()))
+            })
+            .collect()
     }
 
     /// Remember a viewer's size. Only the writer's request changes the PTY size.

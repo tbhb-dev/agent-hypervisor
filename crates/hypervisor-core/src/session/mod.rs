@@ -144,22 +144,39 @@ pub enum Input {
     Spawned,
     /// The PTY produced output.
     Output(Vec<u8>),
-    /// The emulator's replies to the last [`Effect::Feed`].
+    /// The capability profile's replies to the last [`Effect::Feed`].
     Replies(Vec<u8>),
     /// The PTY's output reached its end.
     OutputClosed,
     /// The child exited.
     ChildExited(Exit),
-    /// A viewer asked for a size.
-    Resize(Size),
     /// The shell finished a batch of inputs; pending size requests settle now.
     Settle,
     /// The number of attached viewers changed.
     Viewers(usize),
-    /// Input for the application.
-    Write(Vec<u8>),
-    /// Interrupt the foreground job.
-    Interrupt,
+    /// Attach a viewer without implicitly taking the write lock.
+    Attach {
+        /// Caller-supplied identity.
+        viewer: ViewerId,
+        /// Initial mode.
+        mode: ViewerMode,
+        /// Requested terminal size.
+        size: Size,
+        /// Maximum queued output bytes.
+        budget: NonZeroUsize,
+    },
+    /// Detach a viewer, releasing its write lock if held.
+    Detach(ViewerId),
+    /// Explicitly take or transfer the write lock.
+    Take(Writer),
+    /// Release the write lock.
+    ReleaseWriter(Writer),
+    /// The attached viewer's requested size.
+    ViewerResize(ViewerId, Size),
+    /// Input from a viewer or programmatic source.
+    Submit(Writer, Vec<u8>),
+    /// Interrupt from the lock holder.
+    Interrupt(Writer),
     /// End the session: hang up, then kill the group after the grace.
     Close,
     /// A deadline from [`Holder::deadline`] passed.
@@ -172,7 +189,7 @@ pub enum Input {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Effect {
-    /// Feed bytes to the emulator and step its replies back in as [`Input::Replies`].
+    /// Feed bytes to the emulator and answer queries from the capability profile.
     Feed(Vec<u8>),
     /// Write bytes to the PTY.
     WritePty(Vec<u8>),
@@ -193,6 +210,14 @@ pub enum Effect {
     Release,
     /// Tell the session's subscribers.
     Emit(SessionEvent),
+    /// A viewer attached; run 11 maps this to the session event stream.
+    ViewerAttached(ViewerId),
+    /// A viewer detached; run 11 maps this to the session event stream.
+    ViewerDetached(ViewerId),
+    /// The source's command was refused and had no PTY effect.
+    Refused(Refusal),
+    /// A viewer lost live output and must obtain a fresh grid snapshot.
+    Resync { viewer: ViewerId, oldest: u64 },
 }
 
 /// What subscribers hear about a session.
@@ -218,6 +243,7 @@ pub struct Holder {
     size: SizeState,
     state: StateMachine,
     viewers: usize,
+    registry: ViewerRegistry,
     had_viewer: bool,
     closing: bool,
     output_closed: bool,
@@ -228,6 +254,11 @@ pub struct Holder {
 }
 
 impl Holder {
+    /// Mark the CPR query just delivered in live output to attached viewers.
+    pub fn expect_viewer_cpr(&mut self) {
+        self.registry.expect_cpr();
+    }
+
     /// A holder in [`Phase::Starting`] for a PTY spawned at `size`.
     #[must_use]
     pub fn new(config: HolderConfig, size: Size) -> Self {
@@ -238,6 +269,7 @@ impl Holder {
             size: SizeState::new(size),
             state: StateMachine::default(),
             viewers: 0,
+            registry: ViewerRegistry::default(),
             had_viewer: false,
             closing: false,
             output_closed: false,
@@ -258,6 +290,30 @@ impl Holder {
     #[must_use]
     pub const fn ring(&self) -> &OutputRing {
         &self.ring
+    }
+
+    /// The attached viewers and write lock.
+    #[must_use]
+    pub const fn registry(&self) -> &ViewerRegistry {
+        &self.registry
+    }
+
+    /// Pop a viewer's next bounded output item.
+    ///
+    /// # Errors
+    ///
+    /// If the viewer is not attached.
+    pub fn read_viewer(&mut self, viewer: ViewerId) -> Result<ViewerRead, Refusal> {
+        self.registry.read(viewer)
+    }
+
+    /// Mark a viewer live after the actor has made its fresh grid snapshot.
+    ///
+    /// # Errors
+    ///
+    /// If the viewer is not attached.
+    pub fn resynced(&mut self, viewer: ViewerId) -> Result<(), Refusal> {
+        self.registry.resynced(viewer)
     }
 
     /// The size applied to the PTY and the emulator.
@@ -291,6 +347,7 @@ impl Holder {
             self.drain_until,
             reap_at,
             self.state.deadline(),
+            self.registry.input_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -315,7 +372,14 @@ impl Holder {
                 }
             }
             Input::Output(bytes) => {
+                let seq = self.ring.next();
                 self.ring.append(&bytes);
+                for viewer in self.registry.output(seq, &bytes, self.ring.oldest()) {
+                    fx.push(Effect::Resync {
+                        viewer,
+                        oldest: self.ring.oldest(),
+                    });
+                }
                 fx.push(Effect::Feed(bytes));
             }
             Input::Replies(replies) => {
@@ -337,23 +401,48 @@ impl Holder {
                     self.drain_until = Some(now + self.config.exit_drain);
                 }
             }
-            Input::Resize(size) => {
-                if running {
-                    self.size.request(size);
-                }
-            }
             Input::Settle => self.settle(accepts_input, &mut fx),
             Input::Viewers(count) => self.viewers_changed(count, now),
-            Input::Write(bytes) => {
-                if accepts_input {
-                    fx.push(Effect::WritePty(bytes));
+            Input::Attach {
+                viewer,
+                mode,
+                size,
+                budget,
+            } => match self.registry.attach(viewer, mode, size, budget) {
+                Ok(()) => {
+                    self.viewers_changed(self.registry.len(), now);
+                    fx.push(Effect::ViewerAttached(viewer));
+                }
+                Err(reason) => fx.push(Effect::Refused(reason)),
+            },
+            Input::Detach(viewer) => match self.registry.detach(viewer) {
+                Ok(()) => {
+                    self.viewers_changed(self.registry.len(), now);
+                    fx.push(Effect::ViewerDetached(viewer));
+                }
+                Err(reason) => fx.push(Effect::Refused(reason)),
+            },
+            Input::Take(who) => match self.registry.take(who) {
+                Ok(Some(size)) if running => self.size.request(size),
+                Ok(_) => {}
+                Err(reason) => fx.push(Effect::Refused(reason)),
+            },
+            Input::ReleaseWriter(who) => {
+                if let Err(reason) = self.registry.release(who) {
+                    fx.push(Effect::Refused(reason));
                 }
             }
-            Input::Interrupt => {
-                if accepts_input {
-                    fx.push(Effect::Interrupt);
-                }
-            }
+            Input::ViewerResize(viewer, size) => match self.registry.resize(viewer, size) {
+                Ok(true) if running => self.size.request(size),
+                Ok(_) => {}
+                Err(reason) => fx.push(Effect::Refused(reason)),
+            },
+            Input::Submit(who, bytes) => self.submit(who, &bytes, accepts_input, now, &mut fx),
+            Input::Interrupt(who) => match self.registry.check_input(who) {
+                Ok(()) if accepts_input => fx.push(Effect::Interrupt),
+                Ok(()) => {}
+                Err(reason) => fx.push(Effect::Refused(reason)),
+            },
             Input::Close => self.close(now, &mut fx),
             Input::Tick => {}
             Input::Hook(report) => {
@@ -378,6 +467,34 @@ impl Holder {
                 fx.push(Effect::Feed(Vec::new()));
                 fx.push(Effect::Emit(SessionEvent::Resized(size)));
             }
+        }
+    }
+
+    fn submit(
+        &mut self,
+        who: Writer,
+        bytes: &[u8],
+        accepts_input: bool,
+        now: Duration,
+        fx: &mut Vec<Effect>,
+    ) {
+        let bytes = match who {
+            Writer::Viewer(id) => match self.registry.filter_input(id, bytes, now) {
+                Ok(bytes) => bytes,
+                Err(reason) => {
+                    fx.push(Effect::Refused(reason));
+                    return;
+                }
+            },
+            Writer::Program(_) => bytes.to_vec(),
+        };
+        if bytes.is_empty() {
+            return;
+        }
+        match self.registry.check_input(who) {
+            Ok(()) if accepts_input => fx.push(Effect::WritePty(bytes)),
+            Ok(()) => {}
+            Err(reason) => fx.push(Effect::Refused(reason)),
         }
     }
 
@@ -430,6 +547,14 @@ impl Holder {
 
     fn fire_due(&mut self, now: Duration, fx: &mut Vec<Effect>) {
         self.state.tick(now);
+        for (viewer, bytes) in self.registry.flush_due_input(now) {
+            if self.phase == Phase::Running
+                && self.pending_exit.is_none()
+                && self.registry.check_input(Writer::Viewer(viewer)).is_ok()
+            {
+                fx.push(Effect::WritePty(bytes));
+            }
+        }
         let due = |at: Option<Duration>| at.is_some_and(|at| at <= now);
         if due(self.end_at) {
             self.close(now, fx);

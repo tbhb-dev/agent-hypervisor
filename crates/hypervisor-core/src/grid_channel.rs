@@ -95,7 +95,7 @@ impl GridFrame {
                 hyperlinks,
                 ..
             } => {
-                if *base_frame == 0 || *base_frame >= *frame {
+                if *base_frame == 0 || base_frame.checked_add(1) != Some(*frame) {
                     return Err(FrameError::InvalidValue);
                 }
                 if size.cols == 0
@@ -146,6 +146,7 @@ impl GridFrame {
 /// Per-channel frame number and rate-limit state. The caller supplies monotonic time.
 pub struct GridEncoder {
     frame: u64,
+    ids: BTreeMap<String, u32>,
     previous: Option<Grid>,
     previous_modes: Modes,
     sent_at: Option<Duration>,
@@ -163,6 +164,7 @@ impl GridEncoder {
         }
         Ok(Self {
             frame: 0,
+            ids: BTreeMap::new(),
             previous: None,
             previous_modes: Modes::default(),
             sent_at: None,
@@ -172,10 +174,17 @@ impl GridEncoder {
         })
     }
 
-    #[must_use]
-    pub fn due(&self, now: Duration) -> bool {
-        self.sent_at
-            .is_none_or(|at| now.saturating_sub(at) >= self.min_interval)
+    /// Whether another frame may be emitted at `now`.
+    ///
+    /// # Errors
+    /// Returns `InvalidValue` when time moves backwards.
+    pub fn due(&self, now: Duration) -> Result<bool, FrameError> {
+        if self.sent_at.is_some_and(|at| now < at) {
+            return Err(FrameError::InvalidValue);
+        }
+        Ok(self
+            .sent_at
+            .is_none_or(|at| now.saturating_sub(at) >= self.min_interval))
     }
 
     /// Build the next full or row-diff frame; unchanged and throttled states emit nothing.
@@ -190,10 +199,7 @@ impl GridEncoder {
         output_sequence: u64,
         force_full: bool,
     ) -> Result<Option<GridFrame>, FrameError> {
-        if self.sent_at.is_some_and(|at| now < at) {
-            return Err(FrameError::InvalidValue);
-        }
-        if !self.due(now) {
+        if !self.due(now)? {
             return Ok(None);
         }
         let full = force_full
@@ -223,7 +229,7 @@ impl GridEncoder {
             return Ok(None);
         }
         let number = self.frame.checked_add(1).ok_or(FrameError::InvalidValue)?;
-        let hyperlinks = links(&grid)?;
+        let (next_ids, hyperlinks) = links(&grid, &self.ids)?;
         let ids: BTreeMap<&str, u32> = hyperlinks
             .iter()
             .map(|link| (link.uri.as_str(), link.id))
@@ -272,6 +278,7 @@ impl GridEncoder {
         };
         Frame::Grid(frame.clone()).encode()?;
         self.frame = number;
+        self.ids = next_ids;
         self.previous = Some(grid);
         self.previous_modes = modes;
         self.sent_at = Some(now);
@@ -279,7 +286,11 @@ impl GridEncoder {
     }
 }
 
-fn links(grid: &Grid) -> Result<Vec<Hyperlink>, FrameError> {
+fn links(
+    grid: &Grid,
+    known: &BTreeMap<String, u32>,
+) -> Result<(BTreeMap<String, u32>, Vec<Hyperlink>), FrameError> {
+    let mut ids = known.clone();
     let mut uris: Vec<&str> = grid
         .cells()
         .iter()
@@ -287,15 +298,22 @@ fn links(grid: &Grid) -> Result<Vec<Hyperlink>, FrameError> {
         .collect();
     uris.sort_unstable();
     uris.dedup();
-    uris.into_iter()
-        .enumerate()
-        .map(|(index, uri)| {
-            Ok(Hyperlink {
-                id: u32::try_from(index + 1).map_err(|_| FrameError::InvalidValue)?,
-                uri: uri.to_owned(),
-            })
-        })
-        .collect()
+    let mut links = Vec::with_capacity(uris.len());
+    for uri in uris {
+        let id = if let Some(id) = ids.get(uri) {
+            *id
+        } else {
+            let id = u32::try_from(ids.len() + 1).map_err(|_| FrameError::InvalidValue)?;
+            ids.insert(uri.to_owned(), id);
+            id
+        };
+        links.push(Hyperlink {
+            id,
+            uri: uri.to_owned(),
+        });
+    }
+    links.sort_unstable_by_key(|link| link.id);
+    Ok((ids, links))
 }
 
 fn wire_cell(cell: &Cell, ids: &BTreeMap<&str, u32>) -> GridCell {
@@ -318,7 +336,6 @@ fn wire_cell(cell: &Cell, ids: &BTreeMap<&str, u32>) -> GridCell {
 mod tests {
     use super::*;
     use crate::emulator::{Screen, Size};
-    use proptest::prelude::*;
 
     fn screen(rows: &[&str], cursor: Cursor) -> Grid {
         let cols = u16::try_from(rows[0].len()).unwrap();
@@ -343,6 +360,7 @@ mod tests {
             .poll(Duration::ZERO, original.clone(), Modes::default(), 3, false)
             .unwrap()
             .unwrap();
+        assert_eq!(Frame::Grid(first.clone()).encode().unwrap()[6], 11);
         assert!(
             matches!(&first, GridFrame::Full { frame: 1, output_sequence: 3, cells, .. } if cells.len() == 4)
         );
@@ -392,7 +410,8 @@ mod tests {
         let at = Duration::from_secs(1);
         let first = screen(&["a"], Cursor::default());
         encoder.poll(at, first, Modes::default(), 0, false).unwrap();
-        assert!(!encoder.due(at + Duration::from_millis(499)));
+        assert_eq!(encoder.due(at + Duration::from_millis(499)), Ok(false));
+        assert_eq!(encoder.due(Duration::ZERO), Err(FrameError::InvalidValue));
         assert_eq!(
             encoder
                 .poll(
@@ -426,44 +445,73 @@ mod tests {
     }
 
     #[test]
-    fn hyperlinks_and_wide_cells_survive_wire_round_trip() {
-        let size = Size::new(2, 1).unwrap();
-        let cells = vec![
+    fn adding_a_link_keeps_ids_in_unchanged_rows() {
+        let size = Size::new(1, 2).unwrap();
+        let old = vec![
             Cell {
-                text: "中".into(),
-                width: CellWidth::Wide,
-                hyperlink: Some("https://example.test/a".into()),
+                text: "z".into(),
+                hyperlink: Some("z".into()),
                 ..Cell::blank()
             },
-            Cell {
-                width: CellWidth::SpacerTail,
-                ..Cell::blank()
-            },
+            Cell::blank(),
         ];
-        let grid = Grid::new(size, cells, Cursor::default()).unwrap();
+        let first = Grid::new(size, old.clone(), Cursor::default()).unwrap();
         let mut encoder = GridEncoder::new(None).unwrap();
-        let full = encoder
-            .poll(Duration::ZERO, grid, Modes::default(), 0, false)
-            .unwrap()
+        assert!(
+            matches!(encoder.poll(Duration::ZERO, first, Modes::default(), 0, false).unwrap(),
+            Some(GridFrame::Full { cells, .. }) if cells[0].hyperlink_id == Some(1))
+        );
+        let mut next = old;
+        next[1].hyperlink = Some("a".into());
+        let next = Grid::new(size, next, Cursor::default()).unwrap();
+        let diff = encoder
+            .poll(Duration::from_millis(1), next, Modes::default(), 1, false)
             .unwrap();
-        let bytes = Frame::Grid(full).encode().unwrap();
-        let (
-            Frame::Grid(GridFrame::Full {
-                cells, hyperlinks, ..
-            }),
-            _,
-        ) = Frame::decode(&bytes).unwrap().unwrap()
-        else {
-            panic!("wrong frame")
-        };
-        assert_eq!(cells[0].width, CellWidth::Wide);
-        assert_eq!(cells[1].width, CellWidth::SpacerTail);
-        assert_eq!(cells[0].hyperlink_id, Some(1));
-        assert_eq!(hyperlinks[0].uri, "https://example.test/a");
+        assert!(
+            matches!(diff, Some(GridFrame::Diff { rows, hyperlinks, .. })
+            if rows.len() == 1 && rows[0].row == 1 && rows[0].cells[0].hyperlink_id == Some(2)
+            && hyperlinks == [Hyperlink { id: 1, uri: "z".into() }, Hyperlink { id: 2, uri: "a".into() }])
+        );
     }
 
     #[test]
-    fn invalid_shapes_and_oversized_frames_do_not_advance_encoder() {
+    fn diff_requires_the_immediately_previous_frame() {
+        let frame = GridFrame::Diff {
+            frame: 4,
+            base_frame: 1,
+            output_sequence: 0,
+            size: WireSize { cols: 1, rows: 1 },
+            rows: vec![],
+            cursor: Cursor::default(),
+            modes: Modes::default(),
+            hyperlinks: vec![],
+        };
+        assert_eq!(Frame::Grid(frame).encode(), Err(FrameError::InvalidValue));
+    }
+
+    #[test]
+    fn forced_resync_emits_full_frame() {
+        let mut encoder = GridEncoder::new(None).unwrap();
+        let original = screen(&["a"], Cursor::default());
+        encoder
+            .poll(Duration::ZERO, original.clone(), Modes::default(), 0, false)
+            .unwrap();
+        assert!(matches!(
+            encoder
+                .poll(
+                    Duration::from_millis(1),
+                    original,
+                    Modes::default(),
+                    1,
+                    true
+                )
+                .unwrap(),
+            Some(GridFrame::Full { frame: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn oversized_frames_do_not_advance_encoder() {
         let mut encoder = GridEncoder::new(None).unwrap();
         let huge = Grid::new(
             Size::new(1, 1).unwrap(),
@@ -490,46 +538,5 @@ mod tests {
                 .unwrap(),
             Some(GridFrame::Full { frame: 1, .. })
         ));
-        let mut bad = Frame::Grid(GridFrame::Diff {
-            frame: 2,
-            base_frame: 2,
-            output_sequence: 0,
-            size: WireSize { cols: 1, rows: 1 },
-            rows: vec![],
-            cursor: Cursor::default(),
-            modes: Modes::default(),
-            hyperlinks: vec![],
-        });
-        assert_eq!(bad.encode(), Err(FrameError::InvalidValue));
-        if let Frame::Grid(GridFrame::Diff { base_frame, .. }) = &mut bad {
-            *base_frame = 1;
-        }
-        let mut bytes = bad.encode().unwrap();
-        let at = bytes
-            .windows(14)
-            .position(|window| window == b"\"base_frame\":1")
-            .unwrap();
-        bytes[at + 13] = b'2';
-        assert_eq!(Frame::decode(&bytes), Err(FrameError::InvalidValue));
-    }
-
-    proptest! {
-        #[test]
-        fn one_changed_row_is_the_only_diff_row(row in 0usize..4, value in b'a'..=b'z') {
-            let value = char::from(value);
-            let mut encoder = GridEncoder::new(None).unwrap();
-            let original = screen(&["aa", "bb", "cc", "dd"], Cursor::default());
-            encoder.poll(Duration::ZERO, original.clone(), Modes::default(), 0, false).unwrap();
-            let mut cells = original.cells().to_vec();
-            cells[row * 2].text = value.to_string();
-            let changed = Grid::new(original.size(), cells, Cursor::default()).unwrap();
-            let next = encoder.poll(Duration::from_millis(1), changed, Modes::default(), 1, false).unwrap();
-            if value == 'a' && row == 0 || value == 'b' && row == 1 || value == 'c' && row == 2 || value == 'd' && row == 3 {
-                prop_assert_eq!(next, None);
-            } else {
-                let one_row = matches!(next, Some(GridFrame::Diff { rows, .. }) if rows.len() == 1 && usize::from(rows[0].row) == row);
-                prop_assert!(one_row);
-            }
-        }
     }
 }

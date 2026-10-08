@@ -82,7 +82,7 @@ impl<'a> Channel<'a> {
         if self.policy.detached() {
             return Err(ChannelError::Client(ClientError::Detached));
         }
-        if !grid.due(now) {
+        if !grid.due(now).map_err(ChannelError::Grid)? {
             return Ok(None);
         }
         let Some((screen, modes, sequence, lost)) = self

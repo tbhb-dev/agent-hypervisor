@@ -865,7 +865,9 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                 lost,
             )
         });
-        self.holder.resynced(id)?;
+        if value.is_some() {
+            self.holder.resynced(id)?;
+        }
         Ok(value)
     }
 

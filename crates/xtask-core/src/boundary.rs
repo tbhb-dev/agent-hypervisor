@@ -620,11 +620,15 @@ mod tests {
                 REQUIRED_FORBID.join(", ")
             ),
             format!(
-                "macro_rules! unused ( () => {{ #![forbid({})] }} );",
+                "macro_rules! unused ( () => ( #![forbid({})] ) );",
                 REQUIRED_FORBID.join(", ")
             ),
             format!(
-                "macro_rules! unused [ () => {{ #![forbid({})] }} ];",
+                "macro_rules! unused [ () => [ #![forbid({})] ] ];",
+                REQUIRED_FORBID.join(", ")
+            ),
+            format!(
+                "macro_rules! unused {{ () => {{ {{}} #![forbid({})] }} }}",
                 REQUIRED_FORBID.join(", ")
             ),
         ] {

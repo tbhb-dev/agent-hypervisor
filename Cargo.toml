@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 ghostty-vt-sys = { path = "crates/ghostty-vt-sys" }
 hypervisor-core = { path = "crates/hypervisor-core" }
+hypervisor-ghostty = { path = "crates/hypervisor-ghostty" }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 serde_json = "1.0.151"
 xtask-core = { path = "crates/xtask-core" }

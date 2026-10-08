@@ -1,0 +1,20 @@
+[package]
+name = "hypervisor-ghostty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The hypervisor's terminal emulator on ghostty-vt"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ghostty-vt-sys.workspace = true
+hypervisor-core.workspace = true
+
+[dev-dependencies]
+alacritty_terminal = { version = "=0.26.0", default-features = false }
+serde_json.workspace = true
+
+[lints]
+workspace = true

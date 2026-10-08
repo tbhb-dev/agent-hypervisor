@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use hypervisor_core::emulator::{Cursor, Emulator, PROFILE, QueryScanner, Size};
+use hypervisor_core::emulator::{Cursor, Emulator, Grid, Modes, PROFILE, QueryScanner, Size};
 use hypervisor_core::screen::{RuleDetector, ScreenDetector};
 use hypervisor_core::session::{
     Effect, Exit, Holder, HolderConfig, Input, Phase, Refusal, RingRead, SessionEvent, Signal,
@@ -31,6 +31,7 @@ pub mod channel;
 
 /// The most messages handled before pending size requests settle.
 const BATCH: usize = 64;
+type GridSnapshot = (Grid, Modes, u64, bool);
 
 /// A request to a running session.
 #[derive(Debug)]
@@ -76,6 +77,8 @@ pub enum Command {
     ReadViewer(ViewerId, Sender<Result<ViewerRead, Refusal>>),
     /// Return a grid snapshot and the next output sequence, then resume live output.
     ViewerSnapshot(ViewerId, Sender<Result<(u64, Vec<u8>), Refusal>>),
+    /// Capture the active grid, modes, and byte offset in one actor turn.
+    ViewerGrid(ViewerId, Sender<Result<Option<GridSnapshot>, Refusal>>),
     /// Interrupt from the lock holder.
     Interrupt(Writer, Sender<Result<(), Refusal>>),
     /// Signal the foreground group from the write-lock holder.
@@ -511,6 +514,15 @@ impl SessionHandle {
         self.send(Command::ViewerSnapshot(id, reply));
         answer.recv().unwrap_or(Err(Refusal::UnknownViewer))
     }
+    /// Return a grid snapshot and clear this grid viewer's byte queue.
+    ///
+    /// # Errors
+    /// If the viewer is not attached or the actor has ended.
+    pub fn viewer_grid(&self, id: ViewerId) -> Result<Option<GridSnapshot>, Refusal> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Command::ViewerGrid(id, reply));
+        answer.recv().unwrap_or(Err(Refusal::UnknownViewer))
+    }
     /// Sends a command. A command sent after the session thread has ended is dropped; the
     /// event channel's disconnection reports that end.
     pub fn send(&self, command: Command) {
@@ -802,6 +814,10 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                     let _ = reply.send(self.holder.resynced(id).map(|()| (next, snapshot)));
                     return;
                 }
+                Command::ViewerGrid(id, reply) => {
+                    let _ = reply.send(self.viewer_grid(id));
+                    return;
+                }
                 Command::Interrupt(who, reply) => {
                     let _ = reply.send(self.step(Input::Interrupt(who)));
                     return;
@@ -836,6 +852,21 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
             }
         }
         result
+    }
+
+    fn viewer_grid(&mut self, id: ViewerId) -> Result<Option<GridSnapshot>, Refusal> {
+        let lost = matches!(self.holder.read_viewer(id)?, ViewerRead::Resync { .. });
+        let screen = self.emulator.as_ref().filter(|_| self.holder.has_screen());
+        let value = screen.map(|emulator| {
+            (
+                emulator.grid(),
+                emulator.modes(),
+                self.holder.ring().next(),
+                lost,
+            )
+        });
+        self.holder.resynced(id)?;
+        Ok(value)
     }
 
     fn observe_screen(&mut self) {

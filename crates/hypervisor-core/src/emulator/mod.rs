@@ -18,6 +18,7 @@ pub use reply::{
 pub use supplement::{CsiEffect, TRACKED_MODES, csi_effects};
 pub use vt::serialize;
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A terminal size in cells. Both dimensions are at least one.
@@ -73,7 +74,7 @@ impl Size {
 }
 
 /// A cell color.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Color {
     /// The terminal's default foreground or background.
     #[default]
@@ -85,7 +86,7 @@ pub enum Color {
 }
 
 /// SGR attributes other than underline and color, as a bit set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Attrs(u8);
 
 impl Attrs {
@@ -140,7 +141,7 @@ impl Attrs {
 }
 
 /// Underline style, SGR 4 and its `4:n` forms.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Underline {
     /// No underline.
     #[default]
@@ -158,7 +159,7 @@ pub enum Underline {
 }
 
 /// How much of a wide character a cell holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum CellWidth {
     /// One column.
     #[default]
@@ -188,6 +189,8 @@ pub struct Cell {
     pub underline: Underline,
     /// Width class.
     pub width: CellWidth,
+    /// The OSC 8 URI, if present. A grid frame assigns its own hyperlink id.
+    pub hyperlink: Option<String>,
 }
 
 impl Default for Cell {
@@ -208,6 +211,7 @@ impl Cell {
             attrs: Attrs::NONE,
             underline: Underline::None,
             width: CellWidth::Narrow,
+            hyperlink: None,
         }
     }
 
@@ -219,7 +223,7 @@ impl Cell {
 }
 
 /// Cursor position, zero-based, on the active screen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Cursor {
     /// Row from the top.
     pub row: u16,
@@ -344,7 +348,7 @@ impl Grid {
 }
 
 /// Which screen buffer is active.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Screen {
     /// The primary screen, which holds the scrollback.
     #[default]
@@ -354,7 +358,7 @@ pub enum Screen {
 }
 
 /// Which mouse events the application asked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum MouseTracking {
     /// No mouse reporting.
     #[default]
@@ -389,7 +393,7 @@ impl MouseTracking {
 }
 
 /// How mouse reports are encoded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum MouseFormat {
     /// The original X10 byte encoding.
     #[default]
@@ -428,7 +432,7 @@ impl MouseFormat {
     clippy::struct_excessive_bools,
     reason = "each flag mirrors one independent DEC private mode"
 )]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Modes {
     /// The active screen.
     pub screen: Screen,

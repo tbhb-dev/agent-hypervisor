@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use crate::emulator::{PROFILE, Size};
+use crate::grid_channel::GridFrame;
 /// The sole version implemented by this prototype.
 pub const VERSION: u16 = 1;
 /// Maximum frame length after the four-byte prefix, including the typed header.
@@ -152,6 +153,9 @@ pub struct OpenRequest {
     pub client: Capabilities,
     #[serde(deserialize_with = "required_nullable")]
     pub resume: Option<ResumeToken>,
+    /// Grid output cap. Omitted for existing version-one clients.
+    #[serde(default)]
+    pub max_frames_per_second: Option<u16>,
 }
 
 fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -337,6 +341,7 @@ pub enum Frame {
     Control(Control),
     ControlResult(ControlResult),
     Event(Event),
+    Grid(GridFrame),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -377,6 +382,7 @@ impl Frame {
             Self::Control(v) => (VERSION, 6, json(v)?),
             Self::ControlResult(v) => (VERSION, 7, json(v)?),
             Self::Event(v) => (VERSION, 8, json(v)?),
+            Self::Grid(v) => (VERSION, 9, json(v)?),
         };
         let length = HEADER + payload.len();
         if length > MAX_FRAME {
@@ -427,6 +433,7 @@ impl Frame {
             6 => Self::Control(parse(payload)?),
             7 => Self::ControlResult(parse(payload)?),
             8 => Self::Event(parse(payload)?),
+            9 => Self::Grid(parse(payload)?),
             _ => return Err(FrameError::UnknownType),
         };
         frame.validate()?;
@@ -461,6 +468,7 @@ impl Frame {
                 return Err(FrameError::InvalidValue);
             }
             Self::Resize(v) if v.cols == 0 || v.rows == 0 => return Err(FrameError::InvalidValue),
+            Self::Grid(v) => v.validate()?,
             Self::Event(Event::SessionStateChanged(value))
                 if !matches!(
                     value.as_str(),
@@ -520,6 +528,7 @@ mod tests {
                 flags: 0,
             },
             resume: None,
+            max_frames_per_second: None,
         }
     }
 

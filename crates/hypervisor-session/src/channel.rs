@@ -2,11 +2,14 @@
 
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::Duration;
 
 use hypervisor_core::channel::{
-    Control, ControlResult, Event, Frame, OpenRefusal, OpenRefused, OpenRequest, OpenResponse,
+    Control, ControlResult, Encoding, Event, Frame, FrameError, OpenRefusal, OpenRefused,
+    OpenRequest, OpenResponse,
 };
 use hypervisor_core::channel_policy::{ChannelPolicy, ClientAction, ClientError};
+use hypervisor_core::grid_channel::GridEncoder;
 use hypervisor_core::session::{Refusal, ViewerId, Writer};
 
 use crate::{SequencedEvent, SessionHandle};
@@ -19,6 +22,7 @@ pub struct Channel<'a> {
     viewer: ViewerId,
     events: Receiver<SequencedEvent>,
     policy: ChannelPolicy,
+    grid: Option<GridEncoder>,
 }
 
 impl<'a> Channel<'a> {
@@ -33,6 +37,14 @@ impl<'a> Channel<'a> {
     ) -> Result<(Self, Frame), Box<Frame>> {
         let policy = ChannelPolicy::open(request)
             .map_err(|refused| Box::new(Frame::OpenRefused(refused)))?;
+        let grid = if request.encoding == Encoding::Grid {
+            Some(
+                GridEncoder::new(request.max_frames_per_second)
+                    .map_err(|_| refusal(OpenRefusal::InvalidRequest))?,
+            )
+        } else {
+            None
+        };
         let size = request
             .size
             .into_session()
@@ -52,9 +64,37 @@ impl<'a> Channel<'a> {
                 viewer,
                 events,
                 policy,
+                grid,
             },
             response,
         ))
+    }
+
+    /// Poll the active grid using caller supplied monotonic time. The first result is full.
+    ///
+    /// # Errors
+    /// If the channel is not grid encoded, the viewer is gone, or a frame cannot be encoded.
+    pub fn poll_grid(&mut self, now: Duration) -> Result<Option<Frame>, ChannelError> {
+        let grid = self
+            .grid
+            .as_mut()
+            .ok_or(ChannelError::Client(ClientError::UnexpectedFrame))?;
+        if self.policy.detached() {
+            return Err(ChannelError::Client(ClientError::Detached));
+        }
+        if !grid.due(now) {
+            return Ok(None);
+        }
+        let Some((screen, modes, sequence, lost)) = self
+            .session
+            .viewer_grid(self.viewer)
+            .map_err(ChannelError::Refused)?
+        else {
+            return Ok(None);
+        };
+        grid.poll(now, screen, modes, sequence, lost)
+            .map(|frame| frame.map(Frame::Grid))
+            .map_err(ChannelError::Grid)
     }
 
     /// Apply a client frame. Input is dropped when this channel is read-only or lacks the lock.
@@ -122,6 +162,7 @@ impl Drop for Channel<'_> {
 pub enum ChannelError {
     Client(ClientError),
     Refused(Refusal),
+    Grid(FrameError),
 }
 
 fn refusal(reason: OpenRefusal) -> Box<Frame> {

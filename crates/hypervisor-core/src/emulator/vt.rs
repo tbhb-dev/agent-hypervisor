@@ -7,7 +7,7 @@
 //!
 //! The output assumes a terminal of the grid's size. It redraws only the active screen: entering
 //! the alternate screen leaves the viewer's primary screen blank. Scroll regions, tab stops,
-//! charsets, hyperlinks, titles, the palette, and kitty keyboard flags are not carried, nor is
+//! charsets, titles, the palette, and kitty keyboard flags are not carried, nor is
 //! a pending wrap at the cursor.
 
 use std::fmt::Write as _;
@@ -84,9 +84,20 @@ fn draw_rows(out: &mut String, grid: &Grid) {
             start = 2;
         }
     }
+    if pen.hyperlink.is_some() {
+        out.push_str("\x1b]8;;\x1b\\");
+    }
 }
 
 fn draw(out: &mut String, pen: &mut Cell, cell: &Cell) {
+    if pen.hyperlink != cell.hyperlink {
+        out.push_str("\x1b]8;;");
+        if let Some(uri) = &cell.hyperlink {
+            out.push_str(uri);
+        }
+        out.push_str("\x1b\\");
+        pen.hyperlink.clone_from(&cell.hyperlink);
+    }
     if !same_style(pen, cell) {
         sgr(out, cell);
         pen.clone_from(cell);
@@ -331,6 +342,17 @@ mod tests {
             out.contains("\x1b[0;4:3;38;2;1;2;3;48;5;200;58;2;9;8;7mu"),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn hyperlink_is_opened_and_closed_around_its_cells() {
+        let linked = Cell {
+            hyperlink: Some("https://example.test/a".into()),
+            ..text("a")
+        };
+        let g = grid(2, 1, vec![linked, text("b")], Cursor::default());
+        let out = as_text(&serialize(&g, &Modes::default()));
+        assert!(out.contains("\x1b]8;;https://example.test/a\x1b\\a\x1b]8;;\x1b\\b"));
     }
 
     proptest! {

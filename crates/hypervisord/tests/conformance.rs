@@ -132,6 +132,17 @@ fn wait_for_output(session: &SessionHandle, text: &str) -> String {
     }
 }
 
+fn wait_for_screen(session: &SessionHandle, text: &str) {
+    let start = Instant::now();
+    while !session
+        .snapshot()
+        .is_some_and(|screen| String::from_utf8_lossy(&screen).contains(text))
+    {
+        assert!(start.elapsed() < WAIT, "missing {text:?} on screen");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn event_until(
     session: &SessionHandle,
     wanted: impl Fn(SessionEvent) -> bool,
@@ -334,7 +345,7 @@ fn terminal_channel_refuses_unsupported_versions_and_unimplemented_encodings() {
 #[test]
 fn terminal_channel_reports_resync_after_viewer_overflow() {
     let fixture = Fixture::start(
-        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; IFS= read -r line; i=0; while [ $i -lt 70 ]; do printf '%1024s' x; i=$((i+1)); done; IFS= read -r line",
+        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; IFS= read -r line; i=0; while [ $i -lt 70 ]; do printf '%1024s' x; i=$((i+1)); done; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
     );
     let session = fixture.session();
     let pgid = fixture_pgid(&wait_for_output(session, "ready"));
@@ -362,7 +373,19 @@ fn terminal_channel_reports_resync_after_viewer_overflow() {
         };
         assert_eq!(oldest, retained_oldest);
         assert_eq!(channel.next_output(), Ok(None));
-        assert!(matches!(channel.snapshot(), Ok(Frame::Snapshot { .. })));
+        let Frame::Snapshot { next_sequence, .. } = channel.snapshot().unwrap() else {
+            panic!("missing resync snapshot")
+        };
+        assert_eq!(channel.next_output(), Ok(None));
+        channel
+            .receive(Frame::Input(b"after-resync\n".to_vec()))
+            .unwrap();
+        wait_for_output(session, "got:after-resync");
+        let Frame::Output { sequence, bytes } = channel.next_output().unwrap().unwrap() else {
+            panic!("missing post-resync output")
+        };
+        assert_eq!(sequence, next_sequence);
+        assert!(String::from_utf8_lossy(&bytes).contains("got:after-resync"));
         assert!(matches!(
             session.read_from(response.starting_sequence),
             Some(RingRead::Bytes(bytes)) if !bytes.is_empty()
@@ -414,6 +437,19 @@ fn terminal_channel_snapshots_modes_and_streams_sequenced_output() {
             Frame::decode(&encoded),
             Ok(Some((Frame::Output { sequence, bytes }, encoded.len())))
         );
+        channel.receive(Frame::Input(b"queued\n".to_vec())).unwrap();
+        wait_for_output(session, "got:queued");
+        let Frame::Snapshot { next_sequence, .. } = channel.snapshot().unwrap() else {
+            panic!("missing replacement snapshot")
+        };
+        assert_eq!(channel.next_output(), Ok(None));
+        channel.receive(Frame::Input(b"after\n".to_vec())).unwrap();
+        wait_for_output(session, "got:after");
+        let Frame::Output { sequence, bytes } = channel.next_output().unwrap().unwrap() else {
+            panic!("missing output after replacement snapshot")
+        };
+        assert_eq!(sequence, next_sequence);
+        assert!(String::from_utf8_lossy(&bytes).contains("got:after"));
     }
     fixture.finish(pgid);
 }
@@ -448,16 +484,29 @@ fn terminal_channel_replays_retained_bytes_and_snapshots_evicted_bytes() {
     let Frame::OpenResponse(response) = response else {
         panic!("wrong open response")
     };
+    session
+        .submit(Writer::Program(9), b"live\n".to_vec())
+        .unwrap();
+    wait_for_output(session, "got:live");
     let Frame::Output { sequence, bytes } = replay.next_output().unwrap().unwrap() else {
         panic!("missing replay")
     };
     assert_eq!(sequence, resume_at);
     assert_eq!(response.starting_sequence, resume_at + bytes.len() as u64);
     assert!(String::from_utf8_lossy(&bytes).contains("got:away"));
+    let Frame::Output {
+        sequence,
+        bytes: live,
+    } = replay.next_output().unwrap().unwrap()
+    else {
+        panic!("missing live output after replay")
+    };
+    assert_eq!(sequence, response.starting_sequence);
+    assert!(String::from_utf8_lossy(&live).contains("got:live"));
     assert_eq!(replay.next_output(), Ok(None));
     drop(replay);
     request.resume = Some(hypervisor_core::channel::ResumeToken {
-        next_sequence: response.starting_sequence,
+        next_sequence: sequence + live.len() as u64,
     });
     let (mut current, _) = Channel::open(session, ViewerId(88), &request).unwrap();
     assert_eq!(current.next_output(), Ok(None));
@@ -465,17 +514,7 @@ fn terminal_channel_replays_retained_bytes_and_snapshots_evicted_bytes() {
     let mut long = vec![b'x'; 100];
     long.push(b'\n');
     session.submit(Writer::Program(9), long).unwrap();
-    let start = Instant::now();
-    while !session
-        .snapshot()
-        .is_some_and(|screen| String::from_utf8_lossy(&screen).contains("xxxxxxxxxx"))
-    {
-        assert!(
-            start.elapsed() < WAIT,
-            "long output did not reach the screen"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_screen(session, "xxxxxxxxxx");
     request.resume = Some(hypervisor_core::channel::ResumeToken { next_sequence: 0 });
     let (mut snapshot, response) = Channel::open(session, ViewerId(87), &request).unwrap();
     let Frame::OpenResponse(response) = response else {
@@ -490,6 +529,15 @@ fn terminal_channel_replays_retained_bytes_and_snapshots_evicted_bytes() {
     };
     assert_eq!(response.starting_sequence, next_sequence);
     assert!(String::from_utf8_lossy(&bytes).contains("xxxxxxxxxx"));
+    session
+        .submit(Writer::Program(9), b"after-snapshot\n".to_vec())
+        .unwrap();
+    wait_for_screen(session, "got:after-snapshot");
+    let Frame::Output { sequence, bytes } = snapshot.next_output().unwrap().unwrap() else {
+        panic!("missing live output after replacement snapshot")
+    };
+    assert_eq!(sequence, next_sequence);
+    assert!(String::from_utf8_lossy(&bytes).contains("got:after-snapshot"));
     drop(snapshot);
     fixture.finish(pgid);
 }

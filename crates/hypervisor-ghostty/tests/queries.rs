@@ -72,6 +72,17 @@ fn modes_follow_the_sequences() {
 }
 
 #[test]
+fn snapshot_replaces_stale_alternate_screen_and_modes() {
+    let mut stale = emulator();
+    stale.feed(b"old\x1b[?1049h\x1b[?1h\x1b=\x1b[?7l\x1b[?9h\x1b[?1006h\x1b[?1007h\x1b[?1004h\x1b[?2004h\x1b[?2027h\x1b[?25l\x1b[>7u");
+    let mut target = emulator();
+    target.feed(b"new");
+    stale.feed(&target.serialize_vt());
+    assert!(diff(&target.grid(), &stale.grid()).is_empty());
+    assert_eq!(stale.modes(), target.modes());
+}
+
+#[test]
 fn resize_changes_the_size() {
     let mut emu = emulator();
     let size = Size::new(132, 50).expect("size");

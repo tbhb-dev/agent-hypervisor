@@ -1,8 +1,8 @@
 //! Pure admission and client-frame decisions for one terminal channel.
 
 use crate::channel::{
-    Control, Encoding, Frame, Mode, OpenRefusal, OpenRefused, OpenRequest, VERSION, WireSize,
-    negotiate,
+    Control, Encoding, Frame, FrameError, Mode, OpenRefusal, OpenRefused, OpenRequest, VERSION,
+    WireSize, negotiate,
 };
 use crate::session::RingRead;
 
@@ -12,6 +12,29 @@ pub enum ByteStart {
     Replay(Vec<u8>),
     Snapshot,
     Ahead,
+}
+
+/// Why a grid-derived snapshot cannot be sent to a viewer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotRefusal {
+    Empty,
+    Frame(FrameError),
+}
+
+/// Validate the complete wire frame before the shell admits or resumes a viewer.
+///
+/// # Errors
+/// An unavailable screen or a snapshot that cannot fit in one frame.
+pub fn snapshot_frame(next_sequence: u64, bytes: Vec<u8>) -> Result<Frame, SnapshotRefusal> {
+    if bytes.is_empty() {
+        return Err(SnapshotRefusal::Empty);
+    }
+    let frame = Frame::Snapshot {
+        next_sequence,
+        bytes,
+    };
+    frame.encode().map_err(SnapshotRefusal::Frame)?;
+    Ok(frame)
 }
 
 /// Choose replay only when every requested byte through the attachment point is retained.
@@ -209,7 +232,34 @@ mod tests {
         assert_eq!(byte_start(Some(6), 5, None), ByteStart::Ahead);
     }
 
+    #[test]
+    fn snapshot_frame_refuses_empty_and_oversized_screens() {
+        assert_eq!(snapshot_frame(3, vec![]), Err(SnapshotRefusal::Empty));
+        assert_eq!(
+            snapshot_frame(3, vec![b'x'; crate::channel::MAX_FRAME]),
+            Err(SnapshotRefusal::Frame(FrameError::TooLarge))
+        );
+        assert_eq!(
+            snapshot_frame(3, b"vt".to_vec()),
+            Ok(Frame::Snapshot {
+                next_sequence: 3,
+                bytes: b"vt".to_vec()
+            })
+        );
+    }
+
     proptest! {
+        #[test]
+        fn nonempty_snapshots_keep_the_sequence_and_bytes(
+            sequence in any::<u64>(),
+            bytes in proptest::collection::vec(any::<u8>(), 1..1000),
+        ) {
+            prop_assert_eq!(
+                snapshot_frame(sequence, bytes.clone()),
+                Ok(Frame::Snapshot { next_sequence: sequence, bytes })
+            );
+        }
+
         #[test]
         fn replay_ends_at_attachment_even_when_read_includes_later_output(
             sequence in 0u64..1_000_000,

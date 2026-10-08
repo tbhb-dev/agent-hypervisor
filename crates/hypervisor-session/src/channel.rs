@@ -9,7 +9,8 @@ use hypervisor_core::channel::{
     OpenResponse, output_frames,
 };
 use hypervisor_core::channel_policy::{
-    ByteStart, ChannelPolicy, ClientAction, ClientError, byte_start,
+    ByteStart, ChannelPolicy, ClientAction, ClientError, SnapshotRefusal, byte_start,
+    snapshot_frame,
 };
 use hypervisor_core::session::{Refusal, ViewerId, ViewerRead, Writer};
 
@@ -62,21 +63,17 @@ impl<'a> Channel<'a> {
                 attached_at
             }
             ByteStart::Snapshot => {
-                let (next, bytes) = match session.viewer_snapshot(viewer) {
-                    Ok(snapshot) if !snapshot.1.is_empty() => snapshot,
-                    _ => {
-                        let _ = session.detach(viewer);
-                        return Err(refusal(OpenRefusal::SessionRefused));
-                    }
-                };
-                let snapshot = Frame::Snapshot {
-                    next_sequence: next,
-                    bytes,
-                };
-                if snapshot.encode().is_err() {
+                let Ok((next, bytes)) = session.viewer_snapshot(viewer) else {
                     let _ = session.detach(viewer);
                     return Err(refusal(OpenRefusal::SessionRefused));
-                }
+                };
+                let snapshot = match open_snapshot(next, bytes) {
+                    Ok(frame) => frame,
+                    Err(reason) => {
+                        let _ = session.detach(viewer);
+                        return Err(refusal(reason));
+                    }
+                };
                 initial.push_back(snapshot);
                 next
             }
@@ -139,21 +136,14 @@ impl<'a> Channel<'a> {
             .session
             .viewer_snapshot(self.viewer)
             .map_err(ChannelError::Refused)?;
-        if bytes.is_empty() {
-            let _ = self.session.detach(self.viewer);
-            self.policy.control_result(Control::Detach, true);
-            return Err(ChannelError::Unavailable);
+        match resync_snapshot(next_sequence, bytes) {
+            Ok(frame) => Ok(frame),
+            Err(error) => {
+                let _ = self.session.detach(self.viewer);
+                self.policy.control_result(Control::Detach, true);
+                Err(error)
+            }
         }
-        let frame = Frame::Snapshot {
-            next_sequence,
-            bytes,
-        };
-        if let Err(error) = frame.encode() {
-            let _ = self.session.detach(self.viewer);
-            self.policy.control_result(Control::Detach, true);
-            return Err(ChannelError::Frame(error));
-        }
-        Ok(frame)
     }
 
     /// Apply a client frame. Input is dropped when this channel is read-only or lacks the lock.
@@ -230,4 +220,39 @@ fn refusal(reason: OpenRefusal) -> Box<Frame> {
         reason,
         supported_versions: vec![hypervisor_core::channel::VERSION],
     }))
+}
+
+fn open_snapshot(next: u64, bytes: Vec<u8>) -> Result<Frame, OpenRefusal> {
+    snapshot_frame(next, bytes).map_err(|_| OpenRefusal::SessionRefused)
+}
+
+fn resync_snapshot(next: u64, bytes: Vec<u8>) -> Result<Frame, ChannelError> {
+    snapshot_frame(next, bytes).map_err(|error| match error {
+        SnapshotRefusal::Empty => ChannelError::Unavailable,
+        SnapshotRefusal::Frame(error) => ChannelError::Frame(error),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hypervisor_core::channel::MAX_FRAME;
+
+    #[test]
+    fn open_refuses_empty_and_oversized_snapshots() {
+        assert_eq!(open_snapshot(2, vec![]), Err(OpenRefusal::SessionRefused));
+        assert_eq!(
+            open_snapshot(2, vec![b'x'; MAX_FRAME]),
+            Err(OpenRefusal::SessionRefused)
+        );
+    }
+
+    #[test]
+    fn resync_maps_empty_and_oversized_snapshots_to_terminal_errors() {
+        assert_eq!(resync_snapshot(2, vec![]), Err(ChannelError::Unavailable));
+        assert_eq!(
+            resync_snapshot(2, vec![b'x'; MAX_FRAME]),
+            Err(ChannelError::Frame(FrameError::TooLarge))
+        );
+    }
 }

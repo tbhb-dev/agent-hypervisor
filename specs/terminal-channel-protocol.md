@@ -16,7 +16,7 @@ An accepted open attaches a viewer in the requested mode with its requested size
 
 ## Run 14 byte encoding and resume
 
-`Snapshot` (type 9) has an eight-byte unsigned big-endian `next_sequence` followed by nonempty VT bytes. The server serializes the current emulator grid and its tracked modes on the actor thread. The VT begins with a terminal soft reset and clear. It redraws the active screen, restores tracked input modes, then places the cursor. An alternate screen snapshot enters that screen before drawing. The snapshot describes the state after all output bytes before `next_sequence`. Later `Output` frames begin there. A fresh attach sends this snapshot after `OpenResponse`.
+`Snapshot` (type 9) has an eight-byte unsigned big-endian `next_sequence` followed by nonempty VT bytes. The server serializes the current emulator grid and its tracked modes on the actor thread. The VT ends synchronized output and selects the primary or alternate screen. After a soft reset and clear, it redraws active cells and restores tracked modes. It finishes at the saved cursor. A reused viewer leaves the alternate screen and clears stale modes when the snapshot is primary ([#8](https://github.com/tbhb-dev/agent-hypervisor/issues/8)). The snapshot describes the state after all output bytes before `next_sequence`. Later `Output` frames begin there. A fresh attach sends this snapshot after `OpenResponse`.
 
 `Output` (type 10) has an eight-byte unsigned big-endian `sequence` followed by nonempty raw PTY bytes. The offset identifies the first byte in its payload, including NUL or invalid UTF-8, and the next offset is `sequence + payload length`. The receiver must apply these frames in order and request a new snapshot if a gap appears. Both frame types reject a payload shorter than eight bytes, and an output offset must not overflow `u64` after adding its payload length. Replay is split at the common frame limit.
 
@@ -51,11 +51,11 @@ Run 14 checked the same source at `tbhb-dev/agent-orchestration-poc.internal` co
 | --- | --- |
 | Resume from the client's last sequence number. | The merged ring counts byte offsets and `read_from` starts inclusively. The token contains the next byte the client needs. Using the last applied byte would duplicate it. |
 | A slow viewer is dropped and told to resync. | The merged viewer registry retains a paused attachment. The channel preserves that behavior and exposes a fresh snapshot operation after its resync event. |
-| Snapshot the screen and mode state as VT for xterm.js and native terminals. | The merged grid serializer restores the tracked modes but does not capture scroll regions, tab stops, charsets, hyperlinks, titles, palette changes, kitty keyboard flags, or pending wrap. Client rendering against xterm.js and native terminals remains untested until the later client phases. |
+| Snapshot the screen and mode state as VT for xterm.js and native terminals. | The serializer resets stale viewer modes and restores the tracked active modes ([#8](https://github.com/tbhb-dev/agent-hypervisor/issues/8)). Scroll regions, tab stops, charsets, hyperlinks, titles, palette changes, pending wrap, and the kitty keyboard stack remain tracked gaps ([#66](https://github.com/tbhb-dev/agent-hypervisor/issues/66)). Client rendering against xterm.js and native terminals remains untested ([#44](https://github.com/tbhb-dev/agent-hypervisor/issues/44)). |
 
 ## Untested limits
 
-- Client rendering of byte snapshots in xterm.js and native terminals remains unverified ([#44](https://github.com/tbhb-dev/agent-hypervisor/issues/44)). The Phase 5 snapshot-fidelity suite checks the serializer's omitted state against live harness screens.
+- Client rendering of byte snapshots in xterm.js and native terminals remains unverified ([#44](https://github.com/tbhb-dev/agent-hypervisor/issues/44)). The omitted serializer state has an explicit disposition and test tracker ([#66](https://github.com/tbhb-dev/agent-hypervisor/issues/66)).
 - Grid frames, row diffs, frame-rate limits, and scrollback await run 15 ([#51](https://github.com/tbhb-dev/agent-hypervisor/issues/51)).
 - Spawn targets require caller-side resolution until the runtime driver is connected in run 17 ([#52](https://github.com/tbhb-dev/agent-hypervisor/issues/52)).
 - Frame behavior on Unix sockets, WebSockets, and multiplexed streams is untested until transports exist ([#53](https://github.com/tbhb-dev/agent-hypervisor/issues/53)).

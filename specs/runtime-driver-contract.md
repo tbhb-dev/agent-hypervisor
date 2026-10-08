@@ -32,6 +32,8 @@ Test labels start with `dev.tbhb.hypervisor.test.owner-<pid>-`, which records th
 
 Three more macOS-only tests cover survival. A separate daemon process adopts a launchd shim and its session. A daemon binary swapped by rename adopts the same shim PID, whose job still names its pinned program. A shim killed with `SIGKILL` is restarted by launchd and reported as restarted with no sessions.
 
+The launchd integration tests require `launchctl bootstrap`, which returns status 5 inside the Codex worker sandbox. `mise run check` keeps them in the test binary as visibly ignored cases and prints a notice that they did not run. `mise run check:host` runs all cases, including the child-run cleanup cases, on an unsandboxed macOS host and checks for surviving fixture groups and jobs. Before merge, the reviewer records a passing host run at the PR's current head SHA and names the host. The Linux CI `check` cannot establish launchd behavior. An unavailable or failing host run blocks merge ([#107](https://github.com/tbhb-dev/agent-hypervisor/issues/107)).
+
 ## Run 19 Seatbelt driver
 
 Run 19 builds source lines 177 and 178 and proposal line 116 at vault commit `331d791c3704663135a8899cb44867714e9dc800`. The host shim also serves `seatbelt` workloads. `validate_workload` dispatches on the runtime and refuses `apple_container`. A seatbelt workload needs `seatbelt` isolation, no image, credential references, or resource limits, and `host` or `deny` network. `isolated` is refused ([#113](https://github.com/tbhb-dev/agent-hypervisor/issues/113)). A mount specifies one absolute path, with its source equal to its target, because Seatbelt grants access and cannot remap. `create` canonicalizes mount paths, since Seatbelt matches physical paths such as `/private/tmp`.

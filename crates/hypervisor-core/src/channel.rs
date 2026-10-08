@@ -99,7 +99,12 @@ pub enum SessionKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum OpenTarget {
     Session(String),
     Spawn(WireSpawnSpec),
@@ -145,7 +150,16 @@ pub struct OpenRequest {
     pub encoding: Encoding,
     pub size: WireSize,
     pub client: Capabilities,
+    #[serde(deserialize_with = "required_nullable")]
     pub resume: Option<ResumeToken>,
+}
+
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,9 +241,14 @@ impl ControlResult {
     }
 }
 
-/// Events are channel scoped, except session state and exit, which all viewers receive.
+/// Mode and resync events are viewer scoped; size, writer, state, and exit are shared.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum Event {
     ModeChanged(Mode),
     SizeChanged(WireSize),
@@ -245,7 +264,12 @@ pub enum Event {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "id",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum WireWriter {
     Viewer(u64),
     Program(u64),
@@ -437,6 +461,20 @@ impl Frame {
                 return Err(FrameError::InvalidValue);
             }
             Self::Resize(v) if v.cols == 0 || v.rows == 0 => return Err(FrameError::InvalidValue),
+            Self::Event(Event::SessionStateChanged(value))
+                if !matches!(
+                    value.as_str(),
+                    "unknown"
+                        | "idle"
+                        | "working"
+                        | "blocked_approval"
+                        | "blocked_input"
+                        | "blocked_unknown"
+                        | "exited"
+                ) =>
+            {
+                return Err(FrameError::InvalidValue);
+            }
             _ => {}
         }
         Ok(())
@@ -483,6 +521,255 @@ mod tests {
             },
             resume: None,
         }
+    }
+
+    fn raw_frame(version: u16, kind: u8, payload: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(3 + u32::try_from(payload.len()).unwrap()).to_be_bytes());
+        bytes.extend_from_slice(&version.to_be_bytes());
+        bytes.push(kind);
+        bytes.extend_from_slice(payload.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn header_versions_are_checked_for_each_open_direction() {
+        for frame in [
+            Frame::OpenRequest(request(OpenTarget::Session("s".into()))),
+            Frame::OpenRefused(OpenRefused {
+                reason: OpenRefusal::UnsupportedVersion,
+                supported_versions: vec![VERSION],
+            }),
+        ] {
+            let mut bytes = frame.encode().unwrap();
+            bytes[4..6].copy_from_slice(&VERSION.to_be_bytes());
+            assert_eq!(Frame::decode(&bytes), Err(FrameError::UnsupportedVersion));
+        }
+        let mut bytes = Frame::Control(Control::Take).encode().unwrap();
+        bytes[4..6].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(Frame::decode(&bytes), Err(FrameError::UnsupportedVersion));
+        bytes[6] = 99;
+        assert_eq!(Frame::decode(&bytes), Err(FrameError::UnsupportedVersion));
+    }
+
+    #[test]
+    fn unknown_and_missing_json_fields_are_refused() {
+        let request = serde_json::to_value(request(OpenTarget::Session("s".into()))).unwrap();
+        let mut extra = request.clone();
+        extra["extra"] = serde_json::json!(1);
+        let mut target_extra = request.clone();
+        target_extra["target"]["extra"] = serde_json::json!(1);
+        let mut missing_resume = request;
+        missing_resume.as_object_mut().unwrap().remove("resume");
+        for value in [extra, target_extra, missing_resume] {
+            let bytes = raw_frame(0, 1, &value.to_string());
+            assert_eq!(Frame::decode(&bytes), Err(FrameError::MalformedPayload));
+        }
+        for payload in [
+            r#"{"kind":"session_exited","data":{"code":1,"signal":null,"extra":1}}"#,
+            r#"{"kind":"resync_required","data":{"oldest":1},"extra":1}"#,
+            r#"{"kind":"writer_changed","data":{"kind":"viewer","id":1,"extra":1}}"#,
+        ] {
+            assert_eq!(
+                Frame::decode(&raw_frame(VERSION, 8, payload)),
+                Err(FrameError::MalformedPayload)
+            );
+        }
+    }
+
+    #[test]
+    fn every_open_validation_rejection_is_checked() {
+        let base = request(OpenTarget::Session("s".into()));
+        let mut cases = Vec::new();
+        let mut empty_versions = base.clone();
+        empty_versions.versions.clear();
+        cases.push(empty_versions);
+        let mut zero_cols = base.clone();
+        zero_cols.size.cols = 0;
+        cases.push(zero_cols);
+        let mut zero_rows = base.clone();
+        zero_rows.size.rows = 0;
+        cases.push(zero_rows);
+        let mut empty_terminal = base.clone();
+        empty_terminal.client.terminal.clear();
+        cases.push(empty_terminal);
+        let mut empty_session = base.clone();
+        empty_session.target = OpenTarget::Session(String::new());
+        cases.push(empty_session);
+        let mut empty_command = base;
+        empty_command.target = OpenTarget::Spawn(WireSpawnSpec {
+            command: String::new(),
+            args: vec![],
+            env: vec![],
+            cwd: None,
+            user: None,
+            kind: SessionKind::Shell,
+        });
+        cases.push(empty_command);
+        for case in cases {
+            assert_eq!(
+                Frame::OpenRequest(case.clone()).encode(),
+                Err(FrameError::InvalidValue)
+            );
+            assert_eq!(
+                Frame::decode(&raw_frame(0, 1, &serde_json::to_string(&case).unwrap())),
+                Err(FrameError::InvalidValue)
+            );
+        }
+        let response = OpenResponse::from_session(Mode::ReadOnly, Size::new(80, 24).unwrap(), 0);
+        let mut cases = Vec::new();
+        let mut wrong_version = response.clone();
+        wrong_version.version = 2;
+        cases.push(wrong_version);
+        let mut zero_cols = response.clone();
+        zero_cols.effective_size.cols = 0;
+        cases.push(zero_cols);
+        let mut zero_rows = response;
+        zero_rows.effective_size.rows = 0;
+        cases.push(zero_rows);
+        for case in cases {
+            assert_eq!(
+                Frame::OpenResponse(case.clone()).encode(),
+                Err(FrameError::InvalidValue)
+            );
+            assert_eq!(
+                Frame::decode(&raw_frame(
+                    VERSION,
+                    2,
+                    &serde_json::to_string(&case).unwrap()
+                )),
+                Err(FrameError::InvalidValue)
+            );
+        }
+    }
+
+    #[test]
+    fn holder_events_map_only_to_their_channel() {
+        let viewer = ViewerId(1);
+        let other = ViewerId(2);
+        for mode in [ViewerMode::ReadOnly, ViewerMode::ReadWrite] {
+            let mapped = if mode == ViewerMode::ReadOnly {
+                Mode::ReadOnly
+            } else {
+                Mode::ReadWrite
+            };
+            assert_eq!(
+                Event::from_session(SessionEvent::ModeChanged { viewer, mode }, viewer),
+                Some(Event::ModeChanged(mapped))
+            );
+            assert_eq!(
+                Event::from_session(
+                    SessionEvent::ModeChanged {
+                        viewer: other,
+                        mode
+                    },
+                    viewer
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            Event::from_session(SessionEvent::ResyncRequired { viewer, oldest: 42 }, viewer),
+            Some(Event::ResyncRequired { oldest: 42 })
+        );
+        assert_eq!(
+            Event::from_session(
+                SessionEvent::ResyncRequired {
+                    viewer: other,
+                    oldest: 42
+                },
+                viewer
+            ),
+            None
+        );
+        for (writer, mapped) in [
+            (Some(Writer::Viewer(viewer)), Some(WireWriter::Viewer(1))),
+            (Some(Writer::Program(3)), Some(WireWriter::Program(3))),
+            (None, None),
+        ] {
+            assert_eq!(
+                Event::from_session(SessionEvent::WriterChanged(writer), viewer),
+                Some(Event::WriterChanged(mapped))
+            );
+        }
+        assert_eq!(
+            Event::from_session(SessionEvent::Resized(Size::new(90, 30).unwrap()), viewer),
+            Some(Event::SizeChanged(WireSize { cols: 90, rows: 30 }))
+        );
+    }
+
+    #[test]
+    fn holder_state_exit_and_lifecycle_events_map_correctly() {
+        let viewer = ViewerId(1);
+        for (state, value) in [
+            (AgentState::Unknown, "unknown"),
+            (AgentState::Idle, "idle"),
+            (AgentState::Working, "working"),
+            (
+                AgentState::Blocked {
+                    reason: BlockReason::Approval,
+                },
+                "blocked_approval",
+            ),
+            (
+                AgentState::Blocked {
+                    reason: BlockReason::Input,
+                },
+                "blocked_input",
+            ),
+            (
+                AgentState::Blocked {
+                    reason: BlockReason::Unknown,
+                },
+                "blocked_unknown",
+            ),
+            (AgentState::Exited, "exited"),
+        ] {
+            assert_eq!(
+                Event::from_session(
+                    SessionEvent::StateChanged {
+                        from: AgentState::Unknown,
+                        to: state
+                    },
+                    viewer
+                ),
+                Some(Event::SessionStateChanged(value.into()))
+            );
+        }
+        let exit = crate::session::Exit {
+            code: Some(7),
+            signal: None,
+            raw: Some(7 << 8),
+        };
+        assert_eq!(
+            Event::from_session(SessionEvent::Exited(exit), viewer),
+            Some(Event::SessionExited {
+                code: Some(7),
+                signal: None
+            })
+        );
+        for event in [
+            SessionEvent::Created,
+            SessionEvent::Running,
+            SessionEvent::Attached { viewer },
+            SessionEvent::Detached { viewer },
+            SessionEvent::Reaped,
+        ] {
+            assert_eq!(Event::from_session(event, viewer), None);
+        }
+    }
+
+    #[test]
+    fn unknown_state_values_are_refused() {
+        let payload = r#"{"kind":"session_state_changed","data":"bogus"}"#;
+        assert_eq!(
+            Frame::decode(&raw_frame(VERSION, 8, payload)),
+            Err(FrameError::InvalidValue)
+        );
+        assert_eq!(
+            Frame::Event(Event::SessionStateChanged("bogus".into())).encode(),
+            Err(FrameError::InvalidValue)
+        );
     }
 
     #[test]

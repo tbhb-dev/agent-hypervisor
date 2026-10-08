@@ -94,6 +94,106 @@ fn attach_writer(h: &mut Holder) {
     h.step(Input::Settle, ms(0));
 }
 
+#[test]
+fn writer_signal_requires_the_lock_and_running_child() {
+    let viewer = ViewerId(1);
+    let writer = Writer::Viewer(viewer);
+    let mut h = running(HolderConfig::new(Persistence::Persistent));
+    h.step(
+        Input::Attach {
+            viewer,
+            mode: ViewerMode::ReadWrite,
+            size: size(80, 24),
+            budget: NonZeroUsize::new(64).unwrap(),
+        },
+        ms(0),
+    );
+    assert_eq!(
+        h.step(Input::SendSignal(writer, Signal::Interrupt), ms(1)),
+        vec![Effect::Refused(super::Refusal::NotWriter)]
+    );
+    h.step(Input::Take(writer), ms(2));
+    assert_eq!(
+        h.step(Input::SendSignal(writer, Signal::Interrupt), ms(3)),
+        vec![Effect::Signal {
+            signal: Signal::Interrupt,
+            target: Target::Foreground
+        }]
+    );
+    let mut before_spawn = Holder::new(HolderConfig::new(Persistence::Persistent), size(80, 24));
+    before_spawn.step(
+        Input::Attach {
+            viewer,
+            mode: ViewerMode::ReadWrite,
+            size: size(80, 24),
+            budget: NonZeroUsize::new(64).unwrap(),
+        },
+        ms(0),
+    );
+    before_spawn.step(Input::Take(writer), ms(0));
+    assert!(
+        before_spawn
+            .step(Input::SendSignal(writer, Signal::Interrupt), ms(1))
+            .is_empty()
+    );
+}
+
+#[test]
+fn writer_change_events_follow_real_lock_changes() {
+    let mut h = running(HolderConfig::new(Persistence::Persistent));
+    for viewer in [ViewerId(1), ViewerId(2)] {
+        h.step(
+            Input::Attach {
+                viewer,
+                mode: ViewerMode::ReadWrite,
+                size: size(80, 24),
+                budget: NonZeroUsize::new(64).unwrap(),
+            },
+            ms(0),
+        );
+    }
+    let first = Writer::Viewer(ViewerId(1));
+    let program = Writer::Program(3);
+    assert_eq!(
+        h.step(Input::Take(first), ms(1)),
+        vec![Effect::Emit(SessionEvent::WriterChanged(Some(first)))]
+    );
+    assert!(h.step(Input::Take(first), ms(2)).is_empty());
+    assert_eq!(
+        h.step(Input::Take(program), ms(3)),
+        vec![Effect::Emit(SessionEvent::WriterChanged(Some(program)))]
+    );
+    assert_eq!(
+        h.step(Input::Take(first), ms(4)),
+        vec![Effect::Emit(SessionEvent::WriterChanged(Some(first)))]
+    );
+    assert_eq!(
+        h.step(Input::Detach(ViewerId(2)), ms(5)),
+        vec![Effect::ViewerDetached(ViewerId(2))]
+    );
+    assert_eq!(
+        h.step(Input::Detach(ViewerId(1)), ms(6)),
+        vec![
+            Effect::ViewerDetached(ViewerId(1)),
+            Effect::Emit(SessionEvent::WriterChanged(None))
+        ]
+    );
+    h.step(
+        Input::Attach {
+            viewer: ViewerId(1),
+            mode: ViewerMode::ReadWrite,
+            size: size(80, 24),
+            budget: NonZeroUsize::new(64).unwrap(),
+        },
+        ms(7),
+    );
+    h.step(Input::Take(first), ms(8));
+    assert_eq!(
+        h.step(Input::ReleaseWriter(first), ms(9)),
+        vec![Effect::Emit(SessionEvent::WriterChanged(None))]
+    );
+}
+
 const HANGUP: Effect = Effect::Signal {
     signal: Signal::Hangup,
     target: Target::Group,
@@ -179,7 +279,15 @@ fn a_same_size_take_requests_a_redraw_hint() {
     );
     assert_eq!(
         h.step(Input::Take(Writer::Viewer(ViewerId(1))), ms(1)),
-        vec![]
+        vec![
+            Effect::Emit(SessionEvent::ModeChanged {
+                viewer: ViewerId(1),
+                mode: ViewerMode::ReadWrite
+            }),
+            Effect::Emit(SessionEvent::WriterChanged(Some(Writer::Viewer(ViewerId(
+                1
+            ))))),
+        ]
     );
     assert_eq!(h.step(Input::Settle, ms(1)), vec![Effect::RedrawHint]);
 }

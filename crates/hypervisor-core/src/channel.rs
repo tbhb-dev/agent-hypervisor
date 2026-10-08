@@ -1,6 +1,7 @@
 //! Version-one terminal channel values and transport-independent framing.
 
-use crate::session::{Signal, ViewerMode};
+use crate::session::{SessionEvent, Signal, ViewerId, ViewerMode, Writer};
+use crate::state::{AgentState, BlockReason};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -272,6 +273,57 @@ pub enum Event {
 pub enum WireWriter {
     Viewer(u64),
     Program(u64),
+}
+
+impl Event {
+    /// Map a holder event to one channel's event, omitting unrelated viewer modes.
+    #[must_use]
+    pub fn from_session(event: SessionEvent, viewer: ViewerId) -> Option<Self> {
+        match event {
+            SessionEvent::ModeChanged { viewer: id, mode } if id == viewer => {
+                Some(Self::ModeChanged(match mode {
+                    ViewerMode::ReadOnly => Mode::ReadOnly,
+                    ViewerMode::ReadWrite => Mode::ReadWrite,
+                }))
+            }
+            SessionEvent::WriterChanged(writer) => {
+                Some(Self::WriterChanged(writer.map(|who| match who {
+                    Writer::Viewer(id) => WireWriter::Viewer(id.0),
+                    Writer::Program(id) => WireWriter::Program(id),
+                })))
+            }
+            SessionEvent::Resized(size) => Some(Self::SizeChanged(WireSize {
+                cols: size.cols(),
+                rows: size.rows(),
+            })),
+            SessionEvent::StateChanged { to, .. } => Some(Self::SessionStateChanged(
+                match to {
+                    AgentState::Unknown => "unknown",
+                    AgentState::Idle => "idle",
+                    AgentState::Working => "working",
+                    AgentState::Blocked {
+                        reason: BlockReason::Approval,
+                    } => "blocked_approval",
+                    AgentState::Blocked {
+                        reason: BlockReason::Input,
+                    } => "blocked_input",
+                    AgentState::Blocked {
+                        reason: BlockReason::Unknown,
+                    } => "blocked_unknown",
+                    AgentState::Exited => "exited",
+                }
+                .into(),
+            )),
+            SessionEvent::Exited(exit) => Some(Self::SessionExited {
+                code: exit.code,
+                signal: exit.signal,
+            }),
+            SessionEvent::ResyncRequired { viewer: id, oldest } if id == viewer => {
+                Some(Self::ResyncRequired { oldest })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Version zero is reserved for the open request and refusal so peers can negotiate version one.
@@ -588,6 +640,122 @@ mod tests {
                 )),
                 Err(FrameError::InvalidValue)
             );
+        }
+    }
+
+    #[test]
+    fn holder_events_map_only_to_their_channel() {
+        let viewer = ViewerId(1);
+        let other = ViewerId(2);
+        for mode in [ViewerMode::ReadOnly, ViewerMode::ReadWrite] {
+            let mapped = if mode == ViewerMode::ReadOnly {
+                Mode::ReadOnly
+            } else {
+                Mode::ReadWrite
+            };
+            assert_eq!(
+                Event::from_session(SessionEvent::ModeChanged { viewer, mode }, viewer),
+                Some(Event::ModeChanged(mapped))
+            );
+            assert_eq!(
+                Event::from_session(
+                    SessionEvent::ModeChanged {
+                        viewer: other,
+                        mode
+                    },
+                    viewer
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            Event::from_session(SessionEvent::ResyncRequired { viewer, oldest: 42 }, viewer),
+            Some(Event::ResyncRequired { oldest: 42 })
+        );
+        assert_eq!(
+            Event::from_session(
+                SessionEvent::ResyncRequired {
+                    viewer: other,
+                    oldest: 42
+                },
+                viewer
+            ),
+            None
+        );
+        for (writer, mapped) in [
+            (Some(Writer::Viewer(viewer)), Some(WireWriter::Viewer(1))),
+            (Some(Writer::Program(3)), Some(WireWriter::Program(3))),
+            (None, None),
+        ] {
+            assert_eq!(
+                Event::from_session(SessionEvent::WriterChanged(writer), viewer),
+                Some(Event::WriterChanged(mapped))
+            );
+        }
+        assert_eq!(
+            Event::from_session(SessionEvent::Resized(Size::new(90, 30).unwrap()), viewer),
+            Some(Event::SizeChanged(WireSize { cols: 90, rows: 30 }))
+        );
+    }
+
+    #[test]
+    fn holder_state_exit_and_lifecycle_events_map_correctly() {
+        let viewer = ViewerId(1);
+        for (state, value) in [
+            (AgentState::Unknown, "unknown"),
+            (AgentState::Idle, "idle"),
+            (AgentState::Working, "working"),
+            (
+                AgentState::Blocked {
+                    reason: BlockReason::Approval,
+                },
+                "blocked_approval",
+            ),
+            (
+                AgentState::Blocked {
+                    reason: BlockReason::Input,
+                },
+                "blocked_input",
+            ),
+            (
+                AgentState::Blocked {
+                    reason: BlockReason::Unknown,
+                },
+                "blocked_unknown",
+            ),
+            (AgentState::Exited, "exited"),
+        ] {
+            assert_eq!(
+                Event::from_session(
+                    SessionEvent::StateChanged {
+                        from: AgentState::Unknown,
+                        to: state
+                    },
+                    viewer
+                ),
+                Some(Event::SessionStateChanged(value.into()))
+            );
+        }
+        let exit = crate::session::Exit {
+            code: Some(7),
+            signal: None,
+            raw: Some(7 << 8),
+        };
+        assert_eq!(
+            Event::from_session(SessionEvent::Exited(exit), viewer),
+            Some(Event::SessionExited {
+                code: Some(7),
+                signal: None
+            })
+        );
+        for event in [
+            SessionEvent::Created,
+            SessionEvent::Running,
+            SessionEvent::Attached { viewer },
+            SessionEvent::Detached { viewer },
+            SessionEvent::Reaped,
+        ] {
+            assert_eq!(Event::from_session(event, viewer), None);
         }
     }
 

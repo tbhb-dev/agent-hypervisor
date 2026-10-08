@@ -60,6 +60,39 @@ fn spec(script: &str, cols: u16, rows: u16) -> SpawnSpec {
     s
 }
 
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "the test reads its inherited SIGHUP disposition with sigaction"
+)]
+fn a_child_inherits_default_hangup_even_when_the_supervisor_ignores_it() {
+    if std::env::var_os("HYPERVISOR_TEST_IGNORED_HUP").is_some() {
+        // SAFETY: zero is a valid empty signal action for this query-only call.
+        let mut inherited: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null new action queries the current process's SIGHUP disposition.
+        let result = unsafe { libc::sigaction(libc::SIGHUP, std::ptr::null(), &raw mut inherited) };
+        assert_eq!(result, 0);
+        assert_eq!(inherited.sa_sigaction, libc::SIG_IGN);
+        let mut pty = spawn_fixture("kill -HUP $$; echo survived", 80, 24);
+        assert_eq!(pty.take_waiter().unwrap().wait().unwrap().signal, Some(1));
+        return;
+    }
+
+    let status = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "trap '' HUP; exec \"$@\"",
+            "sh",
+            std::env::current_exe().unwrap().to_str().unwrap(),
+            "--exact",
+            "a_child_inherits_default_hangup_even_when_the_supervisor_ignores_it",
+        ])
+        .env("HYPERVISOR_TEST_IGNORED_HUP", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 /// Collects a PTY's output on a thread.
 struct Output(Arc<Mutex<Vec<u8>>>);
 

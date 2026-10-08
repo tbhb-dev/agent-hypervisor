@@ -226,6 +226,7 @@ name = "hypervisor-pty"
 version = "0.1.0"
 dependencies = [
  "hypervisor-core",
+ "libc",
  "rustix",
 ]
 

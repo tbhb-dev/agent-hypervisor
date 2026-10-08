@@ -19,6 +19,7 @@ The code here prototypes the agent hypervisor from RFC-36 to RFC-41. The hypervi
 - Put every crate at `crates/<name>/`, with a directory name equal to the package name.
 - A crate whose name ends in `-core` is pure. Every other crate is a shell crate.
 - Product crates: `hypervisor-core` holds the hypervisor's decisions, and `hypervisord` is the host daemon binary. New product crates take a `hypervisor-` prefix, or the binary's own name for a binary.
+- Emulator crates: `hypervisor-ghostty` puts the core's `Emulator` trait on ghostty-vt, and `ghostty-vt-sys` is its raw FFI, named by the Rust `-sys` convention. The `-sys` crate builds `libghostty-vt.a` with Zig from the commit in `crates/ghostty-vt-sys/ghostty.pin`; its committed `src/bindings.rs` is regenerated with `mise run ghostty:bindings`, never edited.
 - Repository tooling: `xtask-core` holds the pure decisions behind the repository checks, and `xtask` is their shell, run with `cargo run -p xtask -- <command>`.
 - The workspace sets edition 2024, `resolver = "3"`, and shared lints in the root `Cargo.toml`. Every crate inherits them with `[lints] workspace = true` and takes its version, edition, and license from `[workspace.package]`. Commit `Cargo.lock`.
 

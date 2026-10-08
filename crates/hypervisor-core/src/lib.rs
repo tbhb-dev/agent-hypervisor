@@ -11,6 +11,7 @@
 
 pub mod attenuation;
 pub mod channel;
+pub mod channel_policy;
 pub mod emulator;
 pub mod screen;
 pub mod session;

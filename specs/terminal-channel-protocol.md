@@ -44,7 +44,7 @@ The source is `tbhb-dev/agent-orchestration-poc.internal` commit `f06e8f771f7288
 - Client capability flags are advertised but only encoding is selected. Other negotiation behavior is undefined ([#54](https://github.com/tbhb-dev/agent-hypervisor/issues/54)).
 - The merged holder promotes a read-only viewer on `take`. Caller authorization is untested and required before exposed clients use it ([#45](https://github.com/tbhb-dev/agent-hypervisor/issues/45)).
 
-`crates/hypervisor-core/src/channel.rs` tests each frame type, malformed frames, truncated frames, version refusal, and round trips for arbitrary input bytes. The holder emits the mode, writer, and resync events named by the protocol. The session adapter and Unix PTY conformance cases follow in the second run 13 PR.
+`crates/hypervisor-core/src/channel.rs` tests each frame type, malformed frames, truncated frames, version refusal, and round trips for arbitrary input bytes. The holder emits the mode, writer, and resync events named by the protocol. `crates/hypervisor-session/src/channel.rs` adapts decoded frames to the resolved session, with Unix PTY conformance cases in `crates/hypervisord/tests/conformance.rs`.
 
 ## Inputs
 

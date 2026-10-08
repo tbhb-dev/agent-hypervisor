@@ -19,13 +19,15 @@ use std::time::{Duration, Instant};
 use hypervisor_core::emulator::{Cursor, Emulator, PROFILE, QueryScanner, Size};
 use hypervisor_core::screen::{RuleDetector, ScreenDetector};
 use hypervisor_core::session::{
-    Effect, Exit, Holder, HolderConfig, Input, Phase, Refusal, RingRead, SessionEvent, SpawnSpec,
-    ViewerId, ViewerMode, ViewerRead, Writer,
+    Effect, Exit, Holder, HolderConfig, Input, Phase, Refusal, RingRead, SessionEvent, Signal,
+    SpawnSpec, ViewerId, ViewerMode, ViewerRead, Writer,
 };
 use hypervisor_core::state::{Harness, HookKind, HookReport};
 use hypervisor_pty::{Pty, PtyError, Spawn, Wait};
 use serde_json::json;
 use std::num::NonZeroUsize;
+
+pub mod channel;
 
 /// The most messages handled before pending size requests settle.
 const BATCH: usize = 64;
@@ -68,12 +70,16 @@ pub enum Command {
     ViewerSnapshot(ViewerId, Sender<Result<(u64, Vec<u8>), Refusal>>),
     /// Interrupt from the lock holder.
     Interrupt(Writer, Sender<Result<(), Refusal>>),
+    /// Signal the foreground group from the write-lock holder.
+    Signal(Writer, Signal, Sender<Result<(), Refusal>>),
     /// End the session.
     Close,
     /// Read the output ring from a sequence number.
     ReadFrom(u64, Sender<RingRead>),
     /// The screen as VT bytes, or `None` once the session is reaped.
     Snapshot(Sender<Option<Vec<u8>>>),
+    /// Atomically read the effective size and next output byte offset.
+    ChannelInfo(Sender<(Size, u64)>),
 }
 
 #[cfg(test)]
@@ -299,6 +305,13 @@ impl LogContext {
             SessionEvent::StateChanged { .. } => ("state_changed", None),
             SessionEvent::Running => ("running", None),
             SessionEvent::Resized(_) => ("resized", None),
+            SessionEvent::ModeChanged { viewer, .. } => {
+                ("mode_changed", Some(format!("viewer:{}", viewer.0)))
+            }
+            SessionEvent::WriterChanged(_) => ("writer_changed", None),
+            SessionEvent::ResyncRequired { viewer, .. } => {
+                ("resync_required", Some(format!("viewer:{}", viewer.0)))
+            }
             SessionEvent::Exited(_) => ("exited", None),
             SessionEvent::Reaped => ("reaped", None),
             _ => ("unknown", None),
@@ -400,6 +413,22 @@ impl SessionHandle {
     /// If `who` does not hold the lock or the actor has ended.
     pub fn interrupt(&self, who: Writer) -> Result<(), Refusal> {
         self.request(|reply| Command::Interrupt(who, reply))
+    }
+
+    /// Signal the foreground group under the same write lock.
+    ///
+    /// # Errors
+    /// If the caller does not hold the lock or the actor has ended.
+    pub fn signal(&self, who: Writer, signal: Signal) -> Result<(), Refusal> {
+        self.request(|reply| Command::Signal(who, signal, reply))
+    }
+
+    /// Effective PTY size and the next output byte sequence, in one actor turn.
+    #[must_use]
+    pub fn channel_info(&self) -> Option<(Size, u64)> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Command::ChannelInfo(reply));
+        answer.recv().ok()
     }
 
     /// Pop the next output item, including a resync notice after overflow.
@@ -707,6 +736,10 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                     let _ = reply.send(self.step(Input::Interrupt(who)));
                     return;
                 }
+                Command::Signal(who, signal, reply) => {
+                    let _ = reply.send(self.step(Input::SendSignal(who, signal)));
+                    return;
+                }
                 Command::Close => Input::Close,
                 Command::ReadFrom(seq, reply) => {
                     let _ = reply.send(self.holder.ring().read_from(seq));
@@ -715,6 +748,10 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                 Command::Snapshot(reply) => {
                     let screen = self.emulator.as_ref().filter(|_| self.holder.has_screen());
                     let _ = reply.send(screen.map(Emulator::serialize_vt));
+                    return;
+                }
+                Command::ChannelInfo(reply) => {
+                    let _ = reply.send((self.holder.size(), self.holder.ring().next()));
                     return;
                 }
             },
@@ -835,10 +872,13 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                 self.events
                     .retain(|subscriber| subscriber.send(envelope).is_ok());
             }
-            Effect::ViewerAttached(_)
-            | Effect::ViewerDetached(_)
-            | Effect::Resync { .. }
-            | Effect::Refused(_) => {}
+            Effect::Resync { viewer, oldest } => {
+                self.apply(Effect::Emit(SessionEvent::ResyncRequired {
+                    viewer,
+                    oldest,
+                }));
+            }
+            Effect::ViewerAttached(_) | Effect::ViewerDetached(_) | Effect::Refused(_) => {}
             // A variant added for a later run must be handled here in that run.
             _ => unreachable!("an effect this actor does not know: {effect:?}"),
         }

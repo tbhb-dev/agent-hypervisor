@@ -469,6 +469,7 @@ fn a_same_size_resize_sends_a_redraw_hint_and_no_resize() {
             SessionEvent::Created
                 | SessionEvent::Running
                 | SessionEvent::Attached { viewer: VIEWER }
+                | SessionEvent::WriterChanged(Some(Writer::Viewer(VIEWER)))
         )),
         "a same-size request emitted a resize"
     );

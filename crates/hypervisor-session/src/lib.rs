@@ -257,6 +257,96 @@ mod log_tests {
     }
 
     #[test]
+    fn grid_without_screen_keeps_the_viewers_resync_flag() {
+        let mut actor: Actor<FailingWrite, GhosttyEmulator> = Actor {
+            holder: Holder::new(
+                HolderConfig::new(Persistence::Persistent),
+                Size::new(1, 1).unwrap(),
+            ),
+            pty: Some(FailingWrite),
+            emulator: None,
+            events: Vec::new(),
+            event_seq: 0,
+            origin: Instant::now(),
+            log: LogContext {
+                workload_id: "test".into(),
+                session_id: "test".into(),
+            },
+            queries: QueryScanner::default(),
+            screen_harness: None,
+            screen_at: None,
+            error_lines: Vec::new(),
+        };
+        actor.step(Input::Spawned).unwrap();
+        let viewer = ViewerId(41);
+        actor
+            .step(Input::Attach {
+                viewer,
+                mode: ViewerMode::ReadOnly,
+                size: Size::new(1, 1).unwrap(),
+                budget: NonZeroUsize::new(1).unwrap(),
+            })
+            .unwrap();
+        actor.step(Input::Output(b"overflow".to_vec())).unwrap();
+        assert!(matches!(
+            actor.holder.read_viewer(viewer),
+            Ok(ViewerRead::Resync { .. })
+        ));
+        assert_eq!(actor.viewer_grid(viewer), Ok(None));
+        assert!(matches!(
+            actor.holder.read_viewer(viewer),
+            Ok(ViewerRead::Resync { .. })
+        ));
+    }
+
+    #[test]
+    fn grid_poll_without_screen_returns_none() {
+        let (tx, rx) = mpsc::channel();
+        let (_events_tx, events) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            while let Ok(Msg::Command(command)) = rx.recv() {
+                match command {
+                    Command::Subscribe(_) => {}
+                    Command::AttachChannel(_, _, size, _, reply) => {
+                        let _ = reply.send(Ok((size, 0)));
+                    }
+                    Command::ViewerGrid(_, reply) => {
+                        let _ = reply.send(Ok(None));
+                    }
+                    Command::Detach(_, reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::Close => break,
+                    other => panic!("unexpected command: {other:?}"),
+                }
+            }
+        });
+        let session = SessionHandle {
+            tx,
+            events,
+            thread: Some(thread),
+        };
+        let request = OpenRequest {
+            versions: vec![1],
+            target: OpenTarget::Session("test".into()),
+            mode: Mode::ReadOnly,
+            encoding: Encoding::Grid,
+            size: WireSize { cols: 1, rows: 1 },
+            client: Capabilities {
+                terminal: "test".into(),
+                flags: 0,
+            },
+            resume: None,
+            max_frames_per_second: None,
+        };
+        let (mut channel, _) = channel::Channel::open(&session, ViewerId(42), &request).unwrap();
+        assert_eq!(channel.poll_grid(Duration::ZERO), Ok(None));
+        drop(channel);
+        session.send(Command::Close);
+        session.join();
+    }
+
+    #[test]
     fn failed_pty_write_is_logged_with_session_ids() {
         let mut actor: Actor<FailingWrite, GhosttyEmulator> = Actor {
             holder: Holder::new(

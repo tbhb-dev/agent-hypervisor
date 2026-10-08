@@ -1,6 +1,6 @@
 //! Pure grid-frame construction from the holder's active screen.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -290,7 +290,6 @@ fn links(
     grid: &Grid,
     known: &BTreeMap<String, u32>,
 ) -> Result<(BTreeMap<String, u32>, Vec<Hyperlink>), FrameError> {
-    let mut ids = known.clone();
     let mut uris: Vec<&str> = grid
         .cells()
         .iter()
@@ -298,13 +297,24 @@ fn links(
         .collect();
     uris.sort_unstable();
     uris.dedup();
+    let mut ids: BTreeMap<String, u32> = known
+        .iter()
+        .filter(|(uri, _)| uris.binary_search(&uri.as_str()).is_ok())
+        .map(|(uri, id)| (uri.clone(), *id))
+        .collect();
+    let mut used: BTreeSet<u32> = ids.values().copied().collect();
+    let mut next_id = 1u32;
     let mut links = Vec::with_capacity(uris.len());
     for uri in uris {
         let id = if let Some(id) = ids.get(uri) {
             *id
         } else {
-            let id = u32::try_from(ids.len() + 1).map_err(|_| FrameError::InvalidValue)?;
+            while used.contains(&next_id) {
+                next_id = next_id.checked_add(1).ok_or(FrameError::InvalidValue)?;
+            }
+            let id = next_id;
             ids.insert(uri.to_owned(), id);
+            used.insert(id);
             id
         };
         links.push(Hyperlink {
@@ -336,6 +346,7 @@ fn wire_cell(cell: &Cell, ids: &BTreeMap<&str, u32>) -> GridCell {
 mod tests {
     use super::*;
     use crate::emulator::{Screen, Size};
+    use proptest::prelude::*;
 
     fn screen(rows: &[&str], cursor: Cursor) -> Grid {
         let cols = u16::try_from(rows[0].len()).unwrap();
@@ -445,6 +456,43 @@ mod tests {
     }
 
     #[test]
+    fn hyperlinks_and_wide_cells_survive_wire_round_trip() {
+        let size = Size::new(2, 1).unwrap();
+        let cells = vec![
+            Cell {
+                text: "中".into(),
+                width: CellWidth::Wide,
+                hyperlink: Some("https://example.test/a".into()),
+                ..Cell::blank()
+            },
+            Cell {
+                width: CellWidth::SpacerTail,
+                ..Cell::blank()
+            },
+        ];
+        let grid = Grid::new(size, cells, Cursor::default()).unwrap();
+        let mut encoder = GridEncoder::new(None).unwrap();
+        let full = encoder
+            .poll(Duration::ZERO, grid, Modes::default(), 0, false)
+            .unwrap()
+            .unwrap();
+        let bytes = Frame::Grid(full).encode().unwrap();
+        let (
+            Frame::Grid(GridFrame::Full {
+                cells, hyperlinks, ..
+            }),
+            _,
+        ) = Frame::decode(&bytes).unwrap().unwrap()
+        else {
+            panic!("wrong frame")
+        };
+        assert_eq!(cells[0].width, CellWidth::Wide);
+        assert_eq!(cells[1].width, CellWidth::SpacerTail);
+        assert_eq!(cells[0].hyperlink_id, Some(1));
+        assert_eq!(hyperlinks[0].uri, "https://example.test/a");
+    }
+
+    #[test]
     fn adding_a_link_keeps_ids_in_unchanged_rows() {
         let size = Size::new(1, 2).unwrap();
         let old = vec![
@@ -475,43 +523,42 @@ mod tests {
     }
 
     #[test]
-    fn diff_requires_the_immediately_previous_frame() {
-        let frame = GridFrame::Diff {
-            frame: 4,
-            base_frame: 1,
-            output_sequence: 0,
-            size: WireSize { cols: 1, rows: 1 },
-            rows: vec![],
-            cursor: Cursor::default(),
-            modes: Modes::default(),
-            hyperlinks: vec![],
-        };
-        assert_eq!(Frame::Grid(frame).encode(), Err(FrameError::InvalidValue));
-    }
-
-    #[test]
-    fn forced_resync_emits_full_frame() {
+    fn hyperlink_ids_are_bounded_by_the_current_screen() {
         let mut encoder = GridEncoder::new(None).unwrap();
-        let original = screen(&["a"], Cursor::default());
-        encoder
-            .poll(Duration::ZERO, original.clone(), Modes::default(), 0, false)
+        for index in 0..200 {
+            let grid = Grid::new(
+                Size::new(1, 1).unwrap(),
+                vec![Cell {
+                    text: "x".into(),
+                    hyperlink: Some(format!("https://example.test/{index}")),
+                    ..Cell::blank()
+                }],
+                Cursor::default(),
+            )
             .unwrap();
-        assert!(matches!(
-            encoder
+            let frame = encoder
                 .poll(
-                    Duration::from_millis(1),
-                    original,
+                    Duration::from_millis(index),
+                    grid,
                     Modes::default(),
-                    1,
-                    true
+                    index,
+                    false,
                 )
-                .unwrap(),
-            Some(GridFrame::Full { frame: 2, .. })
-        ));
+                .unwrap()
+                .unwrap();
+            let links = match frame {
+                GridFrame::Full { hyperlinks, .. } | GridFrame::Diff { hyperlinks, .. } => {
+                    hyperlinks
+                }
+            };
+            assert_eq!(links.len(), 1);
+            assert_eq!(encoder.ids.len(), 1);
+            assert_eq!(encoder.ids.values().next(), Some(&1));
+        }
     }
 
     #[test]
-    fn oversized_frames_do_not_advance_encoder() {
+    fn invalid_shapes_and_oversized_frames_do_not_advance_encoder() {
         let mut encoder = GridEncoder::new(None).unwrap();
         let huge = Grid::new(
             Size::new(1, 1).unwrap(),
@@ -538,5 +585,165 @@ mod tests {
                 .unwrap(),
             Some(GridFrame::Full { frame: 1, .. })
         ));
+        let mut bad = Frame::Grid(GridFrame::Diff {
+            frame: 2,
+            base_frame: 2,
+            output_sequence: 0,
+            size: WireSize { cols: 1, rows: 1 },
+            rows: vec![],
+            cursor: Cursor::default(),
+            modes: Modes::default(),
+            hyperlinks: vec![],
+        });
+        assert_eq!(bad.encode(), Err(FrameError::InvalidValue));
+        if let Frame::Grid(GridFrame::Diff { base_frame, .. }) = &mut bad {
+            *base_frame = 1;
+        }
+        let mut bytes = bad.encode().unwrap();
+        let at = bytes
+            .windows(14)
+            .position(|window| window == b"\"base_frame\":1")
+            .unwrap();
+        bytes[at + 13] = b'2';
+        assert_eq!(Frame::decode(&bytes), Err(FrameError::InvalidValue));
+    }
+
+    #[test]
+    fn full_and_diff_reject_invalid_wire_values() {
+        let mut encoder = GridEncoder::new(None).unwrap();
+        let first = screen(&["ab", "cd"], Cursor::default());
+        let full = encoder
+            .poll(Duration::ZERO, first, Modes::default(), 0, false)
+            .unwrap()
+            .unwrap();
+        let next = screen(&["ab", "xy"], Cursor::default());
+        let diff = encoder
+            .poll(Duration::from_millis(1), next, Modes::default(), 2, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Frame::decode(&Frame::Grid(diff.clone()).encode().unwrap())
+                .unwrap()
+                .unwrap()
+                .0,
+            Frame::Grid(diff.clone())
+        );
+        let mut invalid = Vec::new();
+        let mut zero_frame = full.clone();
+        if let GridFrame::Full { frame, .. } = &mut zero_frame {
+            *frame = 0;
+        }
+        invalid.push(zero_frame);
+        let mut short = full.clone();
+        if let GridFrame::Full { cells, .. } = &mut short {
+            cells.pop();
+        }
+        invalid.push(short);
+        let mut cursor = full.clone();
+        if let GridFrame::Full { cursor, .. } = &mut cursor {
+            cursor.col = 2;
+        }
+        invalid.push(cursor);
+        let mut empty_cluster = full.clone();
+        if let GridFrame::Full { cells, .. } = &mut empty_cluster {
+            cells[0].cluster.clear();
+        }
+        invalid.push(empty_cluster);
+        let mut duplicate_link = full.clone();
+        if let GridFrame::Full { hyperlinks, .. } = &mut duplicate_link {
+            hyperlinks.extend([
+                Hyperlink {
+                    id: 1,
+                    uri: "a".into(),
+                },
+                Hyperlink {
+                    id: 1,
+                    uri: "b".into(),
+                },
+            ]);
+        }
+        invalid.push(duplicate_link);
+        let mut link = full;
+        if let GridFrame::Full { cells, .. } = &mut link {
+            cells[0].hyperlink_id = Some(1);
+        }
+        invalid.push(link);
+        let mut bad_row = diff.clone();
+        if let GridFrame::Diff { rows, .. } = &mut bad_row {
+            rows[0].row = 2;
+        }
+        invalid.push(bad_row);
+        let mut short_row = diff.clone();
+        if let GridFrame::Diff { rows, .. } = &mut short_row {
+            rows[0].cells.pop();
+        }
+        invalid.push(short_row);
+        let mut gap = diff.clone();
+        if let GridFrame::Diff { frame, .. } = &mut gap {
+            *frame = 4;
+        }
+        invalid.push(gap);
+        let mut bad_base = diff;
+        if let GridFrame::Diff { base_frame, .. } = &mut bad_base {
+            *base_frame = 0;
+        }
+        invalid.push(bad_base);
+        for value in invalid {
+            assert_eq!(Frame::Grid(value).encode(), Err(FrameError::InvalidValue));
+        }
+    }
+
+    #[test]
+    fn grid_decoder_rejects_unknown_fields_and_wrong_header_version() {
+        let mut encoder = GridEncoder::new(None).unwrap();
+        let full = encoder
+            .poll(
+                Duration::ZERO,
+                screen(&["a"], Cursor::default()),
+                Modes::default(),
+                0,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        let mut bytes = Frame::Grid(full).encode().unwrap();
+        bytes[4..6].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(Frame::decode(&bytes), Err(FrameError::UnsupportedVersion));
+        let body: serde_json::Value = serde_json::from_slice(&bytes[7..]).unwrap();
+        for field in ["extra", "cursor", "modes"] {
+            let mut value = body.clone();
+            if field == "extra" {
+                value[field] = serde_json::json!(1);
+            } else {
+                value[field]["extra"] = serde_json::json!(1);
+            }
+            let payload = value.to_string();
+            let length = u32::try_from(payload.len() + 3).unwrap();
+            let mut invalid = length.to_be_bytes().to_vec();
+            invalid.extend_from_slice(&crate::channel::VERSION.to_be_bytes());
+            invalid.push(11);
+            invalid.extend_from_slice(payload.as_bytes());
+            assert_eq!(Frame::decode(&invalid), Err(FrameError::MalformedPayload));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn one_changed_row_is_the_only_diff_row(row in 0usize..4, value in b'a'..=b'z') {
+            let value = char::from(value);
+            let mut encoder = GridEncoder::new(None).unwrap();
+            let original = screen(&["aa", "bb", "cc", "dd"], Cursor::default());
+            encoder.poll(Duration::ZERO, original.clone(), Modes::default(), 0, false).unwrap();
+            let mut cells = original.cells().to_vec();
+            cells[row * 2].text = value.to_string();
+            let changed = Grid::new(original.size(), cells, Cursor::default()).unwrap();
+            let next = encoder.poll(Duration::from_millis(1), changed, Modes::default(), 1, false).unwrap();
+            if value == 'a' && row == 0 || value == 'b' && row == 1 || value == 'c' && row == 2 || value == 'd' && row == 3 {
+                prop_assert_eq!(next, None);
+            } else {
+                let one_row = matches!(next, Some(GridFrame::Diff { rows, .. }) if rows.len() == 1 && usize::from(rows[0].row) == row);
+                prop_assert!(one_row);
+            }
+        }
     }
 }

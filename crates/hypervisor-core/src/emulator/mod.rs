@@ -224,6 +224,7 @@ impl Cell {
 
 /// Cursor position, zero-based, on the active screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Cursor {
     /// Row from the top.
     pub row: u16,
@@ -433,6 +434,7 @@ impl MouseFormat {
     reason = "each flag mirrors one independent DEC private mode"
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Modes {
     /// The active screen.
     pub screen: Screen,

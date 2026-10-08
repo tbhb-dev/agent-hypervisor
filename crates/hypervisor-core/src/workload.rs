@@ -123,6 +123,8 @@ impl fmt::Debug for WorkloadSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recovery {
     Running,
+    /// A supervisor restarted the shim after an unclean exit; its earlier sessions are gone.
+    Restarted,
     Stopped,
     Foreign,
 }
@@ -144,6 +146,33 @@ pub fn recovery_identity(expected_host: &str, id: &StableId, found: Option<&Stab
     recovery(expected_host, id, found == Some(id))
 }
 
+/// Event prefix a shim records when it replaces a predecessor that left its socket behind.
+pub const RESTART_EVENT: &str = "shim_restarted_after_unclean_exit";
+
+/// First events of a shim. The driver removes a stale socket before its own starts, so a
+/// stale socket at shim start means a supervisor restarted the shim unattended.
+#[must_use]
+pub fn start_events(id: &StableId, stale_socket: bool) -> Vec<String> {
+    let mut events = vec![format!("workload_started:{}", id.label())];
+    if stale_socket {
+        events.push(format!("{RESTART_EVENT}:{}", id.label()));
+    }
+    events
+}
+
+/// Mark an answering shim that reports an unattended restart.
+#[must_use]
+pub fn adopted(recovery: Recovery, events: &[String]) -> Recovery {
+    let restarted = events
+        .iter()
+        .any(|event| event.split(':').next() == Some(RESTART_EVENT));
+    if recovery == Recovery::Running && restarted {
+        Recovery::Restarted
+    } else {
+        recovery
+    }
+}
+
 /// Check a host workload before the shell persists it.
 ///
 /// # Errors
@@ -162,7 +191,7 @@ pub fn admit_host_workload(expected_host: &str, spec: &WorkloadSpec) -> Result<(
 /// A live shim or a workload already recorded as running.
 pub fn admit_start(recovery: Recovery, socket_answers: bool) -> Result<(), &'static str> {
     match recovery {
-        Recovery::Running => return Err("workload already running"),
+        Recovery::Running | Recovery::Restarted => return Err("workload already running"),
         Recovery::Foreign => return Err("foreign host workload"),
         Recovery::Stopped => {}
     }
@@ -448,6 +477,7 @@ mod tests {
     fn start_refuses_running_or_answering_shim() {
         assert_eq!(admit_start(Recovery::Stopped, false), Ok(()));
         assert!(admit_start(Recovery::Running, false).is_err());
+        assert!(admit_start(Recovery::Restarted, false).is_err());
         assert!(admit_start(Recovery::Foreign, false).is_err());
         assert!(admit_start(Recovery::Stopped, true).is_err());
     }
@@ -575,6 +605,21 @@ mod tests {
     }
 
     #[test]
+    fn start_events_mark_only_unattended_restarts() {
+        let id = host().id;
+        assert_eq!(start_events(&id, false), vec!["workload_started:h1:w1"]);
+        let events = start_events(&id, true);
+        assert_eq!(events[1], "shim_restarted_after_unclean_exit:h1:w1");
+        assert_eq!(adopted(Recovery::Running, &events), Recovery::Restarted);
+        assert_eq!(
+            adopted(Recovery::Running, &start_events(&id, false)),
+            Recovery::Running
+        );
+        assert_eq!(adopted(Recovery::Stopped, &events), Recovery::Stopped);
+        assert_eq!(adopted(Recovery::Foreign, &events), Recovery::Foreign);
+    }
+
+    #[test]
     fn debug_hides_environment_values() {
         let mut spec = host();
         spec.env
@@ -586,8 +631,8 @@ mod tests {
 
     proptest! {
         #[test]
-        fn start_requires_stopped_state_and_no_answer(state in 0u8..3, answers in any::<bool>()) {
-            let state = match state { 0 => Recovery::Stopped, 1 => Recovery::Running, _ => Recovery::Foreign };
+        fn start_requires_stopped_state_and_no_answer(state in 0u8..4, answers in any::<bool>()) {
+            let state = match state { 0 => Recovery::Stopped, 1 => Recovery::Running, 2 => Recovery::Restarted, _ => Recovery::Foreign };
             prop_assert_eq!(admit_start(state, answers).is_ok(), state == Recovery::Stopped && !answers);
         }
 
@@ -613,6 +658,15 @@ mod tests {
             let workload = host().id;
             let id = StableId { host: other, local: "session".into() };
             prop_assert_eq!(admit_session(&workload, &id, duplicate).is_ok(), id.host == workload.host && !duplicate);
+        }
+
+        #[test]
+        fn adoption_marks_restart_only_for_running_shims(stale in any::<bool>(), extra in prop::collection::vec("[a-z_]{1,12}:[a-z]{1,4}", 0..4)) {
+            let id = host().id;
+            let mut events = start_events(&id, stale);
+            events.extend(extra);
+            prop_assert_eq!(adopted(Recovery::Running, &events) == Recovery::Restarted, stale);
+            prop_assert_eq!(adopted(Recovery::Stopped, &events), Recovery::Stopped);
         }
 
         #[test]

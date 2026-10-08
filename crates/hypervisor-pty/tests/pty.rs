@@ -74,6 +74,8 @@ fn a_child_inherits_default_hangup_even_when_the_supervisor_ignores_it() {
         assert_eq!(result, 0);
         assert_eq!(inherited.sa_sigaction, libc::SIG_IGN);
         let mut pty = spawn_fixture("kill -HUP $$; echo survived", 80, 24);
+        // Drain the master while the child exits; an ignored HUP writes output.
+        let _out = Output::start(&pty);
         assert_eq!(pty.take_waiter().unwrap().wait().unwrap().signal, Some(1));
         return;
     }

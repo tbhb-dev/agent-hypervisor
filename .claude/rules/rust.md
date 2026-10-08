@@ -26,6 +26,8 @@ Sources are the Rust 1.97 and 1.98 release notes and the Rust 2024 edition guide
 - Wrap each unsafe operation inside an `unsafe fn` in its own `unsafe` block. The edition warns on `unsafe_op_in_unsafe_fn`, and the workspace denies it (Rust 2024).
 - Set a child's environment through `Command::env`. `std::env::set_var` and `remove_var` are unsafe now (Rust 2024).
 - Return `()` from bindings instead of `core::ffi::c_void`. The `c_void_returns` lint warns on it (Rust 1.98).
+- Move the Ghostty pin in `crates/ghostty-vt-sys/ghostty.pin`, the Zig pin in `mise.toml`, and the committed bindings together. Ghostty's `build.zig.zon` names the Zig version in `minimum_zig_version`, and `mise run ghostty:bindings` regenerates `src/bindings.rs` with bindgen 0.73.2 (Ghostty a60e9e2a5, Zig 0.16.0).
+- Link libghostty-vt from a directory containing only the static archive. With the dylib beside it, the Apple linker picks the dylib (Ghostty a60e9e2a5).
 - Check bindgen wrappers before adding `repr(transparent)`. It no longer treats `repr(C)` fields, private fields, or `#[non_exhaustive]` types as trivial (Rust 1.98).
 
 ## Language changes to expect

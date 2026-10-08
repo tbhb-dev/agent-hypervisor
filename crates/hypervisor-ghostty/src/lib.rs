@@ -336,6 +336,23 @@ impl Emulator for GhosttyEmulator {
         Grid::new(size, cells, cursor).unwrap_or_else(|e| unreachable!("ghostty grid: {e}"))
     }
 
+    fn title(&self) -> Option<String> {
+        let value = self.get(
+            sys::GHOSTTY_TERMINAL_DATA_TITLE,
+            sys::GhosttyString {
+                ptr: ptr::null(),
+                len: 0,
+            },
+        )?;
+        if value.ptr.is_null() || value.len == 0 {
+            return None;
+        }
+        // SAFETY: the header says this string is borrowed until the next mutating terminal
+        // call. Copying here finishes before such a call can occur on this session thread.
+        let bytes = unsafe { std::slice::from_raw_parts(value.ptr, value.len) };
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
     fn modes(&self) -> Modes {
         let screen = self.get(sys::GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, 0);
         Modes {

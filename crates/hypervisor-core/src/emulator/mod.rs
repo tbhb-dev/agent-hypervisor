@@ -505,6 +505,9 @@ pub trait Emulator {
     /// The active screen's grid, read cell by cell.
     fn grid(&self) -> Grid;
 
+    /// The current OSC window title, if one has been set.
+    fn title(&self) -> Option<String>;
+
     /// The modes in force.
     fn modes(&self) -> Modes;
 

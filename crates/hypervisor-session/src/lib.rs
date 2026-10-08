@@ -17,6 +17,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use hypervisor_core::emulator::{Cursor, Emulator, PROFILE, QueryScanner, Size};
+use hypervisor_core::screen::{RuleDetector, ScreenDetector};
 use hypervisor_core::session::{
     Effect, Exit, Holder, HolderConfig, Input, Phase, Refusal, RingRead, SessionEvent, SpawnSpec,
     ViewerId, ViewerMode, ViewerRead, Writer,
@@ -32,6 +33,10 @@ const BATCH: usize = 64;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Command {
+    /// Add a subscriber for subsequent ordered events.
+    Subscribe(Sender<SequencedEvent>),
+    /// Enable screen detection for a known harness, or disable it with `None`.
+    DetectScreen(Option<Harness>),
     /// A normalized event from this session's hook listener.
     Hook {
         harness: Harness,
@@ -100,10 +105,17 @@ impl fmt::Display for StartError {
 
 impl std::error::Error for StartError {}
 
+/// One session event with a sequence assigned by its actor before fanout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequencedEvent {
+    pub seq: u64,
+    pub event: SessionEvent,
+}
+
 /// The caller's side of a session. Dropping it closes the session.
 pub struct SessionHandle {
     tx: Sender<Msg>,
-    events: Receiver<SessionEvent>,
+    events: Receiver<SequencedEvent>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -215,8 +227,16 @@ impl SessionHandle {
 
     /// The session's events, in order. The channel disconnects when the session is reaped.
     #[must_use]
-    pub const fn events(&self) -> &Receiver<SessionEvent> {
+    pub const fn events(&self) -> &Receiver<SequencedEvent> {
         &self.events
+    }
+
+    /// Subscribe to events emitted after this command reaches the actor.
+    #[must_use]
+    pub fn subscribe(&self) -> Receiver<SequencedEvent> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Command::Subscribe(tx));
+        rx
     }
 
     /// Reads the output ring from `seq`, or `None` once the session thread has ended.
@@ -299,9 +319,12 @@ where
                 holder: Holder::new(config, spec.size),
                 pty: Some(pty),
                 emulator: Some(emulator),
-                events: events_tx,
+                events: vec![events_tx],
+                event_seq: 0,
                 origin,
                 queries: QueryScanner::default(),
+                screen_harness: None,
+                screen_at: None,
             };
             actor.run(&rx);
         })
@@ -358,9 +381,12 @@ struct Actor<P, E> {
     holder: Holder,
     pty: Option<P>,
     emulator: Option<E>,
-    events: Sender<SessionEvent>,
+    events: Vec<Sender<SequencedEvent>>,
+    event_seq: u64,
     origin: Instant,
     queries: QueryScanner,
+    screen_harness: Option<Harness>,
+    screen_at: Option<Duration>,
 }
 
 impl<P: Pty, E: Emulator> Actor<P, E> {
@@ -371,7 +397,11 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
     fn run(&mut self, rx: &Receiver<Msg>) {
         let _ = self.step(Input::Spawned);
         while self.holder.phase() != Phase::Reaped {
-            let first = match self.holder.deadline() {
+            let deadline = [self.holder.deadline(), self.screen_at]
+                .into_iter()
+                .flatten()
+                .min();
+            let first = match deadline {
                 Some(at) => rx.recv_timeout(at.saturating_sub(self.now())),
                 None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
             };
@@ -386,6 +416,10 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                 self.handle(msg);
             }
             let _ = self.step(Input::Settle);
+            if self.screen_at.is_some_and(|at| self.now() >= at) {
+                self.observe_screen();
+                self.screen_at = Some(self.now() + Duration::from_millis(300));
+            }
         }
     }
 
@@ -395,6 +429,15 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
             Msg::OutputClosed => Input::OutputClosed,
             Msg::Exited(exit) => Input::ChildExited(exit),
             Msg::Command(command) => match command {
+                Command::Subscribe(tx) => {
+                    self.events.push(tx);
+                    return;
+                }
+                Command::DetectScreen(harness) => {
+                    self.screen_harness = harness;
+                    self.screen_at = harness.map(|_| self.now() + Duration::from_millis(300));
+                    return;
+                }
                 Command::Hook { harness, kind, seq } => Input::Hook(HookReport {
                     harness,
                     kind,
@@ -474,7 +517,25 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
         result
     }
 
+    fn observe_screen(&mut self) {
+        let Some(harness) = self.screen_harness else {
+            return;
+        };
+        let Some(emulator) = self.emulator.as_ref() else {
+            return;
+        };
+        let detector = RuleDetector::default();
+        if let Some(state) = detector.detect(harness, emulator.title().as_deref(), &emulator.grid())
+        {
+            let _ = self.step(Input::Screen(state));
+        }
+    }
+
     fn apply(&mut self, effect: Effect) {
+        if let Some(event) = effect.viewer_event() {
+            self.apply(Effect::Emit(event));
+            return;
+        }
         match effect {
             Effect::Feed(bytes) => {
                 let mut start = 0;
@@ -535,7 +596,13 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                 self.pty = None;
             }
             Effect::Emit(event) => {
-                let _ = self.events.send(event);
+                self.event_seq += 1;
+                let envelope = SequencedEvent {
+                    seq: self.event_seq,
+                    event,
+                };
+                self.events
+                    .retain(|subscriber| subscriber.send(envelope).is_ok());
             }
             Effect::ViewerAttached(_)
             | Effect::ViewerDetached(_)

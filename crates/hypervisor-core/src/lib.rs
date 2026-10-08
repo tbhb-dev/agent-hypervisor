@@ -11,6 +11,7 @@
 
 pub mod attenuation;
 pub mod emulator;
+pub mod screen;
 pub mod session;
 pub mod state;
 

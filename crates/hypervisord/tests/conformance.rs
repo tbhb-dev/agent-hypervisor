@@ -426,6 +426,37 @@ fn terminal_grid_overflow_forces_full_frame() {
 }
 
 #[test]
+fn terminal_grid_poll_after_actor_end_is_refused() {
+    let fixture =
+        Fixture::start("printf 'pid:%s\\n' \"$$\"; printf 'ready\\n'; while :; do sleep 1; done");
+    let session = fixture.session();
+    let pgid = fixture_pgid(&wait_for_output(session, "ready"));
+    let mut request = open_request();
+    request.encoding = Encoding::Grid;
+    {
+        let (mut channel, _) = Channel::open(session, ViewerId(94), &request).unwrap();
+        assert!(matches!(
+            channel.poll_grid(Duration::ZERO),
+            Ok(Some(Frame::Grid(_)))
+        ));
+        session.send(Command::Close);
+        let start = Instant::now();
+        loop {
+            match channel.poll_grid(Duration::from_millis(1)) {
+                Err(hypervisor_session::channel::ChannelError::Refused(Refusal::UnknownViewer)) => {
+                    break;
+                }
+                Ok(None | Some(_)) => {}
+                other => panic!("unexpected grid result after close: {other:?}"),
+            }
+            assert!(start.elapsed() < WAIT, "actor did not end");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fixture.finish(pgid);
+}
+
+#[test]
 fn terminal_channel_reports_resync_after_viewer_overflow() {
     let fixture = Fixture::start(
         "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; IFS= read -r line; i=0; while [ $i -lt 70 ]; do printf '%1024s' x; i=$((i+1)); done; IFS= read -r line",

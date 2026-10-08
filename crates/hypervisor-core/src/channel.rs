@@ -382,7 +382,7 @@ impl Frame {
             Self::Control(v) => (VERSION, 6, json(v)?),
             Self::ControlResult(v) => (VERSION, 7, json(v)?),
             Self::Event(v) => (VERSION, 8, json(v)?),
-            Self::Grid(v) => (VERSION, 9, json(v)?),
+            Self::Grid(v) => (VERSION, 11, json(v)?),
         };
         let length = HEADER + payload.len();
         if length > MAX_FRAME {
@@ -433,7 +433,7 @@ impl Frame {
             6 => Self::Control(parse(payload)?),
             7 => Self::ControlResult(parse(payload)?),
             8 => Self::Event(parse(payload)?),
-            9 => Self::Grid(parse(payload)?),
+            11 => Self::Grid(parse(payload)?),
             _ => return Err(FrameError::UnknownType),
         };
         frame.validate()?;

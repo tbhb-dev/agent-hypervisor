@@ -1,6 +1,6 @@
 //! Pure grid-frame construction from the holder's active screen.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -290,7 +290,6 @@ fn links(
     grid: &Grid,
     known: &BTreeMap<String, u32>,
 ) -> Result<(BTreeMap<String, u32>, Vec<Hyperlink>), FrameError> {
-    let mut ids = known.clone();
     let mut uris: Vec<&str> = grid
         .cells()
         .iter()
@@ -298,13 +297,24 @@ fn links(
         .collect();
     uris.sort_unstable();
     uris.dedup();
+    let mut ids: BTreeMap<String, u32> = known
+        .iter()
+        .filter(|(uri, _)| uris.binary_search(&uri.as_str()).is_ok())
+        .map(|(uri, id)| (uri.clone(), *id))
+        .collect();
+    let mut used: BTreeSet<u32> = ids.values().copied().collect();
+    let mut next_id = 1u32;
     let mut links = Vec::with_capacity(uris.len());
     for uri in uris {
         let id = if let Some(id) = ids.get(uri) {
             *id
         } else {
-            let id = u32::try_from(ids.len() + 1).map_err(|_| FrameError::InvalidValue)?;
+            while used.contains(&next_id) {
+                next_id = next_id.checked_add(1).ok_or(FrameError::InvalidValue)?;
+            }
+            let id = next_id;
             ids.insert(uri.to_owned(), id);
+            used.insert(id);
             id
         };
         links.push(Hyperlink {
@@ -361,6 +371,7 @@ mod tests {
             .poll(Duration::ZERO, original.clone(), Modes::default(), 3, false)
             .unwrap()
             .unwrap();
+        assert_eq!(Frame::Grid(first.clone()).encode().unwrap()[6], 11);
         assert!(
             matches!(&first, GridFrame::Full { frame: 1, output_sequence: 3, cells, .. } if cells.len() == 4)
         );
@@ -411,6 +422,7 @@ mod tests {
         let first = screen(&["a"], Cursor::default());
         encoder.poll(at, first, Modes::default(), 0, false).unwrap();
         assert_eq!(encoder.due(at + Duration::from_millis(499)), Ok(false));
+        assert_eq!(encoder.due(Duration::ZERO), Err(FrameError::InvalidValue));
         assert_eq!(
             encoder
                 .poll(
@@ -508,6 +520,41 @@ mod tests {
             if rows.len() == 1 && rows[0].row == 1 && rows[0].cells[0].hyperlink_id == Some(2)
             && hyperlinks == [Hyperlink { id: 1, uri: "z".into() }, Hyperlink { id: 2, uri: "a".into() }])
         );
+    }
+
+    #[test]
+    fn hyperlink_ids_are_bounded_by_the_current_screen() {
+        let mut encoder = GridEncoder::new(None).unwrap();
+        for index in 0..200 {
+            let grid = Grid::new(
+                Size::new(1, 1).unwrap(),
+                vec![Cell {
+                    text: "x".into(),
+                    hyperlink: Some(format!("https://example.test/{index}")),
+                    ..Cell::blank()
+                }],
+                Cursor::default(),
+            )
+            .unwrap();
+            let frame = encoder
+                .poll(
+                    Duration::from_millis(index),
+                    grid,
+                    Modes::default(),
+                    index,
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+            let links = match frame {
+                GridFrame::Full { hyperlinks, .. } | GridFrame::Diff { hyperlinks, .. } => {
+                    hyperlinks
+                }
+            };
+            assert_eq!(links.len(), 1);
+            assert_eq!(encoder.ids.len(), 1);
+            assert_eq!(encoder.ids.values().next(), Some(&1));
+        }
     }
 
     #[test]
@@ -674,7 +721,7 @@ mod tests {
             let length = u32::try_from(payload.len() + 3).unwrap();
             let mut invalid = length.to_be_bytes().to_vec();
             invalid.extend_from_slice(&crate::channel::VERSION.to_be_bytes());
-            invalid.push(9);
+            invalid.push(11);
             invalid.extend_from_slice(payload.as_bytes());
             assert_eq!(Frame::decode(&invalid), Err(FrameError::MalformedPayload));
         }

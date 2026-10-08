@@ -241,6 +241,10 @@ name = "hypervisord"
 version = "0.1.0"
 dependencies = [
  "hypervisor-core",
+ "hypervisor-session",
+ "libc",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

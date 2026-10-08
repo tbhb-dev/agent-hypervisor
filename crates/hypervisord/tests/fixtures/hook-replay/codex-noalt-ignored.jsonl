@@ -1,0 +1,8 @@
+{"event":"SessionStart","notification_type":null,"fully_idle":null,"expected":"Unknown","at_ms":0}
+{"event":"UserPromptSubmit","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":53}
+{"event":"Stop","notification_type":null,"fully_idle":null,"expected":"Idle","at_ms":2334}
+{"event":"UserPromptSubmit","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":7759}
+{"event":"PreToolUse","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":9952}
+{"event":"PermissionRequest","notification_type":null,"fully_idle":null,"expected":"Approval","at_ms":10034}
+{"event":"Interrupt","notification_type":null,"fully_idle":null,"expected":"Idle","at_ms":24756}
+{"event":"SessionEnd","notification_type":null,"fully_idle":null,"expected":"Exited","at_ms":25802}

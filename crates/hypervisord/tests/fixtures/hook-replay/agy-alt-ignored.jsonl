@@ -1,0 +1,5 @@
+{"event":"PreInvocation","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":0}
+{"event":"PostInvocation","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":2112}
+{"event":"Stop","notification_type":null,"fully_idle":true,"expected":"Idle","at_ms":2183}
+{"event":"PreInvocation","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":7624}
+{"event":"PreToolUse","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":9698}

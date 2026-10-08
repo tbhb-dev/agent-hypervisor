@@ -1,0 +1,4 @@
+{"event":"PreInvocation","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":0}
+{"event":"PostInvocation","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":2108}
+{"event":"Stop","notification_type":null,"fully_idle":true,"expected":"Idle","at_ms":2185}
+{"event":"PreInvocation","notification_type":null,"fully_idle":null,"expected":"Working","at_ms":7713}

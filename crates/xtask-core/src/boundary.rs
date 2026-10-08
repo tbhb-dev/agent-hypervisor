@@ -190,19 +190,32 @@ pub fn banned_paths(config: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Returns the lints named in every `#![forbid(...)]` attribute of a crate root, ignoring
-/// line and nested block comments, and string and char literals.
+/// Returns the lints named in crate-root `#![forbid(...)]` attributes, ignoring
+/// nested delimiters, comments, and string and char literals.
 #[must_use]
 pub fn forbidden_lints(lib_root: &str) -> Vec<String> {
     let uncommented = strip_comments(lib_root);
     let code: String = uncommented.chars().filter(|c| !c.is_whitespace()).collect();
-    code.split("#![forbid(")
-        .skip(1)
-        .filter_map(|rest| rest.split_once(")]").map(|(list, _)| list))
-        .flat_map(|list| list.split(','))
-        .filter(|lint| !lint.is_empty())
-        .map(str::to_owned)
-        .collect()
+    let mut depth = 0_usize;
+    let mut lints = Vec::new();
+    for (index, ch) in code.char_indices() {
+        if depth == 0
+            && let Some(rest) = code[index..].strip_prefix("#![forbid(")
+            && let Some((list, _)) = rest.split_once(")]")
+        {
+            lints.extend(
+                list.split(',')
+                    .filter(|lint| !lint.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+        match ch {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    lints
 }
 
 fn strip_comments(source: &str) -> String {
@@ -600,6 +613,60 @@ mod tests {
     }
 
     #[test]
+    fn forbid_inside_macro_body_does_not_count() {
+        for root in [
+            format!(
+                "macro_rules! unused {{ () => {{ #![forbid({})] }} }}",
+                REQUIRED_FORBID.join(", ")
+            ),
+            format!(
+                "macro_rules! unused ( () => ( #![forbid({})] ) );",
+                REQUIRED_FORBID.join(", ")
+            ),
+            format!(
+                "macro_rules! unused [ () => [ #![forbid({})] ] ];",
+                REQUIRED_FORBID.join(", ")
+            ),
+            format!(
+                "macro_rules! unused {{ () => {{ {{}} #![forbid({})] }} }}",
+                REQUIRED_FORBID.join(", ")
+            ),
+        ] {
+            assert_eq!(
+                violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]),
+                REQUIRED_FORBID
+                    .iter()
+                    .map(|lint| missing_forbid(lint))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn forbid_inside_inline_module_does_not_count() {
+        let root = format!(
+            "mod nested {{ #![forbid({})] }}",
+            REQUIRED_FORBID.join(", ")
+        );
+        assert_eq!(
+            violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]),
+            REQUIRED_FORBID
+                .iter()
+                .map(|lint| missing_forbid(lint))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn crate_root_forbid_counts_with_nested_attributes_present() {
+        let root = format!(
+            "#![forbid({})]\nmod nested {{ #![forbid(unused)] }}",
+            REQUIRED_FORBID.join(", ")
+        );
+        assert!(violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]).is_empty());
+    }
+
+    #[test]
     fn missing_lib_root_is_a_violation() {
         assert_eq!(
             violations(&[core(Some(CLIPPY), None, vec![])], &[]),
@@ -681,6 +748,20 @@ mod tests {
                 "/*".repeat(depth),
                 REQUIRED_FORBID.join(", "),
                 "*/".repeat(depth)
+            );
+            prop_assert_eq!(
+                violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]),
+                REQUIRED_FORBID.iter().map(|lint| missing_forbid(lint)).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn nested_module_never_supplies_forbid(depth in 1..6usize) {
+            let root = format!(
+                "{}#![forbid({})]{}",
+                "mod nested {".repeat(depth),
+                REQUIRED_FORBID.join(", "),
+                "}".repeat(depth)
             );
             prop_assert_eq!(
                 violations(&[core(Some(CLIPPY), Some(&root), vec![])], &[]),

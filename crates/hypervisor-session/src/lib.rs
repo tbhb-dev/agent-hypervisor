@@ -467,6 +467,9 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                 let mut start = 0;
                 for (end, &byte) in bytes.iter().enumerate() {
                     if let Some(query) = self.queries.push(byte) {
+                        if query == b"\x1b[6n" {
+                            self.holder.expect_viewer_cpr();
+                        }
                         let reply = self.emulator.as_mut().and_then(|emulator| {
                             let _ = emulator.feed(&bytes[start..=end]);
                             let cursor = if query == b"\x1b[6n" {

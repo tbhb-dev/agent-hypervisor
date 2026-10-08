@@ -50,6 +50,27 @@ const HANGUP: Effect = Effect::Signal {
 };
 
 #[test]
+fn attach_and_detach_emit_viewer_effects_for_run_11() {
+    let mut h = running(HolderConfig::new(Persistence::Persistent));
+    assert_eq!(
+        h.step(
+            Input::Attach {
+                viewer: ViewerId(7),
+                mode: ViewerMode::ReadOnly,
+                size: size(80, 24),
+                budget: NonZeroUsize::new(64).unwrap(),
+            },
+            ms(1),
+        ),
+        vec![Effect::ViewerAttached(ViewerId(7))]
+    );
+    assert_eq!(
+        h.step(Input::Detach(ViewerId(7)), ms(2)),
+        vec![Effect::ViewerDetached(ViewerId(7))]
+    );
+}
+
+#[test]
 fn output_goes_to_the_ring_and_profile_replies_go_back() {
     let mut h = running(HolderConfig::new(Persistence::Persistent));
     assert_eq!(

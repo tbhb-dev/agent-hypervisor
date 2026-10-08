@@ -204,6 +204,15 @@ impl ViewerRegistry {
         Ok(filtered)
     }
 
+    /// Expect one CPR answer from each viewer receiving live output.
+    pub fn expect_cpr(&mut self) {
+        for viewer in self.viewers.values_mut() {
+            if viewer.resync.is_none() {
+                viewer.input_filter.expect_cpr();
+            }
+        }
+    }
+
     /// The next deadline for forwarding an ambiguous standalone escape key.
     #[must_use]
     pub fn input_deadline(&self) -> Option<Duration> {

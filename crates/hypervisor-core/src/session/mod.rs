@@ -250,6 +250,11 @@ pub struct Holder {
 }
 
 impl Holder {
+    /// Mark the CPR query just delivered in live output to attached viewers.
+    pub fn expect_viewer_cpr(&mut self) {
+        self.registry.expect_cpr();
+    }
+
     /// A holder in [`Phase::Starting`] for a PTY spawned at `size`.
     #[must_use]
     pub fn new(config: HolderConfig, size: Size) -> Self {

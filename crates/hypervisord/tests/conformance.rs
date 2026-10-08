@@ -9,11 +9,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hypervisor_core::channel::{
-    Capabilities, Control, ControlResult, Encoding, Event, Frame, Mode, OpenRefusal, OpenRequest,
-    OpenTarget, WireSignal, WireSize,
+    Capabilities, Control, ControlResult, Encoding, Event, Frame, FrameError, Mode, OpenRefusal,
+    OpenRequest, OpenTarget, WireSignal, WireSize,
 };
 use hypervisor_core::channel_policy::ClientError;
-use hypervisor_core::emulator::Size;
+use hypervisor_core::emulator::{Cursor, Modes, Size};
+use hypervisor_core::grid_channel::GridFrame;
 use hypervisor_core::session::{
     HolderConfig, Persistence, Refusal, RingRead, SessionEvent, SessionKind, SpawnSpec, ViewerId,
     ViewerMode, Writer,
@@ -336,6 +337,10 @@ fn terminal_channel_refuses_unsupported_versions_and_invalid_grid_requests() {
         Channel::open(session, ViewerId(90), &request).err().is_some_and(|frame| matches!(*frame, Frame::OpenRefused(refused) if refused.reason == OpenRefusal::InvalidRequest))
     );
     request.max_frames_per_second = None;
+    request.resume = Some(hypervisor_core::channel::ResumeToken { next_sequence: 0 });
+    assert!(
+        Channel::open(session, ViewerId(90), &request).err().is_some_and(|frame| matches!(*frame, Frame::OpenRefused(refused) if refused.reason == OpenRefusal::InvalidRequest))
+    );
     request.encoding = Encoding::Bytes;
     request.resume = Some(hypervisor_core::channel::ResumeToken {
         next_sequence: u64::MAX,
@@ -343,6 +348,150 @@ fn terminal_channel_refuses_unsupported_versions_and_invalid_grid_requests() {
     assert!(
         Channel::open(session, ViewerId(90), &request).err().is_some_and(|frame| matches!(*frame, Frame::OpenRefused(refused) if refused.reason == OpenRefusal::InvalidRequest))
     );
+    fixture.finish(pgid);
+}
+
+#[test]
+fn terminal_grid_full_diff_cap_and_resync() {
+    let fixture = Fixture::start(
+        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+    );
+    let session = fixture.session();
+    let pgid = fixture_pgid(&wait_for_output(session, "ready"));
+    let mut request = open_request();
+    request.encoding = Encoding::Grid;
+    request.max_frames_per_second = Some(2);
+    {
+        let (mut bytes, _) = Channel::open(session, ViewerId(93), &open_request()).unwrap();
+        assert_eq!(
+            bytes.poll_grid(Duration::ZERO),
+            Err(hypervisor_session::channel::ChannelError::Client(
+                hypervisor_core::channel_policy::ClientError::UnexpectedFrame
+            ))
+        );
+        drop(bytes);
+        let (mut channel, response) = Channel::open(session, ViewerId(91), &request)
+            .unwrap_or_else(|_| panic!("grid open refused"));
+        assert!(matches!(response, Frame::OpenResponse(_)));
+        let Frame::Grid(GridFrame::Full {
+            frame: 1, cells, ..
+        }) = channel.poll_grid(Duration::ZERO).unwrap().unwrap()
+        else {
+            panic!("first grid frame is not full")
+        };
+        assert!(cells.iter().any(|cell| cell.cluster == "r"));
+        assert_eq!(channel.poll_grid(Duration::from_millis(499)), Ok(None));
+        channel.receive(Frame::Control(Control::Take)).unwrap();
+        channel.receive(Frame::Input(b"one\n".to_vec())).unwrap();
+        wait_for_output(session, "got:one");
+        assert!(
+            matches!(channel.poll_grid(Duration::from_millis(500)).unwrap(),
+            Some(Frame::Grid(GridFrame::Diff { frame: 2, base_frame: 1, rows, .. })) if !rows.is_empty())
+        );
+        assert_eq!(
+            channel.poll_grid(Duration::ZERO),
+            Err(hypervisor_session::channel::ChannelError::Grid(
+                FrameError::InvalidValue
+            ))
+        );
+        assert_eq!(channel.poll_grid(Duration::from_millis(999)), Ok(None));
+        channel.receive(Frame::Input(b"two\n".to_vec())).unwrap();
+        wait_for_output(session, "got:two");
+        assert!(matches!(
+            channel.poll_grid(Duration::from_millis(1000)).unwrap(),
+            Some(Frame::Grid(GridFrame::Diff {
+                frame: 3,
+                base_frame: 2,
+                ..
+            }))
+        ));
+        assert_eq!(channel.poll_grid(Duration::from_millis(1000)), Ok(None));
+        assert_eq!(
+            channel.receive(Frame::Grid(GridFrame::Diff {
+                frame: 2,
+                base_frame: 1,
+                output_sequence: 0,
+                size: WireSize { cols: 1, rows: 1 },
+                rows: vec![],
+                cursor: Cursor::default(),
+                modes: Modes::default(),
+                hyperlinks: vec![],
+            })),
+            Err(hypervisor_session::channel::ChannelError::Client(
+                hypervisor_core::channel_policy::ClientError::UnexpectedFrame
+            ))
+        );
+        assert_eq!(
+            channel.receive(Frame::Control(Control::Detach)),
+            Ok(Some(Frame::ControlResult(ControlResult::Accepted)))
+        );
+        assert_eq!(
+            channel.poll_grid(Duration::from_millis(1500)),
+            Err(hypervisor_session::channel::ChannelError::Client(
+                hypervisor_core::channel_policy::ClientError::Detached
+            ))
+        );
+    }
+    fixture.finish(pgid);
+}
+
+#[test]
+fn terminal_grid_overflow_forces_full_frame() {
+    let fixture = Fixture::start(
+        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; IFS= read -r line; i=0; while [ $i -lt 70 ]; do printf '%1024s' x; i=$((i+1)); done; IFS= read -r line",
+    );
+    let session = fixture.session();
+    let pgid = fixture_pgid(&wait_for_output(session, "ready"));
+    let mut request = open_request();
+    request.encoding = Encoding::Grid;
+    {
+        let (mut channel, _) = Channel::open(session, ViewerId(92), &request)
+            .unwrap_or_else(|_| panic!("grid open refused"));
+        assert!(matches!(
+            channel.poll_grid(Duration::ZERO).unwrap(),
+            Some(Frame::Grid(GridFrame::Full { frame: 1, .. }))
+        ));
+        channel.receive(Frame::Control(Control::Take)).unwrap();
+        channel.receive(Frame::Input(b"go\n".to_vec())).unwrap();
+        channel_event(&channel, |event| {
+            matches!(event, Event::ResyncRequired { .. })
+        });
+        assert!(matches!(
+            channel.poll_grid(Duration::from_millis(1)).unwrap(),
+            Some(Frame::Grid(GridFrame::Full { frame: 2, .. }))
+        ));
+    }
+    fixture.finish(pgid);
+}
+
+#[test]
+fn terminal_grid_poll_after_actor_end_is_refused() {
+    let fixture =
+        Fixture::start("printf 'pid:%s\\n' \"$$\"; printf 'ready\\n'; while :; do sleep 1; done");
+    let session = fixture.session();
+    let pgid = fixture_pgid(&wait_for_output(session, "ready"));
+    let mut request = open_request();
+    request.encoding = Encoding::Grid;
+    {
+        let (mut channel, _) = Channel::open(session, ViewerId(94), &request).unwrap();
+        assert!(matches!(
+            channel.poll_grid(Duration::ZERO),
+            Ok(Some(Frame::Grid(_)))
+        ));
+        session.send(Command::Close);
+        let start = Instant::now();
+        loop {
+            match channel.poll_grid(Duration::from_millis(1)) {
+                Err(hypervisor_session::channel::ChannelError::Refused(Refusal::UnknownViewer)) => {
+                    break;
+                }
+                Ok(None | Some(_)) => {}
+                other => panic!("unexpected grid result after close: {other:?}"),
+            }
+            assert!(start.elapsed() < WAIT, "actor did not end");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     fixture.finish(pgid);
 }
 

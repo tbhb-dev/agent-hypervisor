@@ -2,6 +2,7 @@
 
 use std::io::Read;
 use std::ops::{Deref, DerefMut};
+use std::os::unix::process::CommandExt;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -60,39 +61,126 @@ fn spec(script: &str, cols: u16, rows: u16) -> SpawnSpec {
     s
 }
 
-#[test]
 #[expect(
     unsafe_code,
-    reason = "the test reads its inherited SIGHUP disposition with sigaction"
+    reason = "the test queries the supervisor's inherited signal disposition"
 )]
-fn a_child_inherits_default_hangup_even_when_the_supervisor_ignores_it() {
-    if std::env::var_os("HYPERVISOR_TEST_IGNORED_HUP").is_some() {
+fn with_ignored_signal(test: &str, name: &str, number: i32, child: impl FnOnce()) {
+    if std::env::var_os("HYPERVISOR_TEST_IGNORED_SIGNAL").as_deref()
+        == Some(std::ffi::OsStr::new(test))
+    {
         // SAFETY: zero is a valid empty signal action for this query-only call.
         let mut inherited: libc::sigaction = unsafe { std::mem::zeroed() };
-        // SAFETY: a null new action queries the current process's SIGHUP disposition.
-        let result = unsafe { libc::sigaction(libc::SIGHUP, std::ptr::null(), &raw mut inherited) };
+        // SAFETY: a null new action queries the inherited disposition.
+        let result = unsafe { libc::sigaction(number, std::ptr::null(), &raw mut inherited) };
         assert_eq!(result, 0);
         assert_eq!(inherited.sa_sigaction, libc::SIG_IGN);
-        let mut pty = spawn_fixture("kill -HUP $$; echo survived", 80, 24);
-        // Drain the master while the child exits; an ignored HUP writes output.
-        let _out = Output::start(&pty);
-        assert_eq!(pty.take_waiter().unwrap().wait().unwrap().signal, Some(1));
+        child();
         return;
     }
 
-    let status = std::process::Command::new("/bin/sh")
+    let mut supervisor = std::process::Command::new("/bin/sh")
         .args([
             "-c",
-            "trap '' HUP; exec \"$@\"",
+            "trap '' \"$1\"; shift; exec \"$@\"",
             "sh",
+            name,
             std::env::current_exe().unwrap().to_str().unwrap(),
             "--exact",
-            "a_child_inherits_default_hangup_even_when_the_supervisor_ignores_it",
+            test,
         ])
-        .env("HYPERVISOR_TEST_IGNORED_HUP", "1")
-        .status()
+        .env("HYPERVISOR_TEST_IGNORED_SIGNAL", test)
+        .process_group(0)
+        .spawn()
         .unwrap();
-    assert!(status.success());
+    let _group = process_group::ProcessGroup::new(supervisor.id().cast_signed());
+    assert!(supervisor.wait().unwrap().success());
+}
+
+fn assert_spawned_signal(signal: rustix::process::Signal, number: i32) {
+    let mut pty = spawn_fixture("exec sleep 2", 80, 24);
+    rustix::process::kill_process(rustix::process::Pid::from_raw(pty.pid()).unwrap(), signal)
+        .unwrap();
+    assert_eq!(
+        pty.take_waiter().unwrap().wait().unwrap().signal,
+        Some(number)
+    );
+}
+
+#[test]
+fn a_child_inherits_default_hangup_even_when_the_supervisor_ignores_it() {
+    with_ignored_signal(
+        "a_child_inherits_default_hangup_even_when_the_supervisor_ignores_it",
+        "HUP",
+        libc::SIGHUP,
+        || {
+            let mut pty = spawn_fixture("kill -HUP $$; echo survived", 80, 24);
+            // Drain the master while the child exits; an ignored HUP writes output.
+            let _out = Output::start(&pty);
+            assert_eq!(pty.take_waiter().unwrap().wait().unwrap().signal, Some(1));
+        },
+    );
+}
+
+#[test]
+fn a_child_inherits_default_interrupt_even_when_the_supervisor_ignores_it() {
+    with_ignored_signal(
+        "a_child_inherits_default_interrupt_even_when_the_supervisor_ignores_it",
+        "INT",
+        libc::SIGINT,
+        || assert_spawned_signal(rustix::process::Signal::INT, libc::SIGINT),
+    );
+}
+
+#[test]
+fn a_child_inherits_default_quit_even_when_the_supervisor_ignores_it() {
+    with_ignored_signal(
+        "a_child_inherits_default_quit_even_when_the_supervisor_ignores_it",
+        "QUIT",
+        libc::SIGQUIT,
+        || assert_spawned_signal(rustix::process::Signal::QUIT, libc::SIGQUIT),
+    );
+}
+
+#[test]
+fn a_child_inherits_default_terminate_even_when_the_supervisor_ignores_it() {
+    with_ignored_signal(
+        "a_child_inherits_default_terminate_even_when_the_supervisor_ignores_it",
+        "TERM",
+        libc::SIGTERM,
+        || assert_spawned_signal(rustix::process::Signal::TERM, libc::SIGTERM),
+    );
+}
+
+#[test]
+fn a_child_inherits_default_pipe_even_when_the_supervisor_ignores_it() {
+    with_ignored_signal(
+        "a_child_inherits_default_pipe_even_when_the_supervisor_ignores_it",
+        "PIPE",
+        libc::SIGPIPE,
+        || assert_spawned_signal(rustix::process::Signal::PIPE, libc::SIGPIPE),
+    );
+}
+
+#[test]
+fn ctrl_c_reaches_a_child_when_the_supervisor_ignores_interrupt() {
+    with_ignored_signal(
+        "ctrl_c_reaches_a_child_when_the_supervisor_ignores_interrupt",
+        "INT",
+        libc::SIGINT,
+        || {
+            let mut pty = spawn_fixture("stty -echo; echo ready; exec sleep 2", 80, 24);
+            let out = Output::start(&pty);
+            out.wait_for("ready");
+            // The shell prints ready immediately before exec; let exec finish before Ctrl-C.
+            thread::sleep(Duration::from_millis(50));
+            pty.write(&[3]).unwrap();
+            assert_eq!(
+                pty.take_waiter().unwrap().wait().unwrap().signal,
+                Some(libc::SIGINT)
+            );
+        },
+    );
 }
 
 /// Collects a PTY's output on a thread.

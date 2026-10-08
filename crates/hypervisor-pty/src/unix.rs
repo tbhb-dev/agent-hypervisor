@@ -115,18 +115,26 @@ impl Spawn for UnixSpawner {
         // set above.
         #[expect(
             unsafe_code,
-            reason = "pre_exec sets the controlling terminal and restores SIGHUP in the child"
+            reason = "pre_exec sets the controlling terminal and restores signal defaults"
         )]
         unsafe {
             cmd.pre_exec(|| {
                 rp::setsid()?;
                 rp::ioctl_tiocsctty(BorrowedFd::borrow_raw(0))?;
-                // An ignored SIGHUP survives exec. Restore its default disposition so a
-                // session spawned by a supervisor that ignores HUP can still be hung up.
+                // Ignored dispositions survive exec. A session must receive terminal and
+                // lifecycle signals even if its supervisor ignored them.
                 let mut action: libc::sigaction = std::mem::zeroed();
                 action.sa_sigaction = libc::SIG_DFL;
-                if libc::sigaction(libc::SIGHUP, &raw const action, std::ptr::null_mut()) == -1 {
-                    return Err(io::Error::last_os_error());
+                for signal in [
+                    libc::SIGHUP,
+                    libc::SIGINT,
+                    libc::SIGQUIT,
+                    libc::SIGTERM,
+                    libc::SIGPIPE,
+                ] {
+                    if libc::sigaction(signal, &raw const action, std::ptr::null_mut()) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });

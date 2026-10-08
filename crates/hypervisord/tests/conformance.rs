@@ -567,6 +567,55 @@ fn terminal_channel_open_input_resize_controls_and_events() {
 }
 
 #[test]
+fn channel_interrupt_reaches_a_child_of_an_interrupt_ignoring_supervisor() {
+    const TEST: &str = "channel_interrupt_reaches_a_child_of_an_interrupt_ignoring_supervisor";
+    if std::env::var_os("HYPERVISOR_TEST_IGNORED_INT").is_none() {
+        let mut supervisor = ProcessCommand::new("/bin/sh")
+            .args([
+                "-c",
+                "trap '' INT; exec \"$@\"",
+                "sh",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                "--exact",
+                TEST,
+            ])
+            .env("HYPERVISOR_TEST_IGNORED_INT", "1")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let _group = process_group::ProcessGroup::new(supervisor.id().cast_signed());
+        assert!(supervisor.wait().unwrap().success());
+        return;
+    }
+
+    let fixture = Fixture::start("printf 'pid:%s\\nready\\n' \"$$\"; exec sleep 2");
+    let session = fixture.session();
+    let pgid = fixture_pgid(&wait_for_output(session, "ready"));
+    let (mut channel, _) = Channel::open(session, ViewerId(93), &open_request()).unwrap();
+    assert_eq!(
+        channel.receive(Frame::Control(Control::Take)),
+        Ok(Some(Frame::ControlResult(ControlResult::Accepted)))
+    );
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        channel.receive(Frame::Control(Control::Signal(WireSignal::Interrupt))),
+        Ok(Some(Frame::ControlResult(ControlResult::Accepted)))
+    );
+    assert_eq!(
+        channel_event(&channel, |event| matches!(
+            event,
+            Event::SessionExited { .. }
+        )),
+        Event::SessionExited {
+            code: None,
+            signal: Some(libc::SIGINT),
+        }
+    );
+    drop(channel);
+    fixture.finish(pgid);
+}
+
+#[test]
 
 fn terminal_channel_detached_refuses_output_and_snapshot() {
     let fixture = Fixture::start("printf 'pid:%s\\nready\\n' \"$$\"; IFS= read -r line");

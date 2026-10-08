@@ -658,15 +658,22 @@ mod tests {
         let mut bytes = Frame::Grid(full).encode().unwrap();
         bytes[4..6].copy_from_slice(&0u16.to_be_bytes());
         assert_eq!(Frame::decode(&bytes), Err(FrameError::UnsupportedVersion));
-        let mut body: serde_json::Value = serde_json::from_slice(&bytes[7..]).unwrap();
-        body["extra"] = serde_json::json!(1);
-        let payload = body.to_string();
-        let length = u32::try_from(payload.len() + 3).unwrap();
-        let mut invalid = length.to_be_bytes().to_vec();
-        invalid.extend_from_slice(&crate::channel::VERSION.to_be_bytes());
-        invalid.push(9);
-        invalid.extend_from_slice(payload.as_bytes());
-        assert_eq!(Frame::decode(&invalid), Err(FrameError::MalformedPayload));
+        let body: serde_json::Value = serde_json::from_slice(&bytes[7..]).unwrap();
+        for field in ["extra", "cursor", "modes"] {
+            let mut value = body.clone();
+            if field == "extra" {
+                value[field] = serde_json::json!(1);
+            } else {
+                value[field]["extra"] = serde_json::json!(1);
+            }
+            let payload = value.to_string();
+            let length = u32::try_from(payload.len() + 3).unwrap();
+            let mut invalid = length.to_be_bytes().to_vec();
+            invalid.extend_from_slice(&crate::channel::VERSION.to_be_bytes());
+            invalid.push(9);
+            invalid.extend_from_slice(payload.as_bytes());
+            assert_eq!(Frame::decode(&invalid), Err(FrameError::MalformedPayload));
+        }
     }
 
     proptest! {

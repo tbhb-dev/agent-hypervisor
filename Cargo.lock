@@ -163,6 +163,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hypervisor-pty"
+version = "0.1.0"
+dependencies = [
+ "hypervisor-core",
+ "rustix",
+]
+
+[[package]]
 name = "hypervisord"
 version = "0.1.0"
 dependencies = [

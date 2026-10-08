@@ -1,0 +1,16 @@
+[package]
+name = "hypervisor-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "PTY backend for the session holder: spawn, I/O, resize, signals, and exit status"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hypervisor-core.workspace = true
+rustix.workspace = true
+
+[lints]
+workspace = true

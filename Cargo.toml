@@ -14,7 +14,19 @@ publish = false
 ghostty-vt-sys = { path = "crates/ghostty-vt-sys" }
 hypervisor-core = { path = "crates/hypervisor-core" }
 hypervisor-ghostty = { path = "crates/hypervisor-ghostty" }
+hypervisor-pty = { path = "crates/hypervisor-pty" }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+rustix = {
+  version = "1.1.5",
+  default-features = false,
+  features = [
+    "fs",
+    "process",
+    "pty",
+    "std",
+    "termios",
+  ]
+}
 serde_json = "1.0.151"
 xtask-core = { path = "crates/xtask-core" }
 

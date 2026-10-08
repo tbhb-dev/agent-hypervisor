@@ -8,6 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hypervisor_core::channel::{
+    Capabilities, Control, ControlResult, Encoding, Event, Frame, Mode, OpenRefusal, OpenRequest,
+    OpenTarget, WireSignal, WireSize,
+};
 use hypervisor_core::emulator::Size;
 use hypervisor_core::session::{
     HolderConfig, Persistence, Refusal, RingRead, SessionEvent, SessionKind, SpawnSpec, ViewerId,
@@ -16,6 +20,7 @@ use hypervisor_core::session::{
 use hypervisor_core::state::{AgentState, BlockReason, Harness, HookKind};
 use hypervisor_ghostty::GhosttyEmulator;
 use hypervisor_pty::{PtyError, Spawn, UnixPty, UnixSpawner};
+use hypervisor_session::channel::Channel;
 use hypervisor_session::{Command, LogContext, SessionHandle, spawn};
 
 #[path = "../../../tests/support/process_group.rs"]
@@ -142,6 +147,195 @@ fn fixture_pgid(output: &str) -> i32 {
         .unwrap()
         .parse()
         .unwrap()
+}
+
+fn open_request() -> OpenRequest {
+    OpenRequest {
+        versions: vec![1],
+        target: OpenTarget::Session("conformance-session".into()),
+        mode: Mode::ReadOnly,
+        encoding: Encoding::Bytes,
+        size: WireSize { cols: 80, rows: 24 },
+        client: Capabilities {
+            terminal: "test".into(),
+            flags: 0,
+        },
+        resume: None,
+    }
+}
+
+fn channel_event(channel: &Channel<'_>, wanted: impl Fn(&Event) -> bool) -> Event {
+    let start = Instant::now();
+    loop {
+        if let Some(Frame::Event(event)) = channel.next_event()
+            && wanted(&event)
+        {
+            return event;
+        }
+        assert!(start.elapsed() < WAIT, "channel event not received");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn terminal_channel_open_input_resize_controls_and_events() {
+    let fixture = Fixture::start(
+        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+    );
+    let session = fixture.session();
+    let pgid = fixture_pgid(&wait_for_output(session, "ready"));
+    {
+        let (mut channel, response) = Channel::open(session, ViewerId(81), &open_request())
+            .unwrap_or_else(|_| panic!("open refused"));
+        let Frame::OpenResponse(response) = response else {
+            panic!("wrong open response")
+        };
+        assert_eq!(response.version, 1);
+        assert_eq!(response.granted_mode, Mode::ReadOnly);
+        assert_eq!(response.effective_size, WireSize { cols: 80, rows: 24 });
+        assert!(response.starting_sequence >= 5);
+        let (mut detachable, _) = Channel::open(session, ViewerId(82), &open_request())
+            .unwrap_or_else(|_| panic!("second open refused"));
+        assert_eq!(
+            detachable.receive(Frame::Control(Control::Detach)),
+            Ok(Some(Frame::ControlResult(ControlResult::Accepted)))
+        );
+        channel
+            .receive(Frame::Input(b"blocked\n".to_vec()))
+            .unwrap();
+        assert_eq!(
+            channel.receive(Frame::Control(Control::Signal(WireSignal::Interrupt))),
+            Ok(Some(Frame::ControlResult(ControlResult::Refused)))
+        );
+        assert_eq!(
+            channel.receive(Frame::Control(Control::Take)),
+            Ok(Some(Frame::ControlResult(ControlResult::Accepted)))
+        );
+        assert_eq!(
+            channel_event(&channel, |e| matches!(
+                e,
+                Event::ModeChanged(Mode::ReadWrite)
+            )),
+            Event::ModeChanged(Mode::ReadWrite)
+        );
+        assert!(matches!(
+            channel_event(&channel, |e| matches!(e, Event::WriterChanged(_))),
+            Event::WriterChanged(Some(_))
+        ));
+        channel.receive(Frame::Input(b"one\n".to_vec())).unwrap();
+        let observed = wait_for_output(session, "got:one");
+        assert!(!observed.contains("got:blocked"));
+        channel
+            .receive(Frame::Resize(WireSize {
+                cols: 100,
+                rows: 30,
+            }))
+            .unwrap();
+        assert_eq!(
+            channel_event(&channel, |e| matches!(e, Event::SizeChanged(_))),
+            Event::SizeChanged(WireSize {
+                cols: 100,
+                rows: 30
+            })
+        );
+        session.send(Command::Hook {
+            harness: Harness::Claude,
+            kind: HookKind::UserPromptSubmit,
+            seq: 1,
+        });
+        assert_eq!(
+            channel_event(&channel, |e| matches!(e, Event::SessionStateChanged(_))),
+            Event::SessionStateChanged("working".into())
+        );
+        assert_eq!(
+            channel.receive(Frame::Control(Control::Release)),
+            Ok(Some(Frame::ControlResult(ControlResult::Accepted)))
+        );
+        assert_eq!(
+            channel_event(&channel, |e| matches!(e, Event::WriterChanged(None))),
+            Event::WriterChanged(None)
+        );
+        channel
+            .receive(Frame::Input(b"blocked2\n".to_vec()))
+            .unwrap();
+        assert_eq!(
+            channel.receive(Frame::Control(Control::Take)),
+            Ok(Some(Frame::ControlResult(ControlResult::Accepted)))
+        );
+        channel
+            .receive(Frame::Input(b"sentinel\n".to_vec()))
+            .unwrap();
+        let observed = wait_for_output(session, "got:sentinel");
+        assert!(!observed.contains("got:blocked2"));
+        assert_eq!(
+            channel.receive(Frame::Control(Control::Signal(WireSignal::Kill))),
+            Ok(Some(Frame::ControlResult(ControlResult::Accepted)))
+        );
+        assert!(matches!(
+            channel_event(&channel, |e| matches!(e, Event::SessionExited { .. })),
+            Event::SessionExited { .. }
+        ));
+    }
+    fixture.finish(pgid);
+}
+
+#[test]
+fn terminal_channel_refuses_unsupported_versions_and_unimplemented_encodings() {
+    let fixture = Fixture::start(
+        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; IFS= read -r line",
+    );
+    let session = fixture.session();
+    let pgid = fixture_pgid(&wait_for_output(session, "ready"));
+    let mut request = open_request();
+    request.versions = vec![2];
+    assert!(
+        Channel::open(session, ViewerId(90), &request).err().is_some_and(|frame| matches!(*frame, Frame::OpenRefused(refused) if refused.reason == OpenRefusal::UnsupportedVersion && refused.supported_versions == [1]))
+    );
+    request.versions = vec![1];
+    request.encoding = Encoding::Grid;
+    assert!(
+        Channel::open(session, ViewerId(90), &request).err().is_some_and(|frame| matches!(*frame, Frame::OpenRefused(refused) if refused.reason == OpenRefusal::UnsupportedEncoding))
+    );
+    request.encoding = Encoding::Bytes;
+    request.resume = Some(hypervisor_core::channel::ResumeToken { next_sequence: 0 });
+    assert!(
+        Channel::open(session, ViewerId(90), &request).err().is_some_and(|frame| matches!(*frame, Frame::OpenRefused(refused) if refused.reason == OpenRefusal::InvalidRequest))
+    );
+    fixture.finish(pgid);
+}
+
+#[test]
+fn terminal_channel_reports_resync_after_viewer_overflow() {
+    let fixture = Fixture::start(
+        "printf 'pid:%s\\n' \"$$\"; stty -echo; printf 'ready\\n'; IFS= read -r line; i=0; while [ $i -lt 70 ]; do printf '%1024s' x; i=$((i+1)); done; IFS= read -r line",
+    );
+    let session = fixture.session();
+    let pgid = fixture_pgid(&wait_for_output(session, "ready"));
+    {
+        let (mut channel, response) = Channel::open(session, ViewerId(83), &open_request())
+            .unwrap_or_else(|_| panic!("open refused"));
+        let Frame::OpenResponse(response) = response else {
+            panic!("wrong open response")
+        };
+        channel.receive(Frame::Control(Control::Take)).unwrap();
+        channel.receive(Frame::Input(b"go\n".to_vec())).unwrap();
+        let Event::ResyncRequired { oldest } =
+            channel_event(&channel, |e| matches!(e, Event::ResyncRequired { .. }))
+        else {
+            panic!("wrong resync event")
+        };
+        let retained_oldest = match session.read_from(0) {
+            Some(RingRead::Bytes(_)) => 0,
+            Some(RingRead::Gone { oldest }) => oldest,
+            other => panic!("unexpected ring read: {other:?}"),
+        };
+        assert_eq!(oldest, retained_oldest);
+        assert!(matches!(
+            session.read_from(response.starting_sequence),
+            Some(RingRead::Bytes(bytes)) if !bytes.is_empty()
+        ));
+    }
+    fixture.finish(pgid);
 }
 
 #[test]

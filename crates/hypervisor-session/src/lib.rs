@@ -19,13 +19,15 @@ use std::time::{Duration, Instant};
 use hypervisor_core::emulator::{Cursor, Emulator, PROFILE, QueryScanner, Size};
 use hypervisor_core::screen::{RuleDetector, ScreenDetector};
 use hypervisor_core::session::{
-    Effect, Exit, Holder, HolderConfig, Input, Phase, Refusal, RingRead, SessionEvent, SpawnSpec,
-    ViewerId, ViewerMode, ViewerRead, Writer,
+    Effect, Exit, Holder, HolderConfig, Input, Phase, Refusal, RingRead, SessionEvent, Signal,
+    SpawnSpec, ViewerId, ViewerMode, ViewerRead, Writer,
 };
 use hypervisor_core::state::{Harness, HookKind, HookReport};
 use hypervisor_pty::{Pty, PtyError, Spawn, Wait};
 use serde_json::json;
 use std::num::NonZeroUsize;
+
+pub mod channel;
 
 /// The most messages handled before pending size requests settle.
 const BATCH: usize = 64;
@@ -52,6 +54,14 @@ pub enum Command {
         NonZeroUsize,
         Sender<Result<(), Refusal>>,
     ),
+    /// Attach and report the size and output sequence in the same actor turn.
+    AttachChannel(
+        ViewerId,
+        ViewerMode,
+        Size,
+        NonZeroUsize,
+        Sender<Result<(Size, u64), Refusal>>,
+    ),
     /// Detach a viewer.
     Detach(ViewerId, Sender<Result<(), Refusal>>),
     /// Explicitly take the lock.
@@ -68,6 +78,8 @@ pub enum Command {
     ViewerSnapshot(ViewerId, Sender<Result<(u64, Vec<u8>), Refusal>>),
     /// Interrupt from the lock holder.
     Interrupt(Writer, Sender<Result<(), Refusal>>),
+    /// Signal the foreground group from the write-lock holder.
+    Signal(Writer, Signal, Sender<Result<(), Refusal>>),
     /// End the session.
     Close,
     /// Read the output ring from a sequence number.
@@ -79,7 +91,7 @@ pub enum Command {
 #[cfg(test)]
 mod log_tests {
     use super::*;
-    use hypervisor_core::session::{Persistence, Signal, Target};
+    use hypervisor_core::session::{Persistence, Signal, Target, ViewerRead};
     use hypervisor_ghostty::GhosttyEmulator;
     use hypervisor_pty::{Caps, Resize, Support};
     use serde_json::Value;
@@ -139,6 +151,51 @@ mod log_tests {
                 resize_repaints: false,
             }
         }
+    }
+
+    #[test]
+    fn channel_attach_reports_the_first_queued_output_sequence() {
+        let mut actor: Actor<FailingWrite, GhosttyEmulator> = Actor {
+            holder: Holder::new(
+                HolderConfig::new(Persistence::Persistent),
+                Size::new(80, 24).unwrap(),
+            ),
+            pty: Some(FailingWrite),
+            emulator: None,
+            events: Vec::new(),
+            event_seq: 0,
+            origin: Instant::now(),
+            log: LogContext {
+                workload_id: "test".into(),
+                session_id: "test".into(),
+            },
+            queries: QueryScanner::default(),
+            screen_harness: None,
+            screen_at: None,
+            error_lines: Vec::new(),
+        };
+        actor.step(Input::Spawned).unwrap();
+        actor.handle(Msg::Output(b"before".to_vec()));
+        let viewer = ViewerId(1);
+        let (reply, answer) = mpsc::channel();
+        actor.handle(Msg::Command(Command::AttachChannel(
+            viewer,
+            ViewerMode::ReadOnly,
+            Size::new(80, 24).unwrap(),
+            NonZeroUsize::new(64).unwrap(),
+            reply,
+        )));
+        actor.handle(Msg::Output(b"after".to_vec()));
+        let (size, starting_sequence) = answer.recv().unwrap().unwrap();
+        assert_eq!(size, Size::new(80, 24).unwrap());
+        assert_eq!(starting_sequence, 6);
+        assert_eq!(
+            actor.holder.read_viewer(viewer),
+            Ok(ViewerRead::Output {
+                seq: starting_sequence,
+                bytes: b"after".to_vec(),
+            })
+        );
     }
 
     #[test]
@@ -299,6 +356,13 @@ impl LogContext {
             SessionEvent::StateChanged { .. } => ("state_changed", None),
             SessionEvent::Running => ("running", None),
             SessionEvent::Resized(_) => ("resized", None),
+            SessionEvent::ModeChanged { viewer, .. } => {
+                ("mode_changed", Some(format!("viewer:{}", viewer.0)))
+            }
+            SessionEvent::WriterChanged(_) => ("writer_changed", None),
+            SessionEvent::ResyncRequired { viewer, .. } => {
+                ("resync_required", Some(format!("viewer:{}", viewer.0)))
+            }
             SessionEvent::Exited(_) => ("exited", None),
             SessionEvent::Reaped => ("reaped", None),
             _ => ("unknown", None),
@@ -346,6 +410,22 @@ impl SessionHandle {
         budget: NonZeroUsize,
     ) -> Result<(), Refusal> {
         self.request(|reply| Command::Attach(id, mode, size, budget, reply))
+    }
+
+    /// Attach a channel and return the size and sequence at that attachment point.
+    ///
+    /// # Errors
+    /// If the viewer is already attached or the actor has ended.
+    pub fn attach_channel(
+        &self,
+        id: ViewerId,
+        mode: ViewerMode,
+        size: Size,
+        budget: NonZeroUsize,
+    ) -> Result<(Size, u64), Refusal> {
+        let (reply, answer) = mpsc::channel();
+        self.send(Command::AttachChannel(id, mode, size, budget, reply));
+        answer.recv().unwrap_or(Err(Refusal::UnknownViewer))
     }
 
     /// Detach a viewer.
@@ -400,6 +480,14 @@ impl SessionHandle {
     /// If `who` does not hold the lock or the actor has ended.
     pub fn interrupt(&self, who: Writer) -> Result<(), Refusal> {
         self.request(|reply| Command::Interrupt(who, reply))
+    }
+
+    /// Signal the foreground group under the same write lock.
+    ///
+    /// # Errors
+    /// If the caller does not hold the lock or the actor has ended.
+    pub fn signal(&self, who: Writer, signal: Signal) -> Result<(), Refusal> {
+        self.request(|reply| Command::Signal(who, signal, reply))
     }
 
     /// Pop the next output item, including a resync notice after overflow.
@@ -672,6 +760,17 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                     let _ = reply.send(result);
                     return;
                 }
+                Command::AttachChannel(id, mode, size, budget, reply) => {
+                    let result = self.step(Input::Attach {
+                        viewer: id,
+                        mode,
+                        size,
+                        budget,
+                    });
+                    let _ = reply
+                        .send(result.map(|()| (self.holder.size(), self.holder.ring().next())));
+                    return;
+                }
                 Command::Detach(id, reply) => {
                     let _ = reply.send(self.step(Input::Detach(id)));
                     return;
@@ -705,6 +804,10 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                 }
                 Command::Interrupt(who, reply) => {
                     let _ = reply.send(self.step(Input::Interrupt(who)));
+                    return;
+                }
+                Command::Signal(who, signal, reply) => {
+                    let _ = reply.send(self.step(Input::SendSignal(who, signal)));
                     return;
                 }
                 Command::Close => Input::Close,
@@ -835,10 +938,13 @@ impl<P: Pty, E: Emulator> Actor<P, E> {
                 self.events
                     .retain(|subscriber| subscriber.send(envelope).is_ok());
             }
-            Effect::ViewerAttached(_)
-            | Effect::ViewerDetached(_)
-            | Effect::Resync { .. }
-            | Effect::Refused(_) => {}
+            Effect::Resync { viewer, oldest } => {
+                self.apply(Effect::Emit(SessionEvent::ResyncRequired {
+                    viewer,
+                    oldest,
+                }));
+            }
+            Effect::ViewerAttached(_) | Effect::ViewerDetached(_) | Effect::Refused(_) => {}
             // A variant added for a later run must be handled here in that run.
             _ => unreachable!("an effect this actor does not know: {effect:?}"),
         }

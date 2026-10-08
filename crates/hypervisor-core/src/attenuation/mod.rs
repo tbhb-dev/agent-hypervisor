@@ -3,12 +3,13 @@
 //! A workload's grant is a row held by `agentd`, keyed by the workload's SPIFFE ID. A child's row
 //! is [`intersect`] of its parent's row and the grant it asked for, so it is never wider than the
 //! parent on any axis: isolation, egress, credentials, and mounts. [`within`] is the containment
-//! test for one request against one grant, and it fails closed.
+//! test for one request against one grant, and it fails closed. [`check`] runs it over a row and
+//! every ancestor row (chain mode), so a row stored without intersection cannot widen anything.
 //!
 //! Credentials appear only as broker references. No type here has a field for a secret value; a
 //! child receives a [`BrokerGrant`] naming its own identity and a reference its parent holds.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// How strongly a workload is isolated from the host, weakest first.
 ///
@@ -199,6 +200,10 @@ pub enum Denial {
     NotCovered,
     /// The spawn asks for weaker isolation than the grant allows.
     WeakerIsolation,
+    /// The table has no row for the identity, or an ancestor row is missing.
+    UnknownRow,
+    /// The parent links loop.
+    Cycle,
 }
 
 /// The answer of [`within`] for one request against one grant.
@@ -517,5 +522,97 @@ pub fn broker_grants(holder: &SpiffeId, grant: &Grant) -> Vec<BrokerGrant> {
         .collect()
 }
 
+/// A row in `agentd`'s grant table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Row {
+    /// The row of the workload that created this one; `None` for a root grant.
+    pub parent: Option<SpiffeId>,
+    /// The grant.
+    pub grant: Grant,
+}
+
+/// Grant rows keyed by SPIFFE ID.
+pub type GrantTable = BTreeMap<SpiffeId, Row>;
+
+/// The child row for a spawn: the parent's grant intersected with the requested one, and what was
+/// dropped. `None` when the table has no row for `parent`.
+#[must_use]
+pub fn spawn_row(
+    table: &GrantTable,
+    parent: &SpiffeId,
+    requested: &Grant,
+) -> Option<(Row, Vec<Dropped>)> {
+    let (grant, dropped) = intersect(&table.get(parent)?.grant, requested);
+    let row = Row {
+        parent: Some(parent.clone()),
+        grant,
+    };
+    Some((row, dropped))
+}
+
+/// The answer of [`check`] or [`check_snapshot`] for a request from a workload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Every row checked covers the request.
+    Allow,
+    /// The named row denied the request, or is missing.
+    Deny {
+        /// The row that denied, or the missing identity.
+        row: SpiffeId,
+        /// Why.
+        denial: Denial,
+    },
+}
+
+/// Chain mode, the default: `peer`'s row and every ancestor row must each cover the request, so a
+/// row stored without intersection cannot widen anything, a parent narrowed after the spawn
+/// narrows its children, and a removed ancestor row denies its descendants.
+#[must_use]
+pub fn check(table: &GrantTable, peer: &SpiffeId, request: &Request) -> Verdict {
+    let mut id = peer;
+    // A parent link chain longer than the table can only be a loop.
+    for _ in 0..=table.len() {
+        let Some(row) = table.get(id) else {
+            return Verdict::Deny {
+                row: id.clone(),
+                denial: Denial::UnknownRow,
+            };
+        };
+        if let Decision::Deny(denial) = within(&row.grant, request) {
+            return Verdict::Deny {
+                row: id.clone(),
+                denial,
+            };
+        }
+        match &row.parent {
+            Some(parent) => id = parent,
+            None => return Verdict::Allow,
+        }
+    }
+    Verdict::Deny {
+        row: id.clone(),
+        denial: Denial::Cycle,
+    }
+}
+
+/// Snapshot mode: only `peer`'s own row is checked. It trusts that the row was intersected at
+/// spawn; use [`check`] unless a cross-host row has no reachable ancestors.
+#[must_use]
+pub fn check_snapshot(table: &GrantTable, peer: &SpiffeId, request: &Request) -> Verdict {
+    match table.get(peer).map(|row| within(&row.grant, request)) {
+        Some(Decision::Allow) => Verdict::Allow,
+        Some(Decision::Deny(denial)) => Verdict::Deny {
+            row: peer.clone(),
+            denial,
+        },
+        None => Verdict::Deny {
+            row: peer.clone(),
+            denial: Denial::UnknownRow,
+        },
+    }
+}
+
+#[cfg(test)]
+mod table_tests;
 #[cfg(test)]
 mod tests;

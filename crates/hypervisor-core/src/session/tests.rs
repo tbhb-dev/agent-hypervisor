@@ -1,8 +1,10 @@
 use super::{
     Effect, Exit, Holder, HolderConfig, Input, Persistence, Phase, SessionEvent, Signal, Target,
+    ViewerId, ViewerMode, Writer,
 };
 use crate::emulator::Size;
 use proptest::prelude::*;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 const EXIT: Exit = Exit {
@@ -28,13 +30,48 @@ fn running(config: HolderConfig) -> Holder {
     h
 }
 
+fn attach_writer(h: &mut Holder) {
+    h.step(
+        Input::Attach {
+            viewer: ViewerId(1),
+            mode: ViewerMode::ReadWrite,
+            size: size(80, 24),
+            budget: NonZeroUsize::new(64).unwrap(),
+        },
+        ms(0),
+    );
+    h.step(Input::Take(Writer::Viewer(ViewerId(1))), ms(0));
+    h.step(Input::Settle, ms(0));
+}
+
 const HANGUP: Effect = Effect::Signal {
     signal: Signal::Hangup,
     target: Target::Group,
 };
 
 #[test]
-fn output_goes_to_the_ring_and_the_emulator_and_replies_go_back() {
+fn attach_and_detach_emit_viewer_effects_for_run_11() {
+    let mut h = running(HolderConfig::new(Persistence::Persistent));
+    assert_eq!(
+        h.step(
+            Input::Attach {
+                viewer: ViewerId(7),
+                mode: ViewerMode::ReadOnly,
+                size: size(80, 24),
+                budget: NonZeroUsize::new(64).unwrap(),
+            },
+            ms(1),
+        ),
+        vec![Effect::ViewerAttached(ViewerId(7))]
+    );
+    assert_eq!(
+        h.step(Input::Detach(ViewerId(7)), ms(2)),
+        vec![Effect::ViewerDetached(ViewerId(7))]
+    );
+}
+
+#[test]
+fn output_goes_to_the_ring_and_profile_replies_go_back() {
     let mut h = running(HolderConfig::new(Persistence::Persistent));
     assert_eq!(
         h.step(Input::Output(b"\x1b[c".to_vec()), ms(1)),
@@ -51,16 +88,80 @@ fn output_goes_to_the_ring_and_the_emulator_and_replies_go_back() {
 #[test]
 fn a_same_size_resize_sends_a_redraw_hint() {
     let mut h = running(HolderConfig::new(Persistence::Persistent));
-    assert_eq!(h.step(Input::Resize(size(80, 24)), ms(1)), vec![]);
+    attach_writer(&mut h);
+    assert_eq!(
+        h.step(Input::ViewerResize(ViewerId(1), size(80, 24)), ms(1)),
+        vec![]
+    );
     assert_eq!(h.step(Input::Settle, ms(1)), vec![Effect::RedrawHint]);
     assert_eq!(h.step(Input::Settle, ms(1)), vec![]);
 }
 
 #[test]
+fn a_same_size_take_requests_a_redraw_hint() {
+    let mut h = running(HolderConfig::new(Persistence::Persistent));
+    h.step(
+        Input::Attach {
+            viewer: ViewerId(1),
+            mode: ViewerMode::ReadOnly,
+            size: size(80, 24),
+            budget: NonZeroUsize::new(8).unwrap(),
+        },
+        ms(0),
+    );
+    assert_eq!(
+        h.step(Input::Take(Writer::Viewer(ViewerId(1))), ms(1)),
+        vec![]
+    );
+    assert_eq!(h.step(Input::Settle, ms(1)), vec![Effect::RedrawHint]);
+}
+
+#[test]
+fn a_standalone_escape_key_flushes_after_the_filter_window() {
+    let mut h = running(HolderConfig::new(Persistence::Persistent));
+    attach_writer(&mut h);
+    assert!(
+        h.step(
+            Input::Submit(Writer::Viewer(ViewerId(1)), b"\x1b".to_vec()),
+            ms(1)
+        )
+        .is_empty()
+    );
+    assert_eq!(h.deadline(), Some(ms(51)));
+    assert!(h.step(Input::Tick, ms(50)).is_empty());
+    assert_eq!(
+        h.step(Input::Tick, ms(51)),
+        vec![Effect::WritePty(b"\x1b".to_vec())]
+    );
+}
+
+#[test]
+fn a_split_terminal_reply_is_discarded_before_the_filter_window() {
+    let mut h = running(HolderConfig::new(Persistence::Persistent));
+    attach_writer(&mut h);
+    assert!(
+        h.step(
+            Input::Submit(Writer::Viewer(ViewerId(1)), b"\x1b[?62".to_vec()),
+            ms(1)
+        )
+        .is_empty()
+    );
+    assert!(
+        h.step(
+            Input::Submit(Writer::Viewer(ViewerId(1)), b";22c".to_vec()),
+            ms(10)
+        )
+        .is_empty()
+    );
+    assert_eq!(h.deadline(), None);
+}
+
+#[test]
 fn a_resize_burst_applies_the_last_size_then_flushes_replies() {
     let mut h = running(HolderConfig::new(Persistence::Persistent));
+    attach_writer(&mut h);
     for s in [size(100, 30), size(90, 20), size(120, 40)] {
-        assert_eq!(h.step(Input::Resize(s), ms(1)), vec![]);
+        assert_eq!(h.step(Input::ViewerResize(ViewerId(1), s), ms(1)), vec![]);
     }
     assert_eq!(
         h.step(Input::Settle, ms(1)),
@@ -108,8 +209,15 @@ fn exit_waits_for_output_to_close_then_keeps_the_screen_until_reaped() {
 #[test]
 fn exit_without_output_closing_ends_after_the_drain() {
     let mut h = running(HolderConfig::new(Persistence::Persistent));
+    attach_writer(&mut h);
     h.step(Input::ChildExited(EXIT), ms(10));
-    assert_eq!(h.step(Input::Write(b"x".to_vec()), ms(20)), vec![]);
+    assert_eq!(
+        h.step(
+            Input::Submit(Writer::Viewer(ViewerId(1)), b"x".to_vec()),
+            ms(20)
+        ),
+        vec![]
+    );
     assert_eq!(
         h.step(Input::Tick, ms(110)),
         vec![Effect::Emit(SessionEvent::Exited(EXIT))]
@@ -236,15 +344,23 @@ fn an_exit_without_a_close_sends_no_kill_once_output_closes() {
 #[test]
 fn close_hangs_up_once() {
     let mut h = running(HolderConfig::new(Persistence::Persistent));
+    attach_writer(&mut h);
     assert_eq!(h.step(Input::Close, ms(0)), vec![HANGUP]);
     assert_eq!(h.step(Input::Close, ms(1)), vec![]);
-    assert_eq!(h.step(Input::Interrupt, ms(1)), vec![Effect::Interrupt]);
+    assert_eq!(
+        h.step(Input::Interrupt(Writer::Viewer(ViewerId(1))), ms(1)),
+        vec![Effect::Interrupt]
+    );
 }
 
 #[test]
 fn nothing_reaches_the_pty_before_spawn() {
     let mut h = Holder::new(HolderConfig::ephemeral(), size(80, 24));
-    assert_eq!(h.step(Input::Write(b"x".to_vec()), ms(0)), vec![]);
+    h.step(Input::Take(Writer::Program(1)), ms(0));
+    assert_eq!(
+        h.step(Input::Submit(Writer::Program(1), b"x".to_vec()), ms(0)),
+        vec![]
+    );
     assert_eq!(h.step(Input::Close, ms(0)), vec![]);
     assert_eq!(h.phase(), Phase::Starting);
 }
@@ -256,11 +372,11 @@ fn input() -> impl Strategy<Value = Input> {
         proptest::collection::vec(any::<u8>(), 0..4).prop_map(Input::Replies),
         Just(Input::OutputClosed),
         Just(Input::ChildExited(EXIT)),
-        (1u16..4, 1u16..4).prop_map(|(c, r)| Input::Resize(size(c, r))),
+        (1u16..4, 1u16..4).prop_map(|(c, r)| Input::ViewerResize(ViewerId(1), size(c, r))),
         Just(Input::Settle),
         (0usize..3).prop_map(Input::Viewers),
-        Just(Input::Write(b"w".to_vec())),
-        Just(Input::Interrupt),
+        Just(Input::Submit(Writer::Program(1), b"w".to_vec())),
+        Just(Input::Interrupt(Writer::Program(1))),
         Just(Input::Close),
         Just(Input::Tick),
     ]
@@ -283,6 +399,35 @@ fn config() -> impl Strategy<Value = HolderConfig> {
 }
 
 proptest! {
+    #[test]
+    fn refused_input_has_no_pty_effect(bytes in proptest::collection::vec(any::<u8>(), 1..30)) {
+        let mut h = running(HolderConfig::new(Persistence::Persistent));
+        attach_writer(&mut h);
+        let fx = h.step(Input::Submit(Writer::Program(7), bytes), ms(1));
+        prop_assert_eq!(fx, vec![Effect::Refused(super::Refusal::NotWriter)]);
+    }
+
+    #[test]
+    fn only_the_writers_last_size_is_applied(
+        reader in (1u16..200, 1u16..80),
+        writer_sizes in proptest::collection::vec((1u16..200, 1u16..80), 1..12),
+    ) {
+        let mut h = running(HolderConfig::new(Persistence::Persistent));
+        attach_writer(&mut h);
+        h.step(Input::Attach {
+            viewer: ViewerId(2), mode: ViewerMode::ReadOnly,
+            size: size(reader.0, reader.1), budget: NonZeroUsize::new(8).unwrap(),
+        }, ms(0));
+        h.step(Input::ViewerResize(ViewerId(2), size(reader.0, reader.1)), ms(1));
+        prop_assert!(h.step(Input::Settle, ms(1)).is_empty());
+        for &(cols, rows) in &writer_sizes {
+            h.step(Input::ViewerResize(ViewerId(1), size(cols, rows)), ms(2));
+        }
+        h.step(Input::Settle, ms(2));
+        let &(cols, rows) = writer_sizes.last().unwrap();
+        prop_assert_eq!(h.size(), size(cols, rows));
+    }
+
     #[test]
     fn deadlines_never_stay_due_and_reaping_happens_once_and_last(
         config in config(),

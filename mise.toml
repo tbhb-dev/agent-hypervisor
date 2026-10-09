@@ -48,6 +48,13 @@ run = ["cargo fmt --all", "tombi format"]
 description = "Build every workspace crate"
 run = "cargo build --workspace --locked"
 
+[tasks."guest:build"]
+description = "Cross-build the Linux arm64 guest agent for Apple container"
+run = [
+  "rustup target add aarch64-unknown-linux-musl",
+  'RUSTFLAGS="-C linker-flavor=ld.lld -C linker=$(rustc --print sysroot)/lib/rustlib/aarch64-apple-darwin/bin/rust-lld" cargo build --locked --target aarch64-unknown-linux-musl --no-default-features --features guest -p hypervisord --bin host-shim',
+]
+
 # Rust
 [tasks."check:fmt"]
 description = "Check Rust formatting"

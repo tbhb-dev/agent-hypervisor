@@ -245,6 +245,7 @@ dependencies = [
 name = "hypervisord"
 version = "0.1.0"
 dependencies = [
+ "hypervisor-alacritty",
  "hypervisor-core",
  "hypervisor-ghostty",
  "hypervisor-pty",

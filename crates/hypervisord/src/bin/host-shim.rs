@@ -8,6 +8,8 @@ fn main() {
     let (metadata, root) = (std::path::Path::new(&metadata), std::path::Path::new(&root));
     let result = if mode == "shim" {
         hypervisord::driver::serve(metadata, root)
+    } else if mode == "guest" {
+        hypervisord::driver::serve_guest(metadata, root)
     } else if mode == "profile" {
         hypervisord::driver::seatbelt_profile(metadata, root).map(|text| print!("{text}"))
     } else {

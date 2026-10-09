@@ -218,7 +218,7 @@ pub fn admit_session(
 }
 
 /// A request on the private shim control socket.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum HostRequest {
     Ping,
     Spawn {
@@ -303,7 +303,7 @@ pub fn validate_workload(spec: &WorkloadSpec) -> Result<(), &'static str> {
     match spec.runtime {
         Runtime::Host => validate_host(spec),
         Runtime::Seatbelt => crate::seatbelt::validate(spec),
-        Runtime::AppleContainer => Err("no driver for the apple_container runtime"),
+        Runtime::AppleContainer => crate::container::validate(spec),
     }
 }
 

@@ -12,6 +12,7 @@
 pub mod attenuation;
 pub mod channel;
 pub mod channel_policy;
+pub mod control;
 pub mod emulator;
 pub mod grid_channel;
 pub mod launchd;

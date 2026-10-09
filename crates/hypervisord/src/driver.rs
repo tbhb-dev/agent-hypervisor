@@ -604,7 +604,7 @@ fn guest_exchange(mut stream: UnixStream, root: &Path, control: &Path) -> io::Re
             io::copy(&mut shim, &mut stream)?;
         }
         GuestRequest::Attach(path) => {
-            if !path.starts_with(root.join("r")) || path.extension().is_none_or(|ext| ext != "c") {
+            if !container::attach_path_allowed(&path, root) {
                 return Err(invalid("terminal socket is outside guest root"));
             }
             let mut terminal = UnixStream::connect(path)?;
@@ -808,17 +808,11 @@ fn prepare_guest_env(
     uid: u32,
     reviewer: bool,
 ) -> io::Result<()> {
-    let home = workload.cache_dir.join("users").join(uid.to_string());
+    let home = container::guest_home(&workload.cache_dir, uid);
     fs::create_dir_all(&home)?;
     fs::set_permissions(&home, Permissions::from_mode(0o700))?;
     chown_guest_home(&home, uid)?;
-    spec.env
-        .retain(|(name, _)| name != "HOME" && name != "GIT_OPTIONAL_LOCKS");
-    spec.env
-        .push(("HOME".into(), home.to_string_lossy().into_owned()));
-    if reviewer {
-        spec.env.push(("GIT_OPTIONAL_LOCKS".into(), "0".into()));
-    }
+    spec.env = container::guest_session_env(&spec.env, &home, reviewer);
     Ok(())
 }
 

@@ -225,9 +225,15 @@ struct PathBeneathAttr {
     parent_fd: i32,
 }
 
-// Linux landlock.h: every filesystem write or mutation right through ABI 5.
+// Linux landlock.h: all rights through ABI 5 except execute and read rights.
 #[cfg(target_os = "linux")]
-const WRITE_RIGHTS: u64 = 0xfffe;
+const WRITE_RIGHTS: u64 = 0xffff & !(LANDLOCK_EXECUTE | LANDLOCK_READ_FILE | LANDLOCK_READ_DIR);
+#[cfg(target_os = "linux")]
+const LANDLOCK_EXECUTE: u64 = 1;
+#[cfg(target_os = "linux")]
+const LANDLOCK_READ_FILE: u64 = 4;
+#[cfg(target_os = "linux")]
+const LANDLOCK_READ_DIR: u64 = 8;
 
 #[cfg(target_os = "linux")]
 #[expect(unsafe_code, reason = "Landlock syscalls have no libc wrapper")]
@@ -248,7 +254,8 @@ fn reviewer_ruleset() -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: a successful create_ruleset returns an owned file descriptor.
-    let ruleset = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    let fd = i32::try_from(fd).map_err(|_| io::Error::other("invalid Landlock file descriptor"))?;
+    let ruleset = unsafe { OwnedFd::from_raw_fd(fd) };
     for path in hypervisor_core::container::REVIEWER_WRITE_PATHS {
         let parent = rustix::fs::open(*path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())?;
         let rule = PathBeneathAttr {
@@ -440,5 +447,18 @@ mod signal_tests {
             .unwrap();
         let _group = process_group::ProcessGroup::new(child.id().cast_signed());
         assert!(child.wait().unwrap().success());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod landlock_tests {
+    use super::{LANDLOCK_EXECUTE, LANDLOCK_READ_DIR, LANDLOCK_READ_FILE, WRITE_RIGHTS};
+
+    #[test]
+    fn reviewer_mask_handles_writes_without_restricting_reads() {
+        assert_eq!(WRITE_RIGHTS, 0xfff2);
+        assert_eq!(WRITE_RIGHTS & LANDLOCK_EXECUTE, 0);
+        assert_eq!(WRITE_RIGHTS & LANDLOCK_READ_FILE, 0);
+        assert_eq!(WRITE_RIGHTS & LANDLOCK_READ_DIR, 0);
     }
 }

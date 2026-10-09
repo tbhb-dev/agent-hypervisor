@@ -76,10 +76,9 @@ pub fn validate(spec: &WorkloadSpec) -> Result<(), &'static str> {
         {
             return Err("container mount path cannot use CLI separators");
         }
-        if ["/workspace", "/cache", GUEST_ROOT]
-            .iter()
-            .any(|root| mount.target.starts_with(root))
-        {
+        if ["/workspace", "/cache", GUEST_ROOT].iter().any(|root| {
+            mount.target.starts_with(root) || Path::new(root).starts_with(&mount.target)
+        }) {
             return Err("container mount overlaps a driver-owned target");
         }
     }
@@ -236,6 +235,80 @@ pub fn admit_user(user: GuestUser, existing: &[u32]) -> Result<(), &'static str>
     }
 }
 
+/// Accept only terminal sockets beneath this guest's private runtime directory.
+#[must_use]
+pub fn attach_path_allowed(path: &Path, root: &Path) -> bool {
+    path.starts_with(root.join("r"))
+        && !path.components().any(|part| part == Component::ParentDir)
+        && path.extension().is_some_and(|ext| ext == "c")
+}
+
+/// Give each guest UID a private home in the container cache.
+#[must_use]
+pub fn guest_home(cache_dir: &Path, uid: u32) -> PathBuf {
+    cache_dir.join("users").join(uid.to_string())
+}
+
+/// Replace caller-controlled home and Git lock settings with the guest policy.
+#[must_use]
+pub fn guest_session_env(
+    env: &[(String, String)],
+    home: &Path,
+    reviewer: bool,
+) -> Vec<(String, String)> {
+    let mut result: Vec<_> = env
+        .iter()
+        .filter(|(name, _)| name != "HOME" && name != "GIT_OPTIONAL_LOCKS")
+        .cloned()
+        .collect();
+    result.push(("HOME".into(), home.to_string_lossy().into_owned()));
+    if reviewer {
+        result.push(("GIT_OPTIONAL_LOCKS".into(), "0".into()));
+    }
+    result
+}
+
+/// A writable host gitdir must never be shared with the guest.
+///
+/// # Errors
+/// A `.git` entry exists at the workspace root.
+pub fn admit_workspace_git_entry(present: bool) -> Result<(), &'static str> {
+    if present {
+        Err("container workspace cannot contain a host .git entry")
+    } else {
+        Ok(())
+    }
+}
+
+/// Check a host mount's file type and permissions after the shell stats it.
+///
+/// # Errors
+/// A socket is mounted outside the broker path or the broker socket is writable.
+pub fn validate_socket_mount(
+    target: &Path,
+    is_socket: bool,
+    permissions: u32,
+    mode: MountMode,
+) -> Result<(), &'static str> {
+    let broker = target == Path::new("/run/broker.sock");
+    if broker != is_socket {
+        return Err("only the broker target accepts a Unix socket mount");
+    }
+    if broker && (permissions & 0o777 != 0o600 || mode != MountMode::ReadOnly) {
+        return Err("broker socket must be mode 0600 and read-only in the workload spec");
+    }
+    Ok(())
+}
+
+/// Derive the guest's terminal socket from the precomputed session hashes.
+#[must_use]
+pub fn guest_session_path(workload_hash: &str, session_hash: &str) -> PathBuf {
+    Path::new(GUEST_ROOT)
+        .join("r")
+        .join(workload_hash)
+        .join(format!("{session_hash}.c"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +423,169 @@ mod tests {
     }
 
     #[test]
+    fn validate_refusal_cases() {
+        type Case = (&'static str, fn(&mut WorkloadSpec));
+        let cases: &[Case] = &[
+            ("runtime", |s| s.runtime = Runtime::Host),
+            ("isolation", |s| s.isolation = Isolation::None),
+            ("name", |s| s.id.local = "x".repeat(60)),
+            ("image missing", |s| s.image = None),
+            ("image empty", |s| s.image = Some(String::new())),
+            ("image option", |s| s.image = Some("-image".into())),
+            ("image nul", |s| s.image = Some("a\0b".into())),
+            ("image newline", |s| s.image = Some("a\nb".into())),
+            ("credentials", |s| s.credential_refs.push("secret".into())),
+            ("memory", |s| s.resources.memory_bytes = Some(0)),
+            ("cpu", |s| s.resources.cpu_count = Some(0)),
+            ("relative source", |s| {
+                s.mounts.push(mount("relative", "/deps"));
+            }),
+            ("relative target", |s| {
+                s.mounts.push(mount("/tmp/data", "deps"));
+            }),
+            ("parent target", |s| {
+                s.mounts.push(mount("/tmp/data", "/deps/../other"));
+            }),
+            ("source separator", |s| {
+                s.mounts.push(mount("/tmp/a,b", "/deps"));
+            }),
+            ("target nul", |s| s.mounts.push(mount("/tmp/data", "/a\0b"))),
+            ("target newline", |s| {
+                s.mounts.push(mount("/tmp/data", "/a\nb"));
+            }),
+            ("owned target", |s| {
+                s.mounts.push(mount("/tmp/data", "/cache/x"));
+            }),
+            ("owned ancestor", |s| {
+                s.mounts.push(mount("/tmp/data", "/run"));
+            }),
+            ("root target", |s| s.mounts.push(mount("/tmp/data", "/"))),
+            ("workspace separator", |s| {
+                s.workspace_dir = "/tmp/a,b".into();
+            }),
+            ("cache separator", |s| s.cache_dir = "/tmp/a\nb".into()),
+        ];
+        for (label, change) in cases {
+            let mut request = spec();
+            change(&mut request);
+            assert!(validate(&request).is_err(), "{label}");
+        }
+    }
+
+    fn mount(source: &str, target: &str) -> Mount {
+        Mount {
+            source: source.into(),
+            target: target.into(),
+            mode: MountMode::ReadOnly,
+        }
+    }
+
+    #[test]
+    fn invalid_guest_users() {
+        let mut session = WireSpawnSpec {
+            command: "sh".into(),
+            args: vec![],
+            env: vec![],
+            cwd: None,
+            user: None,
+            kind: SessionKind::Shell,
+        };
+        assert!(session_user(&session).is_err());
+        for user in [
+            "abc",
+            "reviewer:abc",
+            "9999",
+            "60001",
+            "reviewer:9999",
+            "reviewer:60001",
+        ] {
+            session.user = Some(user.into());
+            assert!(session_user(&session).is_err(), "{user}");
+        }
+    }
+
+    #[test]
+    fn attach_path_stays_under_private_runtime() {
+        let root = Path::new(GUEST_ROOT);
+        assert!(attach_path_allowed(
+            Path::new("/run/hypervisor/r/abc.c"),
+            root
+        ));
+        for path in [
+            "/tmp/abc.c",
+            "/run/hypervisor/r/../../tmp/abc.c",
+            "/run/hypervisor/r/abc.txt",
+            "/run/hypervisor/other/abc.c",
+        ] {
+            assert!(!attach_path_allowed(Path::new(path), root), "{path}");
+        }
+    }
+
+    #[test]
+    fn guest_environment_uses_private_home_and_reviewer_lock_policy() {
+        let home = guest_home(Path::new("/cache"), 10002);
+        assert_eq!(home, Path::new("/cache/users/10002"));
+        let env = vec![
+            ("HOME".into(), "/forged".into()),
+            ("GIT_OPTIONAL_LOCKS".into(), "1".into()),
+            ("PATH".into(), "/bin".into()),
+        ];
+        assert_eq!(
+            guest_session_env(&env, &home, true),
+            vec![
+                ("PATH".into(), "/bin".into()),
+                ("HOME".into(), "/cache/users/10002".into()),
+                ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
+            ]
+        );
+        assert_eq!(
+            guest_session_env(&env, &home, false),
+            vec![
+                ("PATH".into(), "/bin".into()),
+                ("HOME".into(), "/cache/users/10002".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_host_git_entry_is_refused() {
+        assert!(admit_workspace_git_entry(false).is_ok());
+        assert!(admit_workspace_git_entry(true).is_err());
+    }
+
+    #[test]
+    fn broker_socket_mount_requires_private_read_only_source() {
+        assert!(
+            validate_socket_mount(Path::new("/deps"), false, 0o644, MountMode::ReadWrite).is_ok()
+        );
+        for (target, socket, permissions, mode) in [
+            ("/deps", true, 0o600, MountMode::ReadOnly),
+            ("/run/broker.sock", false, 0o600, MountMode::ReadOnly),
+            ("/run/broker.sock", true, 0o666, MountMode::ReadOnly),
+            ("/run/broker.sock", true, 0o600, MountMode::ReadWrite),
+        ] {
+            assert!(validate_socket_mount(Path::new(target), socket, permissions, mode).is_err());
+        }
+        assert!(
+            validate_socket_mount(
+                Path::new("/run/broker.sock"),
+                true,
+                0o600,
+                MountMode::ReadOnly
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn guest_session_socket_is_beneath_runtime_root() {
+        assert_eq!(
+            guest_session_path("work", "session"),
+            Path::new("/run/hypervisor/r/work/session.c")
+        );
+    }
+
+    #[test]
     fn workload_environment_stays_out_of_process_arguments() {
         let mut request = spec();
         request.env.push(("PRIVATE".into(), "sentinel".into()));
@@ -382,6 +618,12 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn mount_cli_separator_is_rejected(part in "[a-z]{1,10},[a-z]{1,10}") {
+            let mut request = spec();
+            request.mounts.push(mount(&format!("/tmp/{part}"), "/deps"));
+            prop_assert!(validate(&request).is_err());
+        }
         #[test]
         fn every_admitted_run_has_no_network(local in "[a-z][a-z0-9]{0,20}") {
             let mut request = spec();

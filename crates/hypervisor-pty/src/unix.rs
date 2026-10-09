@@ -5,6 +5,10 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
@@ -25,6 +29,14 @@ use crate::{Caps, Pty, PtyError, Resize, Spawn, Support, Wait};
 /// Spawns children on new Unix PTYs as the current user.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UnixSpawner;
+
+/// Linux guest PTY spawner. Reviewer children get a fail-closed read-only Landlock policy.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+pub struct GuestSpawner {
+    pub uid: u32,
+    pub reviewer: bool,
+}
 
 /// A Unix PTY's master side and its child's process ID, which is also its process group and
 /// session ID.
@@ -109,58 +121,193 @@ impl Spawn for UnixSpawner {
     type Pty = UnixPty;
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<UnixPty, PtyError> {
-        spec.validate().map_err(PtyError::Spec)?;
-        let _spawning = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
-        let master = open_master()?;
-        pty::grantpt(&master).map_err(io::Error::from)?;
-        pty::unlockpt(&master).map_err(io::Error::from)?;
-        let name = pty::ptsname(&master, Vec::new()).map_err(io::Error::from)?;
-        let slave = rustix::fs::open(
-            name.as_c_str(),
-            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?;
-        // The size is in place before the program starts, so its first read of it is right.
-        termios::tcsetwinsize(&slave, winsize(spec.size)).map_err(io::Error::from)?;
-
-        let mut cmd = Command::new(&spec.command);
-        cmd.args(&spec.args)
-            .env_clear()
-            .envs(spec.env.iter().map(|(k, v)| (k, v)))
-            .stdin(Stdio::from(slave.try_clone()?))
-            .stdout(Stdio::from(slave.try_clone()?))
-            .stderr(Stdio::from(slave));
-        if let Some(cwd) = &spec.cwd {
-            cmd.current_dir(cwd);
-        }
-        // SAFETY: the hook runs in the forked child before exec and makes only `setsid`,
-        // `ioctl`, and `sigaction` calls, which are async-signal-safe, on fd 0, which `stdin`
-        // set above.
-        #[expect(
-            unsafe_code,
-            reason = "pre_exec sets the controlling terminal and restores signal defaults"
-        )]
-        unsafe {
-            cmd.pre_exec(|| {
-                rp::setsid()?;
-                rp::ioctl_tiocsctty(BorrowedFd::borrow_raw(0))?;
-                // Ignored dispositions survive exec. A session must receive terminal and
-                // lifecycle signals even if its supervisor ignored them.
-                restore_signal_dispositions()
-            });
-        }
-        let child = cmd.spawn()?;
-        let pid = Pid::from_child(&child);
-        // `cmd` holds the parent's copies of the slave; dropping it leaves the child the only
-        // holder, so the master reads end of output when the child's tree is gone.
-        drop(cmd);
-        Ok(UnixPty {
-            master: File::from(master),
-            pid,
-            waiter: Some(UnixWaiter(child)),
-        })
+        spawn_impl(spec, None, false)
     }
+}
+
+#[cfg(target_os = "linux")]
+impl Spawn for GuestSpawner {
+    type Pty = UnixPty;
+
+    fn spawn(&self, spec: &SpawnSpec) -> Result<UnixPty, PtyError> {
+        spawn_impl(spec, Some(self.uid), self.reviewer)
+    }
+}
+
+fn spawn_impl(spec: &SpawnSpec, uid: Option<u32>, reviewer: bool) -> Result<UnixPty, PtyError> {
+    let mut check = spec.clone();
+    if uid.is_some() {
+        check.user = None;
+    }
+    check.validate().map_err(PtyError::Spec)?;
+    #[cfg(target_os = "linux")]
+    let ruleset = if reviewer {
+        Some(reviewer_ruleset()?)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = reviewer;
+    let _spawning = SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
+    let master = open_master()?;
+    pty::grantpt(&master).map_err(io::Error::from)?;
+    pty::unlockpt(&master).map_err(io::Error::from)?;
+    let name = pty::ptsname(&master, Vec::new()).map_err(io::Error::from)?;
+    let slave = rustix::fs::open(
+        name.as_c_str(),
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    // The size is in place before the program starts, so its first read of it is right.
+    termios::tcsetwinsize(&slave, winsize(spec.size)).map_err(io::Error::from)?;
+
+    let mut cmd = Command::new(&spec.command);
+    cmd.args(&spec.args)
+        .env_clear()
+        .envs(spec.env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::from(slave.try_clone()?))
+        .stdout(Stdio::from(slave.try_clone()?))
+        .stderr(Stdio::from(slave));
+    if let Some(cwd) = &spec.cwd {
+        cmd.current_dir(cwd);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = uid;
+    // SAFETY: the hook runs in the forked child before exec and makes only `setsid`,
+    // `ioctl`, and `sigaction` calls, which are async-signal-safe, on fd 0, which `stdin`
+    // set above.
+    #[expect(
+        unsafe_code,
+        reason = "pre_exec sets the controlling terminal and restores signal defaults"
+    )]
+    unsafe {
+        cmd.pre_exec(move || {
+            rp::setsid()?;
+            rp::ioctl_tiocsctty(BorrowedFd::borrow_raw(0))?;
+            // Ignored dispositions survive exec. A session must receive terminal and
+            // lifecycle signals even if its supervisor ignored them.
+            restore_signal_dispositions()?;
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(ruleset) = &ruleset {
+                    apply_reviewer_ruleset(ruleset.as_raw_fd())?;
+                }
+                if let Some(uid) = uid {
+                    drop_guest_identity(uid)?;
+                }
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn()?;
+    let pid = Pid::from_child(&child);
+    // `cmd` holds the parent's copies of the slave; dropping it leaves the child the only
+    // holder, so the master reads end of output when the child's tree is gone.
+    drop(cmd);
+    Ok(UnixPty {
+        master: File::from(master),
+        pid,
+        waiter: Some(UnixWaiter(child)),
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct RulesetAttr {
+    handled_access_fs: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct PathBeneathAttr {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+// Linux landlock.h: all rights through ABI 5 except execute and read rights.
+#[cfg(target_os = "linux")]
+const WRITE_RIGHTS: u64 = 0xffff & !(LANDLOCK_EXECUTE | LANDLOCK_READ_FILE | LANDLOCK_READ_DIR);
+#[cfg(target_os = "linux")]
+const LANDLOCK_EXECUTE: u64 = 1;
+#[cfg(target_os = "linux")]
+const LANDLOCK_READ_FILE: u64 = 4;
+#[cfg(target_os = "linux")]
+const LANDLOCK_READ_DIR: u64 = 8;
+
+#[cfg(target_os = "linux")]
+#[expect(unsafe_code, reason = "Landlock syscalls have no libc wrapper")]
+fn reviewer_ruleset() -> io::Result<OwnedFd> {
+    let attr = RulesetAttr {
+        handled_access_fs: WRITE_RIGHTS,
+    };
+    // SAFETY: the kernel reads a fixed repr(C) struct for the duration of the call.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &raw const attr,
+            std::mem::size_of::<RulesetAttr>(),
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful create_ruleset returns an owned file descriptor.
+    let fd = i32::try_from(fd).map_err(|_| io::Error::other("invalid Landlock file descriptor"))?;
+    let ruleset = unsafe { OwnedFd::from_raw_fd(fd) };
+    for path in hypervisor_core::container::REVIEWER_WRITE_PATHS {
+        let parent = rustix::fs::open(*path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())?;
+        let rule = PathBeneathAttr {
+            allowed_access: WRITE_RIGHTS,
+            parent_fd: parent.as_raw_fd(),
+        };
+        // SAFETY: both FDs and the repr(C) rule remain valid during the syscall.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_landlock_add_rule,
+                ruleset.as_raw_fd(),
+                1,
+                &raw const rule,
+                0,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(ruleset)
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "Landlock restriction is installed in the child before exec"
+)]
+fn apply_reviewer_ruleset(fd: i32) -> io::Result<()> {
+    // SAFETY: prctl and the Landlock syscall only use scalar arguments here.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0
+        || unsafe { libc::syscall(libc::SYS_landlock_restrict_self, fd, 0) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "the guest child drops root groups and IDs before exec"
+)]
+fn drop_guest_identity(uid: u32) -> io::Result<()> {
+    // SAFETY: each call uses scalar IDs or a null pointer with zero groups.
+    if unsafe { libc::setgroups(0, std::ptr::null()) } < 0
+        || unsafe { libc::setgid(uid) } < 0
+        || unsafe { libc::setuid(uid) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 impl Wait for UnixWaiter {
@@ -300,5 +447,18 @@ mod signal_tests {
             .unwrap();
         let _group = process_group::ProcessGroup::new(child.id().cast_signed());
         assert!(child.wait().unwrap().success());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod landlock_tests {
+    use super::{LANDLOCK_EXECUTE, LANDLOCK_READ_DIR, LANDLOCK_READ_FILE, WRITE_RIGHTS};
+
+    #[test]
+    fn reviewer_mask_handles_writes_without_restricting_reads() {
+        assert_eq!(WRITE_RIGHTS, 0xfff2);
+        assert_eq!(WRITE_RIGHTS & LANDLOCK_EXECUTE, 0);
+        assert_eq!(WRITE_RIGHTS & LANDLOCK_READ_FILE, 0);
+        assert_eq!(WRITE_RIGHTS & LANDLOCK_READ_DIR, 0);
     }
 }

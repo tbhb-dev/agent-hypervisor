@@ -9,6 +9,8 @@
 
 mod unix;
 
+#[cfg(target_os = "linux")]
+pub use unix::GuestSpawner;
 pub use unix::{UnixPty, UnixReader, UnixSpawner, UnixWaiter};
 
 use std::fmt;

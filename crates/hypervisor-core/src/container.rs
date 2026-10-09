@@ -236,6 +236,39 @@ pub fn admit_user(user: GuestUser, existing: &[u32]) -> Result<(), &'static str>
     }
 }
 
+/// Accept only terminal sockets beneath this guest's private runtime directory.
+#[must_use]
+pub fn attach_path_allowed(path: &Path, root: &Path) -> bool {
+    path.starts_with(root.join("r"))
+        && !path.components().any(|part| part == Component::ParentDir)
+        && path.extension().is_some_and(|ext| ext == "c")
+}
+
+/// Give each guest UID a private home in the container cache.
+#[must_use]
+pub fn guest_home(cache_dir: &Path, uid: u32) -> PathBuf {
+    cache_dir.join("users").join(uid.to_string())
+}
+
+/// Replace caller-controlled home and Git lock settings with the guest policy.
+#[must_use]
+pub fn guest_session_env(
+    env: &[(String, String)],
+    home: &Path,
+    reviewer: bool,
+) -> Vec<(String, String)> {
+    let mut result: Vec<_> = env
+        .iter()
+        .filter(|(name, _)| name != "HOME" && name != "GIT_OPTIONAL_LOCKS")
+        .cloned()
+        .collect();
+    result.push(("HOME".into(), home.to_string_lossy().into_owned()));
+    if reviewer {
+        result.push(("GIT_OPTIONAL_LOCKS".into(), "0".into()));
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +433,49 @@ mod tests {
             session.user = Some(user.into());
             assert!(session_user(&session).is_err(), "{user}");
         }
+    }
+
+    #[test]
+    fn attach_path_stays_under_private_runtime() {
+        let root = Path::new(GUEST_ROOT);
+        assert!(attach_path_allowed(
+            Path::new("/run/hypervisor/r/abc.c"),
+            root
+        ));
+        for path in [
+            "/tmp/abc.c",
+            "/run/hypervisor/r/../../tmp/abc.c",
+            "/run/hypervisor/r/abc.txt",
+            "/run/hypervisor/other/abc.c",
+        ] {
+            assert!(!attach_path_allowed(Path::new(path), root), "{path}");
+        }
+    }
+
+    #[test]
+    fn guest_environment_uses_private_home_and_reviewer_lock_policy() {
+        let home = guest_home(Path::new("/cache"), 10002);
+        assert_eq!(home, Path::new("/cache/users/10002"));
+        let env = vec![
+            ("HOME".into(), "/forged".into()),
+            ("GIT_OPTIONAL_LOCKS".into(), "1".into()),
+            ("PATH".into(), "/bin".into()),
+        ];
+        assert_eq!(
+            guest_session_env(&env, &home, true),
+            vec![
+                ("PATH".into(), "/bin".into()),
+                ("HOME".into(), "/cache/users/10002".into()),
+                ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
+            ]
+        );
+        assert_eq!(
+            guest_session_env(&env, &home, false),
+            vec![
+                ("PATH".into(), "/bin".into()),
+                ("HOME".into(), "/cache/users/10002".into()),
+            ]
+        );
     }
 
     #[test]

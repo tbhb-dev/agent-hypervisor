@@ -5,7 +5,7 @@ use std::fs::{self, Permissions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -165,6 +165,24 @@ fn open_terminal(path: &PathBuf, id: &str) {
     ));
 }
 
+fn assert_private_sockets(root: &Path) {
+    let mut socket_count = 0;
+    for entry in fs::read_dir(root.join("rt")).unwrap() {
+        let path = entry.unwrap().path();
+        if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("sock" | "c")
+        ) {
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            socket_count += 1;
+        }
+    }
+    assert_eq!(socket_count, 3);
+}
+
 #[test]
 #[ignore = "requires Apple container and an unsandboxed macOS host; check:host builds the guest first"]
 fn container_guest_sessions_reviewer_and_cleanup() {
@@ -205,7 +223,7 @@ fn container_guest_sessions_reviewer_and_cleanup() {
         &mut driver,
         "writer",
         "10001",
-        "id -u >/workspace/uid; echo ok >/workspace/writer; exec sleep 120",
+        "id -u >/workspace/uid; echo ok >/workspace/writer; mkdir /workspace/owned; echo ok >/workspace/owned/readme; exec sleep 120",
     );
     wait_for(|| fixture.root.join("ws/writer").exists());
     assert_eq!(
@@ -216,18 +234,26 @@ fn container_guest_sessions_reviewer_and_cleanup() {
     );
     open_terminal(&writer, "r20:writer");
     let reviewer = fixture.session(&mut driver, "reviewer", "reviewer:10002",
-        "cat /workspace/writer >/cache/users/10002/read; if echo bad >/workspace/forbidden; then echo bad >/cache/users/10002/result; else echo denied >/cache/users/10002/result; fi; echo \"$GIT_OPTIONAL_LOCKS\" >/cache/users/10002/gitlock; exec sleep 120");
+        "cat /workspace/writer >/cache/users/10002/read; cat /workspace/owned/readme >/cache/users/10002/subdir_read; if echo bad >/workspace/forbidden; then echo bad >/cache/users/10002/result; else echo denied >/cache/users/10002/result; fi; if echo bad >/workspace/owned/forbidden; then echo bad >/cache/users/10002/subdir_result; else echo denied >/cache/users/10002/subdir_result; fi; echo \"$GIT_OPTIONAL_LOCKS\" >/cache/users/10002/gitlock; exec sleep 120");
     wait_for(|| {
         exec(&name, "/bin/cat", &["/cache/users/10002/result"])
             .status
             .success()
     });
     assert!(!fixture.root.join("ws/forbidden").exists());
-    for (file, expected) in [("result", "denied"), ("read", "ok"), ("gitlock", "0")] {
+    assert!(!fixture.root.join("ws/owned/forbidden").exists());
+    for (file, expected) in [
+        ("result", "denied"),
+        ("subdir_result", "denied"),
+        ("read", "ok"),
+        ("subdir_read", "ok"),
+        ("gitlock", "0"),
+    ] {
         let output = exec(&name, "/bin/cat", &[&format!("/cache/users/10002/{file}")]);
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
     }
+    assert_private_sockets(&fixture.root);
     open_terminal(&reviewer, "r20:reviewer");
     drop(driver);
     let agent = std::env::current_dir()

@@ -102,6 +102,12 @@ The pure `hypervisor_core::container` plan validates an Apple container workload
 
 The no-network choice follows [RFC-37 run 8](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/55dcdf93f72e50a1916a67b8a2a8ef9d4f741141/wiki/proposals/2026-10-07T2010Z-RFC-37-egress-credential-identity-spikes/findings/r8-container-egress.md) and [run 31](https://github.com/tbhb-dev/agent-orchestration-poc.internal/blob/55dcdf93f72e50a1916a67b8a2a8ef9d4f741141/wiki/proposals/2026-10-07T2010Z-RFC-37-egress-credential-identity-spikes/findings/r31-tailnet-lan-peers.md). An `--internal` network still exposed host services and DNS. `--network none` left only loopback in run 8. This design gives each workspace its own VM network namespace. It does not create a named bridge network.
 
+## Run 20 CLI lifecycle
+
+`ContainerDriver::create` canonicalizes host paths and writes a private host spec with a guest-path copy. It creates a named cache volume. The guest sees `/workspace` from the host bind mount and `/cache` from that volume. The canonical host `cache_dir` remains registry metadata but does not back `/cache` in this driver. `start` runs exactly one detached container for the workspace name, then asks the published agent socket for its stable identity. A failed start attempts to remove any container it created. `stop` requests `container stop --time 0` and forces deletion if stop fails. It removes the terminal proxies. `destroy` deletes the volume and metadata after the container stops. The driver uses the `none` network without creating a named network.
+
+`spawn_session` sends the session request to the guest agent and exposes the returned terminal as a private host Unix socket. Each connection forwards the existing terminal channel bytes to the guest. A new daemon instance accepts a running container only after the agent replies with the saved workload ID. It then lists sessions and recreates their local terminal sockets. Dropping the driver leaves the VM running, as dropping `HostDriver` leaves its shim running. The guest executable must be a Linux arm64 binary. `mise run guest:build` produces one at `target/aarch64-unknown-linux-musl/debug/host-shim`.
+
 ## Inputs
 
 Findings below are in the private vault repository `tbhb-dev/agent-orchestration-poc.internal` at commit `69dc14c`.

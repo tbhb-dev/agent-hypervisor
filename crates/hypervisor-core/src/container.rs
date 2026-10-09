@@ -69,7 +69,10 @@ pub fn validate(spec: &WorkloadSpec) -> Result<(), &'static str> {
         }
         if [mount.source.as_path(), mount.target.as_path()]
             .iter()
-            .any(|path| path.to_str().is_none_or(|s| s.contains([',', '\0', '\n'])))
+            .any(|path| {
+                path.to_str()
+                    .is_none_or(|s| s.contains([',', ':', '\0', '\n']))
+            })
         {
             return Err("container mount path cannot use CLI separators");
         }
@@ -82,7 +85,10 @@ pub fn validate(spec: &WorkloadSpec) -> Result<(), &'static str> {
     }
     if [spec.workspace_dir.as_path(), spec.cache_dir.as_path()]
         .iter()
-        .any(|path| path.to_str().is_none_or(|s| s.contains([',', '\0', '\n'])))
+        .any(|path| {
+            path.to_str()
+                .is_none_or(|s| s.contains([',', ':', '\0', '\n']))
+        })
     {
         return Err("container path cannot use CLI separators");
     }
@@ -122,35 +128,40 @@ pub fn run(
         "none".into(),
         "--entrypoint".into(),
         GUEST_AGENT.into(),
+        "--tmpfs".into(),
+        format!("{GUEST_ROOT}:mode=700"),
         "--publish-socket".into(),
         format!("{}:{GUEST_SOCKET}", host_socket.display()),
         "--mount".into(),
-        bind(&spec.workspace_dir, Path::new("/workspace"), false),
+        format!(
+            "type=bind,source={},target=/workspace",
+            spec.workspace_dir.display()
+        ),
         "--mount".into(),
         format!(
             "type=volume,source={},target=/cache",
             cache_volume(&spec.id)
         ),
-        "--mount".into(),
-        bind(agent, Path::new(GUEST_AGENT), true),
-        "--mount".into(),
-        bind(metadata, Path::new(GUEST_METADATA), true),
+        "--volume".into(),
+        format!("{}:{GUEST_AGENT}:ro", agent.display()),
+        "--volume".into(),
+        format!("{}:{GUEST_METADATA}:ro", metadata.display()),
     ];
     for mount in &spec.mounts {
-        // Apple container 1.4.1 requires --volume for a Unix socket file.
-        let value = format!("{}:{}", mount.source.display(), mount.target.display());
-        if mount.target == Path::new("/run/broker.sock") {
-            args.extend(["--volume".into(), value]);
+        // --volume accepts host directories and files, including Unix sockets.
+        let suffix = if mount.mode == MountMode::ReadOnly {
+            ":ro"
         } else {
-            args.extend([
-                "--mount".into(),
-                bind(
-                    &mount.source,
-                    &mount.target,
-                    mount.mode == MountMode::ReadOnly,
-                ),
-            ]);
-        }
+            ""
+        };
+        args.extend([
+            "--volume".into(),
+            format!(
+                "{}:{}{suffix}",
+                mount.source.display(),
+                mount.target.display()
+            ),
+        ]);
     }
     if let Some(memory) = spec.resources.memory_bytes {
         args.extend(["--memory".into(), memory.to_string()]);
@@ -165,18 +176,6 @@ pub fn run(
         GUEST_ROOT.into(),
     ]);
     Ok(Invocation(args))
-}
-
-fn bind(source: &Path, target: &Path, readonly: bool) -> String {
-    let mut mount = format!(
-        "type=bind,source={},target={}",
-        source.display(),
-        target.display()
-    );
-    if readonly {
-        mount.push_str(",readonly");
-    }
-    mount
 }
 
 #[must_use]
@@ -289,16 +288,18 @@ mod tests {
                 "none",
                 "--entrypoint",
                 GUEST_AGENT,
+                "--tmpfs",
+                "/run/hypervisor:mode=700",
                 "--publish-socket",
                 "/tmp/host.sock:/run/hypervisor/agent.sock",
                 "--mount",
                 "type=bind,source=/tmp/ws,target=/workspace",
                 "--mount",
                 "type=volume,source=hv-test-ws-cache,target=/cache",
-                "--mount",
-                "type=bind,source=/tmp/agent,target=/run/hypervisor/agent,readonly",
-                "--mount",
-                "type=bind,source=/tmp/spec,target=/run/hypervisor/workload.json,readonly",
+                "--volume",
+                "/tmp/agent:/run/hypervisor/agent:ro",
+                "--volume",
+                "/tmp/spec:/run/hypervisor/workload.json:ro",
                 "local/base:1",
                 "guest",
                 GUEST_METADATA,
@@ -319,6 +320,33 @@ mod tests {
             mode: MountMode::ReadWrite,
         });
         assert!(validate(&request).is_err());
+    }
+
+    #[test]
+    fn extra_mounts_keep_their_modes() {
+        let mut request = spec();
+        request.mounts = vec![
+            Mount {
+                source: "/tmp/shared".into(),
+                target: "/deps".into(),
+                mode: MountMode::ReadOnly,
+            },
+            Mount {
+                source: "/tmp/output".into(),
+                target: "/output".into(),
+                mode: MountMode::ReadWrite,
+            },
+        ];
+        let args = run(
+            &request,
+            Path::new("/tmp/agent"),
+            Path::new("/tmp/spec"),
+            Path::new("/tmp/host.sock"),
+        )
+        .unwrap()
+        .0;
+        assert!(args.contains(&"/tmp/shared:/deps:ro".into()));
+        assert!(args.contains(&"/tmp/output:/output".into()));
     }
 
     #[test]

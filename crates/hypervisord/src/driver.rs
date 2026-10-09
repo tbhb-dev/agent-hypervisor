@@ -15,22 +15,38 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "guest")]
+use hypervisor_alacritty::AlacrittyEmulator as ScreenEmulator;
 use hypervisor_core::channel::{WireSize, WireSpawnSpec};
+use hypervisor_core::container::{self, GuestRequest, GuestUser};
 use hypervisor_core::emulator::Size;
 use hypervisor_core::launchd::{self, JobConfig, StartPlan};
 use hypervisor_core::seatbelt;
 use hypervisor_core::session::{HolderConfig, Persistence, SessionKind, SpawnSpec};
 use hypervisor_core::workload::{
-    self, HostDecision, HostRequest as Request, HostResponse as Response, Recovery, StableId,
-    WorkloadSpec,
+    self, HostDecision, HostRequest as Request, HostResponse as Response, Recovery, Runtime,
+    StableId, WorkloadSpec,
 };
-use hypervisor_ghostty::GhosttyEmulator;
+#[cfg(not(feature = "guest"))]
+use hypervisor_ghostty::GhosttyEmulator as ScreenEmulator;
+#[cfg(target_os = "linux")]
+use hypervisor_pty::GuestSpawner;
 use hypervisor_pty::UnixSpawner;
 use hypervisor_session::{Command, LogContext, spawn};
 use rustix::process::{self, Pid, Signal};
 use sha2::{Digest, Sha256};
 
 use crate::terminal_socket::TerminalSocket;
+
+#[cfg(feature = "guest")]
+fn make_screen(size: Size) -> Result<ScreenEmulator, std::convert::Infallible> {
+    Ok(ScreenEmulator::new(size))
+}
+
+#[cfg(not(feature = "guest"))]
+fn make_screen(size: Size) -> Result<ScreenEmulator, hypervisor_ghostty::GhosttyError> {
+    ScreenEmulator::new(size)
+}
 
 const MAX_CONTROL: usize = 1024 * 1024;
 const START_WAIT: Duration = Duration::from_secs(5);
@@ -111,6 +127,11 @@ impl HostDriver {
             }
             let spec: WorkloadSpec = serde_json::from_reader(File::open(entry.path())?)?;
             workload::validate_workload(&spec).map_err(invalid)?;
+            if spec.runtime == Runtime::AppleContainer {
+                return Err(invalid(
+                    "container workload belongs to the container driver",
+                ));
+            }
             if entry.path() != driver.metadata(&spec.id) {
                 return Err(invalid("workload metadata filename does not match its ID"));
             }
@@ -148,6 +169,11 @@ impl HostDriver {
     /// Invalid or duplicate workload, or filesystem failure.
     pub fn create(&mut self, mut spec: WorkloadSpec) -> io::Result<()> {
         workload::admit_host_workload(&self.host, &spec).map_err(invalid)?;
+        if spec.runtime == Runtime::AppleContainer {
+            return Err(invalid(
+                "container workload belongs to the container driver",
+            ));
+        }
         spec.workspace_dir = fs::canonicalize(&spec.workspace_dir)?;
         spec.cache_dir = fs::canonicalize(&spec.cache_dir)?;
         // Seatbelt matches physical paths, so a mount names its canonical path.
@@ -421,6 +447,7 @@ struct HostedSession {
     path: PathBuf,
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
+    uid: Option<u32>,
 }
 
 struct ShimState {
@@ -435,8 +462,15 @@ struct ShimState {
 /// # Errors
 /// Invalid metadata or control I/O.
 pub fn serve(metadata: &Path, root: &Path) -> io::Result<()> {
+    serve_mode(metadata, root, false)
+}
+
+fn serve_mode(metadata: &Path, root: &Path, guest: bool) -> io::Result<()> {
     let spec: WorkloadSpec = serde_json::from_reader(File::open(metadata)?)?;
     workload::validate_workload(&spec).map_err(invalid)?;
+    if (spec.runtime == Runtime::AppleContainer) != guest {
+        return Err(invalid("shim mode does not match workload runtime"));
+    }
     let socket = root.join(format!("{}.sock", label_hash(&spec.id)));
     // A stale socket from a dead shim is removed only after connection fails.
     let stale_socket = socket.exists();
@@ -501,6 +535,95 @@ pub fn serve(metadata: &Path, root: &Path) -> io::Result<()> {
         let _ = hosted.thread.join();
     }
     fs::remove_file(socket)?;
+    Ok(())
+}
+
+/// Run the persistent agent inside a container and publish its control and terminal socket.
+///
+/// # Errors
+/// If the guest metadata, socket, or holder fails.
+pub fn serve_guest(metadata: &Path, root: &Path) -> io::Result<()> {
+    let spec: WorkloadSpec = serde_json::from_reader(File::open(metadata)?)?;
+    container::validate(&spec).map_err(invalid)?;
+    // vminitd dials the published socket through the container rootfs, so no private tmpfs
+    // can cover this root; the agent keeps the directory private to root itself.
+    fs::create_dir_all(root)?;
+    fs::set_permissions(root, Permissions::from_mode(0o700))?;
+    let metadata = metadata.to_path_buf();
+    let root_for_shim = root.to_path_buf();
+    let shim = thread::spawn(move || serve_mode(&metadata, &root_for_shim, true));
+    let control = root.join(format!("{}.sock", label_hash(&spec.id)));
+    let started = Instant::now();
+    while !control.exists() {
+        if started.elapsed() >= START_WAIT {
+            return Err(io::Error::other(
+                "guest shim did not bind its control socket",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let public = root.join("agent.sock");
+    let listener = UnixListener::bind(&public)?;
+    fs::set_permissions(&public, Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    while control.exists() {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let root = root.to_path_buf();
+                let control = control.clone();
+                thread::spawn(move || {
+                    if let Err(error) = guest_exchange(stream, &root, &control) {
+                        eprintln!("guest socket exchange failed: {error}");
+                    }
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    fs::remove_file(public)?;
+    shim.join()
+        .map_err(|_| io::Error::other("guest shim panicked"))?
+}
+
+fn guest_exchange(mut stream: UnixStream, root: &Path, control: &Path) -> io::Result<()> {
+    let mut header = Vec::new();
+    loop {
+        let mut byte = [0];
+        if stream.read(&mut byte)? == 0 || header.len() >= MAX_CONTROL {
+            return Err(invalid("missing guest request header"));
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        header.push(byte[0]);
+    }
+    match serde_json::from_slice::<GuestRequest>(&header)? {
+        GuestRequest::Control(request) => {
+            let mut shim = UnixStream::connect(control)?;
+            serde_json::to_writer(&mut shim, &request)?;
+            shim.shutdown(std::net::Shutdown::Write)?;
+            io::copy(&mut shim, &mut stream)?;
+        }
+        GuestRequest::Attach(path) => {
+            if !container::attach_path_allowed(&path, root) {
+                return Err(invalid("terminal socket is outside guest root"));
+            }
+            let mut terminal = UnixStream::connect(path)?;
+            let mut client_read = stream.try_clone()?;
+            let mut terminal_write = terminal.try_clone()?;
+            thread::scope(|scope| {
+                scope.spawn(move || {
+                    let _ = io::copy(&mut client_read, &mut terminal_write);
+                    let _ = terminal_write.shutdown(std::net::Shutdown::Write);
+                });
+                let _ = io::copy(&mut terminal, &mut stream);
+                let _ = stream.shutdown(std::net::Shutdown::Read);
+            });
+        }
+    }
     Ok(())
 }
 
@@ -586,6 +709,18 @@ fn start_session(
 ) -> io::Result<(StableId, HostedSession)> {
     workload::admit_session(&workload.id, &id, sessions.contains_key(&id.label()))
         .map_err(invalid)?;
+    let guest_user = if workload.runtime == Runtime::AppleContainer {
+        Some(container::session_user(&wire).map_err(invalid)?)
+    } else {
+        None
+    };
+    if let Some(user) = guest_user {
+        let existing: Vec<_> = sessions
+            .values()
+            .filter_map(|(_, hosted)| hosted.uid)
+            .collect();
+        container::admit_user(user, &existing).map_err(invalid)?;
+    }
     let size =
         Size::new(wire_size.cols, wire_size.rows).map_err(|_| invalid("zero terminal size"))?;
     let kind = match wire.kind {
@@ -602,22 +737,50 @@ fn start_session(
             .map_or_else(|| workload.workspace_dir.clone(), PathBuf::from),
     );
     spec.user = wire.user;
-    spec.validate()
-        .map_err(|error| invalid(error.to_string()))?;
+    if guest_user.is_none() {
+        spec.validate()
+            .map_err(|error| invalid(error.to_string()))?;
+    }
+    let uid = guest_user.map(|user| match user {
+        GuestUser::Writer(uid) | GuestUser::Reviewer(uid) => uid,
+    });
+    if let Some(uid) = uid {
+        prepare_guest_env(
+            &mut spec,
+            workload,
+            uid,
+            matches!(guest_user, Some(GuestUser::Reviewer(_))),
+        )?;
+    }
     let mut config = HolderConfig::new(Persistence::Persistent);
     // The shim destroys this session on stop; retaining its exited state delays shutdown.
     config.retain_exited = Duration::ZERO;
-    let handle = spawn(
-        UnixSpawner,
-        spec,
-        config,
-        LogContext {
-            workload_id: workload.id.label(),
-            session_id: id.label(),
-        },
-        GhosttyEmulator::new,
-    )
-    .map_err(|error| io::Error::other(error.to_string()))?;
+    let log = LogContext {
+        workload_id: workload.id.label(),
+        session_id: id.label(),
+    };
+    #[cfg(target_os = "linux")]
+    let handle = if let Some(uid) = uid {
+        spawn(
+            GuestSpawner {
+                uid,
+                reviewer: matches!(guest_user, Some(GuestUser::Reviewer(_))),
+            },
+            spec,
+            config,
+            log,
+            make_screen,
+        )
+    } else {
+        spawn(UnixSpawner, spec, config, log, make_screen)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let handle = if uid.is_some() {
+        return Err(invalid("guest sessions require Linux"));
+    } else {
+        spawn(UnixSpawner, spec, config, log, make_screen)
+    };
+    let handle = handle.map_err(|error| io::Error::other(error.to_string()))?;
     let socket = TerminalSocket::bind(
         root,
         &workload.id.label(),
@@ -632,7 +795,49 @@ fn start_session(
         handle.send(Command::Close);
         handle.join();
     });
-    Ok((id, HostedSession { path, stop, thread }))
+    Ok((
+        id,
+        HostedSession {
+            path,
+            stop,
+            thread,
+            uid,
+        },
+    ))
+}
+
+fn prepare_guest_env(
+    spec: &mut SpawnSpec,
+    workload: &WorkloadSpec,
+    uid: u32,
+    reviewer: bool,
+) -> io::Result<()> {
+    let home = container::guest_home(&workload.cache_dir, uid);
+    fs::create_dir_all(&home)?;
+    fs::set_permissions(&home, Permissions::from_mode(0o700))?;
+    chown_guest_home(&home, uid)?;
+    spec.env = container::guest_session_env(&spec.env, &home, reviewer);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn chown_guest_home(path: &Path, uid: u32) -> io::Result<()> {
+    use std::ffi::CString;
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(invalid)?;
+    // SAFETY: NUL-terminated path and scalar guest IDs; the guest agent runs as root.
+    #[expect(
+        unsafe_code,
+        reason = "set guest home ownership before dropping session uid"
+    )]
+    if unsafe { libc::chown(path.as_ptr(), uid, uid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn chown_guest_home(_path: &Path, _uid: u32) -> io::Result<()> {
+    Err(invalid("guest sessions require Linux"))
 }
 
 /// The profile a workload's sessions run under, for running harness probes by hand.

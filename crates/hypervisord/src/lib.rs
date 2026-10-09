@@ -13,6 +13,7 @@ use hypervisor_session::{Command, SessionHandle};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub mod container_driver;
 pub mod driver;
 pub mod terminal_socket;
 
@@ -138,7 +139,7 @@ impl Drop for HookSocket {
     }
 }
 
-fn short_hash(value: &str) -> String {
+pub(crate) fn short_hash(value: &str) -> String {
     use std::fmt::Write as _;
     let digest = Sha256::digest(value.as_bytes());
     let mut hash = String::with_capacity(12);

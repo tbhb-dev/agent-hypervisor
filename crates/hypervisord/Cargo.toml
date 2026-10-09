@@ -9,8 +9,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+hypervisor-alacritty = { workspace = true, optional = true }
 hypervisor-core.workspace = true
-hypervisor-ghostty.workspace = true
+hypervisor-ghostty = { workspace = true, optional = true }
 hypervisor-pty.workspace = true
 hypervisor-session.workspace = true
 libc.workspace = true
@@ -20,6 +21,11 @@ serde_json.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+
+[features]
+default = ["ghostty"]
+ghostty = ["dep:hypervisor-ghostty"]
+guest = ["dep:hypervisor-alacritty"]
 
 [lints]
 workspace = true

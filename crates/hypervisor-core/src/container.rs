@@ -127,8 +127,8 @@ pub fn run(
         "none".into(),
         "--entrypoint".into(),
         GUEST_AGENT.into(),
-        "--tmpfs".into(),
-        format!("{GUEST_ROOT}:mode=700"),
+        // No --tmpfs on GUEST_ROOT: vminitd dials the published socket through the container
+        // rootfs, outside the container's mounts, and a tmpfs there hides it. The agent sets 0700.
         "--publish-socket".into(),
         format!("{}:{GUEST_SOCKET}", host_socket.display()),
         "--mount".into(),
@@ -361,8 +361,6 @@ mod tests {
                 "none",
                 "--entrypoint",
                 GUEST_AGENT,
-                "--tmpfs",
-                "/run/hypervisor:mode=700",
                 "--publish-socket",
                 "/tmp/host.sock:/run/hypervisor/agent.sock",
                 "--mount",

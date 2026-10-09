@@ -73,10 +73,9 @@ pub fn validate(spec: &WorkloadSpec) -> Result<(), &'static str> {
         {
             return Err("container mount path cannot use CLI separators");
         }
-        if ["/workspace", "/cache", GUEST_ROOT]
-            .iter()
-            .any(|root| mount.target.starts_with(root))
-        {
+        if ["/workspace", "/cache", GUEST_ROOT].iter().any(|root| {
+            mount.target.starts_with(root) || Path::new(root).starts_with(&mount.target)
+        }) {
             return Err("container mount overlaps a driver-owned target");
         }
     }
@@ -322,6 +321,88 @@ mod tests {
     }
 
     #[test]
+    fn validate_refusal_cases() {
+        type Case = (&'static str, fn(&mut WorkloadSpec));
+        let cases: &[Case] = &[
+            ("runtime", |s| s.runtime = Runtime::Host),
+            ("isolation", |s| s.isolation = Isolation::None),
+            ("name", |s| s.id.local = "x".repeat(60)),
+            ("image missing", |s| s.image = None),
+            ("image empty", |s| s.image = Some(String::new())),
+            ("image option", |s| s.image = Some("-image".into())),
+            ("image nul", |s| s.image = Some("a\0b".into())),
+            ("image newline", |s| s.image = Some("a\nb".into())),
+            ("credentials", |s| s.credential_refs.push("secret".into())),
+            ("memory", |s| s.resources.memory_bytes = Some(0)),
+            ("cpu", |s| s.resources.cpu_count = Some(0)),
+            ("relative source", |s| {
+                s.mounts.push(mount("relative", "/deps"));
+            }),
+            ("relative target", |s| {
+                s.mounts.push(mount("/tmp/data", "deps"));
+            }),
+            ("parent target", |s| {
+                s.mounts.push(mount("/tmp/data", "/deps/../other"));
+            }),
+            ("source separator", |s| {
+                s.mounts.push(mount("/tmp/a,b", "/deps"));
+            }),
+            ("target nul", |s| s.mounts.push(mount("/tmp/data", "/a\0b"))),
+            ("target newline", |s| {
+                s.mounts.push(mount("/tmp/data", "/a\nb"));
+            }),
+            ("owned target", |s| {
+                s.mounts.push(mount("/tmp/data", "/cache/x"));
+            }),
+            ("owned ancestor", |s| {
+                s.mounts.push(mount("/tmp/data", "/run"));
+            }),
+            ("root target", |s| s.mounts.push(mount("/tmp/data", "/"))),
+            ("workspace separator", |s| {
+                s.workspace_dir = "/tmp/a,b".into();
+            }),
+            ("cache separator", |s| s.cache_dir = "/tmp/a\nb".into()),
+        ];
+        for (label, change) in cases {
+            let mut request = spec();
+            change(&mut request);
+            assert!(validate(&request).is_err(), "{label}");
+        }
+    }
+
+    fn mount(source: &str, target: &str) -> Mount {
+        Mount {
+            source: source.into(),
+            target: target.into(),
+            mode: MountMode::ReadOnly,
+        }
+    }
+
+    #[test]
+    fn invalid_guest_users() {
+        let mut session = WireSpawnSpec {
+            command: "sh".into(),
+            args: vec![],
+            env: vec![],
+            cwd: None,
+            user: None,
+            kind: SessionKind::Shell,
+        };
+        assert!(session_user(&session).is_err());
+        for user in [
+            "abc",
+            "reviewer:abc",
+            "9999",
+            "60001",
+            "reviewer:9999",
+            "reviewer:60001",
+        ] {
+            session.user = Some(user.into());
+            assert!(session_user(&session).is_err(), "{user}");
+        }
+    }
+
+    #[test]
     fn workload_environment_stays_out_of_process_arguments() {
         let mut request = spec();
         request.env.push(("PRIVATE".into(), "sentinel".into()));
@@ -354,6 +435,12 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn mount_cli_separator_is_rejected(part in "[a-z]{1,10},[a-z]{1,10}") {
+            let mut request = spec();
+            request.mounts.push(mount(&format!("/tmp/{part}"), "/deps"));
+            prop_assert!(validate(&request).is_err());
+        }
         #[test]
         fn every_admitted_run_has_no_network(local in "[a-z][a-z0-9]{0,20}") {
             let mut request = spec();

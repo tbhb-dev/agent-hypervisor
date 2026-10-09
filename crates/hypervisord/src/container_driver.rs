@@ -96,7 +96,12 @@ impl ContainerDriver {
                 if let Ok(HostResponse::Sessions(sessions)) = driver.call(&id, &HostRequest::List) {
                     for session in sessions {
                         let guest_path = guest_session_path(&id, &session);
-                        driver.proxy_session(&id, &session, &guest_path)?;
+                        if let Err(error) = driver.proxy_session(&id, &session, &guest_path) {
+                            eprintln!(
+                                "container session proxy recovery failed for {}: {error}",
+                                session.label()
+                            );
+                        }
                     }
                 }
             }
@@ -119,6 +124,7 @@ impl ContainerDriver {
             mount.source = fs::canonicalize(&mount.source)?;
         }
         container::validate(&spec).map_err(invalid)?;
+        validate_workspace_git_entry(&spec.workspace_dir)?;
         validate_socket_mounts(&spec)?;
         let host_path = self.metadata(&spec.id);
         let guest_path = self.guest_metadata(&spec.id);
@@ -169,6 +175,7 @@ impl ContainerDriver {
             .workloads
             .get(&id.label())
             .ok_or_else(|| invalid("unknown workload"))?;
+        validate_workspace_git_entry(&spec.workspace_dir)?;
         workload::admit_start(*recovery, self.call(id, &HostRequest::Ping).is_ok())
             .map_err(invalid)?;
         let args = container::run(
@@ -222,7 +229,11 @@ impl ContainerDriver {
         if !self.workloads.contains_key(&id.label()) {
             return Err(invalid("unknown workload"));
         }
-        self.remove_container(id)?;
+        if cli(&["inspect".into(), container::name(id)]).is_ok() {
+            self.remove_container(id)?;
+        } else if self.socket(id).exists() {
+            fs::remove_file(self.socket(id))?;
+        }
         self.drop_proxies(id);
         self.workloads
             .get_mut(&id.label())
@@ -451,29 +462,31 @@ impl Drop for ContainerDriver {
 }
 
 fn guest_session_path(workload: &StableId, session: &StableId) -> PathBuf {
-    Path::new(container::GUEST_ROOT)
-        .join("r")
-        .join(short_hash(&workload.label()))
-        .join(format!("{}.c", short_hash(&session.label())))
+    container::guest_session_path(
+        &short_hash(&workload.label()),
+        &short_hash(&session.label()),
+    )
+}
+
+fn validate_workspace_git_entry(workspace: &Path) -> io::Result<()> {
+    let present = match fs::symlink_metadata(workspace.join(".git")) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    container::admit_workspace_git_entry(present).map_err(invalid)
 }
 
 fn validate_socket_mounts(spec: &WorkloadSpec) -> io::Result<()> {
     for mount in &spec.mounts {
         let info = fs::metadata(&mount.source)?;
-        let broker = mount.target == Path::new("/run/broker.sock");
-        if broker != info.file_type().is_socket() {
-            return Err(invalid(
-                "only the broker target accepts a Unix socket mount",
-            ));
-        }
-        if broker
-            && (info.permissions().mode() & 0o777 != 0o600
-                || mount.mode != hypervisor_core::workload::MountMode::ReadOnly)
-        {
-            return Err(invalid(
-                "broker socket must be mode 0600 and read-only in the workload spec",
-            ));
-        }
+        container::validate_socket_mount(
+            &mount.target,
+            info.file_type().is_socket(),
+            info.permissions().mode(),
+            mount.mode,
+        )
+        .map_err(invalid)?;
     }
     Ok(())
 }
@@ -512,4 +525,25 @@ fn cli(args: &[String]) -> io::Result<()> {
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_git_directory_and_gitfile_are_refused() {
+        let root = std::env::temp_dir().join(format!("hv-r20-git-entry-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        assert!(validate_workspace_git_entry(&root).is_ok());
+        fs::create_dir(root.join(".git")).unwrap();
+        assert!(validate_workspace_git_entry(&root).is_err());
+        fs::remove_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".git"), "gitdir: /host/shared/.git\n").unwrap();
+        assert!(validate_workspace_git_entry(&root).is_err());
+        fs::remove_file(root.join(".git")).unwrap();
+        std::os::unix::fs::symlink("/host/shared/.git", root.join(".git")).unwrap();
+        assert!(validate_workspace_git_entry(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

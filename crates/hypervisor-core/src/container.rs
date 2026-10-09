@@ -268,6 +268,47 @@ pub fn guest_session_env(
     result
 }
 
+/// A writable host gitdir must never be shared with the guest.
+///
+/// # Errors
+/// A `.git` entry exists at the workspace root.
+pub fn admit_workspace_git_entry(present: bool) -> Result<(), &'static str> {
+    if present {
+        Err("container workspace cannot contain a host .git entry")
+    } else {
+        Ok(())
+    }
+}
+
+/// Check a host mount's file type and permissions after the shell stats it.
+///
+/// # Errors
+/// A socket is mounted outside the broker path or the broker socket is writable.
+pub fn validate_socket_mount(
+    target: &Path,
+    is_socket: bool,
+    permissions: u32,
+    mode: MountMode,
+) -> Result<(), &'static str> {
+    let broker = target == Path::new("/run/broker.sock");
+    if broker != is_socket {
+        return Err("only the broker target accepts a Unix socket mount");
+    }
+    if broker && (permissions & 0o777 != 0o600 || mode != MountMode::ReadOnly) {
+        return Err("broker socket must be mode 0600 and read-only in the workload spec");
+    }
+    Ok(())
+}
+
+/// Derive the guest's terminal socket from the precomputed session hashes.
+#[must_use]
+pub fn guest_session_path(workload_hash: &str, session_hash: &str) -> PathBuf {
+    Path::new(GUEST_ROOT)
+        .join("r")
+        .join(workload_hash)
+        .join(format!("{session_hash}.c"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +544,44 @@ mod tests {
                 ("PATH".into(), "/bin".into()),
                 ("HOME".into(), "/cache/users/10002".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn a_host_git_entry_is_refused() {
+        assert!(admit_workspace_git_entry(false).is_ok());
+        assert!(admit_workspace_git_entry(true).is_err());
+    }
+
+    #[test]
+    fn broker_socket_mount_requires_private_read_only_source() {
+        assert!(
+            validate_socket_mount(Path::new("/deps"), false, 0o644, MountMode::ReadWrite).is_ok()
+        );
+        for (target, socket, permissions, mode) in [
+            ("/deps", true, 0o600, MountMode::ReadOnly),
+            ("/run/broker.sock", false, 0o600, MountMode::ReadOnly),
+            ("/run/broker.sock", true, 0o666, MountMode::ReadOnly),
+            ("/run/broker.sock", true, 0o600, MountMode::ReadWrite),
+        ] {
+            assert!(validate_socket_mount(Path::new(target), socket, permissions, mode).is_err());
+        }
+        assert!(
+            validate_socket_mount(
+                Path::new("/run/broker.sock"),
+                true,
+                0o600,
+                MountMode::ReadOnly
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn guest_session_socket_is_beneath_runtime_root() {
+        assert_eq!(
+            guest_session_path("work", "session"),
+            Path::new("/run/hypervisor/r/work/session.c")
         );
     }
 

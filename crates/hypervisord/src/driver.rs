@@ -545,6 +545,10 @@ fn serve_mode(metadata: &Path, root: &Path, guest: bool) -> io::Result<()> {
 pub fn serve_guest(metadata: &Path, root: &Path) -> io::Result<()> {
     let spec: WorkloadSpec = serde_json::from_reader(File::open(metadata)?)?;
     container::validate(&spec).map_err(invalid)?;
+    // vminitd dials the published socket through the container rootfs, so no private tmpfs
+    // can cover this root; the agent keeps the directory private to root itself.
+    fs::create_dir_all(root)?;
+    fs::set_permissions(root, Permissions::from_mode(0o700))?;
     let metadata = metadata.to_path_buf();
     let root_for_shim = root.to_path_buf();
     let shim = thread::spawn(move || serve_mode(&metadata, &root_for_shim, true));

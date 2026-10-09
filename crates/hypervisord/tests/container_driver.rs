@@ -27,25 +27,26 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> (Self, ContainerDriver) {
-        let root = PathBuf::from(format!("/private/tmp/hv-r20-{}", std::process::id()));
-        let ws = root.join("ws");
-        let cache = root.join("cache");
-        fs::create_dir_all(&ws).unwrap();
-        fs::set_permissions(&ws, Permissions::from_mode(0o777)).unwrap();
-        fs::create_dir_all(&cache).unwrap();
-        let id = StableId {
-            host: "r20".into(),
-            local: std::process::id().to_string(),
-        };
-        let agent = std::env::current_dir()
-            .unwrap()
-            .join("target/aarch64-unknown-linux-musl/debug/host-shim");
+        let agent = guest_agent();
         assert!(
             agent.is_file(),
             "build guest agent with mise run guest:build first"
         );
-        let mut driver = ContainerDriver::open(&root.join("rt"), &id.host, &agent).unwrap();
-        let fixture = Self { root, id };
+        // Own the fixture before creating anything so a later panic still cleans up.
+        let fixture = Self {
+            root: PathBuf::from(format!("/private/tmp/hv-r20-{}", std::process::id())),
+            id: StableId {
+                host: "r20".into(),
+                local: std::process::id().to_string(),
+            },
+        };
+        let ws = fixture.root.join("ws");
+        let cache = fixture.root.join("cache");
+        fs::create_dir_all(&ws).unwrap();
+        fs::set_permissions(&ws, Permissions::from_mode(0o777)).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        let mut driver =
+            ContainerDriver::open(&fixture.root.join("rt"), &fixture.id.host, &agent).unwrap();
         driver
             .create(WorkloadSpec {
                 id: fixture.id.clone(),
@@ -109,6 +110,12 @@ impl Drop for Fixture {
         let files = fs::remove_dir_all(&self.root);
         eprintln!("fixture cleanup: container={container:?} volume={volume:?} files={files:?}");
     }
+}
+
+/// Cargo runs integration tests from the package root; `guest:build` writes to the workspace target.
+fn guest_agent() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/aarch64-unknown-linux-musl/debug/host-shim")
 }
 
 fn exec(name: &str, program: &str, args: &[&str]) -> std::process::Output {
@@ -213,6 +220,13 @@ fn container_guest_sessions_reviewer_and_cleanup() {
     eprintln!(
         "test VM count=1 cpus=2 memory_bytes=536870912 disk_bytes={disk:?} cache_volume_bytes={volume_disk:?} container={name}"
     );
+    // The guest agent, not a mount option, keeps its runtime root private to root.
+    let runtime_root = exec(&name, "/bin/stat", &["-c", "%a %u", "/run/hypervisor"]);
+    assert!(runtime_root.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&runtime_root.stdout).trim(),
+        "700 0"
+    );
     let route = exec(&name, "/bin/cat", &["/proc/net/route"]);
     assert!(route.status.success());
     assert!(
@@ -256,11 +270,8 @@ fn container_guest_sessions_reviewer_and_cleanup() {
     assert_private_sockets(&fixture.root);
     open_terminal(&reviewer, "r20:reviewer");
     drop(driver);
-    let agent = std::env::current_dir()
-        .unwrap()
-        .join("target/aarch64-unknown-linux-musl/debug/host-shim");
     let mut adopted =
-        ContainerDriver::open(&fixture.root.join("rt"), &fixture.id.host, &agent).unwrap();
+        ContainerDriver::open(&fixture.root.join("rt"), &fixture.id.host, &guest_agent()).unwrap();
     assert_eq!(adopted.list_sessions(&fixture.id).unwrap().len(), 2);
     open_terminal(&reviewer, "r20:reviewer");
     adopted.stop(&fixture.id).unwrap();

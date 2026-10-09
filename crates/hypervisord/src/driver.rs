@@ -345,6 +345,18 @@ impl HostDriver {
         }
     }
 
+    /// Close a session's holder, which ends its child, and wait until it is gone.
+    ///
+    /// # Errors
+    /// Unknown session or control I/O failure.
+    pub fn kill_session(&self, workload: &StableId, session: StableId) -> io::Result<()> {
+        match self.call(workload, &Request::Kill(session))? {
+            Response::Killed => Ok(()),
+            Response::Error(error) => Err(io::Error::other(error)),
+            _ => Err(io::Error::other("unexpected shim response")),
+        }
+    }
+
     /// List stable session IDs currently held by the shim.
     ///
     /// # Errors
@@ -532,7 +544,8 @@ fn exchange(
         }
     }
     let request: Request = serde_json::from_slice(&bytes)?;
-    let response = {
+    let mut killed = None;
+    let mut response = {
         let mut state = state
             .lock()
             .map_err(|_| io::Error::other("shim state poisoned"))?;
@@ -557,12 +570,27 @@ fn exchange(
                 }
                 Err(error) => Response::Error(error.to_string()),
             },
+            HostDecision::Kill(id) => match state.sessions.remove(&id.label()) {
+                Some((_, hosted)) => {
+                    state.events.push(format!("session_killed:{}", id.label()));
+                    killed = Some(hosted);
+                    Response::Killed
+                }
+                None => Response::Error("unknown session".into()),
+            },
             HostDecision::Stop => {
                 state.stopping = true;
                 Response::Stopped
             }
         }
     };
+    // Join outside the lock: closing the holder waits for its child to exit.
+    if let Some(hosted) = killed {
+        hosted.stop.store(true, Ordering::Relaxed);
+        if hosted.thread.join().is_err() {
+            response = Response::Error("session thread panicked".into());
+        }
+    }
     let stopped = matches!(response, Response::Stopped);
     let result = stream
         .set_write_timeout(Some(CONTROL_TIMEOUT))

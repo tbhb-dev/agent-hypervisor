@@ -20,6 +20,25 @@ fn main() {
         }
         return;
     }
+    if mode.as_deref() == Some("daemon") {
+        let args: Vec<String> = args.collect();
+        let [root, host, shim, log, socket] = args.as_slice() else {
+            eprintln!("usage: hypervisord daemon ROOT HOST SHIM LOG SOCKET");
+            std::process::exit(2);
+        };
+        let result = hypervisord::control::run_daemon(
+            root.as_ref(),
+            host,
+            shim.as_ref(),
+            log.as_ref(),
+            socket.as_ref(),
+        );
+        if let Err(error) = result {
+            eprintln!("hypervisord daemon: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if mode.as_deref() != Some("hook") {
         println!(
             "{}",

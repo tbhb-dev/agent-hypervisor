@@ -13,6 +13,7 @@ use hypervisor_session::{Command, SessionHandle};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub mod control;
 pub mod driver;
 pub mod terminal_socket;
 

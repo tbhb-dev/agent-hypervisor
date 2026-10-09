@@ -229,6 +229,7 @@ pub enum HostRequest {
     List,
     Stats,
     Events,
+    Kill(StableId),
     Stop,
 }
 
@@ -239,11 +240,12 @@ pub enum HostResponse {
     Sessions(Vec<StableId>),
     Stats { sessions: usize, pid: u32 },
     Events(Vec<String>),
+    Killed,
     Stopped,
     Error(String),
 }
 
-/// The shell executes the two actions that have side effects.
+/// The shell executes the actions that have side effects.
 pub enum HostDecision {
     Reply(HostResponse),
     Spawn {
@@ -251,6 +253,7 @@ pub enum HostDecision {
         spec: WireSpawnSpec,
         size: WireSize,
     },
+    Kill(StableId),
     Stop,
 }
 
@@ -271,6 +274,7 @@ pub fn control_decision(
         }),
         HostRequest::Events => HostDecision::Reply(HostResponse::Events(events.to_vec())),
         HostRequest::Spawn { id, spec, size } => HostDecision::Spawn { id, spec, size },
+        HostRequest::Kill(id) => HostDecision::Kill(id),
         HostRequest::Stop => HostDecision::Stop,
     }
 }
@@ -579,6 +583,9 @@ mod tests {
             control_decision(HostRequest::Stop, &id, &sessions, 42, &events),
             HostDecision::Stop
         ));
+        assert!(
+            matches!(control_decision(HostRequest::Kill(session.clone()), &id, &sessions, 42, &events), HostDecision::Kill(found) if found == session)
+        );
         assert!(matches!(
             control_decision(
                 HostRequest::Spawn {

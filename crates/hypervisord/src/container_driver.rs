@@ -90,6 +90,7 @@ impl ContainerDriver {
         for id in ids {
             if matches!(driver.call(&id, &HostRequest::Ping), Ok(HostResponse::Identity(found)) if found == id)
             {
+                fs::set_permissions(driver.socket(&id), Permissions::from_mode(0o600))?;
                 if let Some(saved) = driver.workloads.get_mut(&id.label()) {
                     saved.1 = Recovery::Running;
                 }
@@ -207,6 +208,7 @@ impl ContainerDriver {
         while started.elapsed() < START_WAIT {
             if matches!(self.call(id, &HostRequest::Ping), Ok(HostResponse::Identity(found)) if found == *id)
             {
+                fs::set_permissions(self.socket(id), Permissions::from_mode(0o600))?;
                 self.workloads
                     .get_mut(&id.label())
                     .ok_or_else(|| invalid("unknown workload"))?
